@@ -84,6 +84,56 @@ def text_to_phonemes(text: str, british: bool = False) -> str:
     return ''.join(t.phonemes + (' ' if t.whitespace else '') for t in tokens if t.phonemes).strip()
 
 
+def _shared_report(input_desc, engines, stages, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak
+    (128 FLOP per clock cycle per engine) times ``engines``.
+    The decoder keys are only emitted when ``decoded_tokens`` is given.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        _hz = getattr(_udc, "CORE_CLOCK_FREQ_HZ", None)
+        per_engine = _hz * 128 / 1e9 if _hz else None  # GFLOP/s per engine
+        peak_gflops = per_engine * engines if (per_engine and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop, 6),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    report = {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop, 6),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+    }
+    if decoded_tokens is not None:
+        report.update({"decoded_tokens": decoded_tokens,
+                       "decode_first_tok_s": _num(decode_first_tok_s, 3),
+                       "decode_avg_tok_s": _num(decode_avg_tok_s, 3)})
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Kokoro-82M on the UnifiedEngine FPGA accelerator (default); "
@@ -177,6 +227,33 @@ def main():
         import soundfile as sf
         sf.write(args.out, audio.cpu().numpy(), 24000, subtype='PCM_16')
         print(f"\nWrote {len(audio) / 24000:.2f}s of audio to {os.path.abspath(args.out)}")
+
+        # One TEST_RESULT line for model_auto_test.py. Per section: hw_s is the device latency
+        # counter summed over the section's programs, gflop the theoretical FLOPs of what those
+        # programs ran at this prompt's real lengths (see kokoro_fpga.py, "TEST_RESULT accounting").
+        import json
+        from kokoro_fpga import get_test_report
+        rep = get_test_report()
+        audio_s = len(audio) / 24000
+        snrs = rep["snr_db"]
+        worst = min(snrs, key=lambda sv: sv[1]) if snrs else None
+        output = f"{audio_s:.2f} s of audio written ({len(audio)} samples at 24 kHz, {os.path.basename(args.out)})"
+        if worst is not None:
+            output += f"; worst of {len(snrs)} section SNRs vs CPU: {worst[1]:.2f} dB (section {worst[0]})"
+        result = dict(_shared_report(
+            {"prompt": args.prompt,
+             "voice": f"{args.voice}, speed {args.speed:g} ({len(args.prompt)} chars, {len(phonemes)} phonemes)"},
+            rep["engines"], rep["stages"]))
+        result["output"] = output
+        result["audio_s"] = round(audio_s, 3)
+        result["min_section_snr_db"] = worst[1] if worst is not None else None
+        result["section_snr_db"] = [[sec, val] for sec, val in snrs]
+        result["programs_run"] = rep["programs_run"]
+        result["instructions"] = rep["instructions"]
+        result["from_bin"] = rep["from_bin"]
+        result["flop_count_fallbacks"] = rep["flop_count_fallbacks"]
+        result["debug_snr"] = bool(args.debug_snr)
+        print("TEST_RESULT:" + json.dumps(result))
         return
 
     print(f"Running {args.device.upper()} reference inference ...")

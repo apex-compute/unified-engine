@@ -7014,6 +7014,42 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
               f"[{pct:4.0f}% peak]" + ("  <-- ABOVE PEAK: the issued-FLOP model is "
                                        "wrong, not the hardware" if pct > 100 else ""))
 
+    def _build_stage_report(self, rows):
+        """The shared TEST_RESULT keys (model_auto_test.py) for one run_inference pass.
+
+        rows: (name, stage key, scheduler attr, heartbeat-label prefix, (effective, hw_issued)
+        FLOPs, wall seconds) in run order. hw_s = the device latency counter summed over
+        the stage's launches (the per-stage wall timers above also hold DMA staging,
+        readbacks and any inline compile); gflop = the HW-ISSUED FLOP model (what %-peak is
+        computed from; the effective figure rides along as effective_gflop). The peak is
+        the hardware-reported clock's (user_dma_core.UE_PEAK_GFLOPS per engine) times the
+        engines the stage's scheduler really ran on -- NOT the CYCLE_NS constant the live
+        readout uses, so pct_peak here can differ from the "[..% peak]" lines."""
+        per_engine = (user_dma_core.CORE_CLOCK_FREQ_HZ * 128 / 1e9 if user_dma_core.CORE_CLOCK_FREQ_HZ else None)  # GFLOP/s per engine
+        log = list(getattr(self, "_device_latency_log", []))
+        stages, used = [], []
+        for name, _stage, sched_attr, label, flops, wall in rows:
+            sched = getattr(self, sched_attr, None)
+            ne = int(sched.num_engines) if sched is not None else 1
+            used.append(ne)
+            lat = [us for lb, us in log if lb.startswith(label)]
+            hw_s = sum(lat) / 1e6 if lat else None      # None: no heartbeat-tracked launch for this stage
+            eff, hw = flops if isinstance(flops, (tuple, list)) else (flops, flops)
+            gflops = (hw / 1e9 / hw_s) if hw_s else None
+            stages.append({"name": name, "hw_s": hw_s, "gflop": hw / 1e9, "gflops": gflops,
+                           "pct_peak": (100 * gflops / (per_engine * ne)) if (gflops is not None and per_engine) else None,
+                           "engines": ne, "launches": len(lat), "wall_s": wall, "effective_gflop": eff / 1e9})
+        engines = max(used) if used else 1
+        peak = per_engine * engines if per_engine else None
+        complete = bool(stages) and all(st["hw_s"] is not None for st in stages)
+        total_hw_s = sum(st["hw_s"] for st in stages) if complete else None
+        total_gflop = sum(st["gflop"] for st in stages)
+        avg = (total_gflop / total_hw_s) if total_hw_s else None
+        return {"engines": engines, "peak_gflops": peak, "stages": stages,
+                "total_hw_s": total_hw_s, "total_gflop": total_gflop, "avg_gflops": avg,
+                "avg_pct_peak": (100 * avg / peak) if (avg is not None and peak) else None,
+                "total_wall_s": sum(st["wall_s"] for st in stages)}
+
     def _n_vision_slots_encoded(self):
         """Image slots the encoder actually RAN: all of them unless zero slots are
         skipped (SKIP_ZERO_VISION_SLOTS), matching the GPU which encodes all slots."""
@@ -7203,6 +7239,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # was really 36.9s. Clearing here keeps #0 honest (its compile IS inside the
         # region and is still reported) and makes #1+ show compile 0.0s / exec = total.
         self.__dict__.setdefault("_compile_times", {}).clear()
+        self.__dict__.setdefault("_device_latency_log", []).clear()
         t0 = time.perf_counter()
         if skip_prefix:
             t_vision = 0.0
@@ -7331,6 +7368,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._dma_read_checked(self.AE_XT_DRAM, buf, len(buf))
         out = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(S, AD).float().numpy()
         actions = out[:10, :7]
+
+        self._stage_report = self._build_stage_report(
+            ([] if skip_prefix else [
+                (f"vision ({n_enc} slots)", "VIS", "_vis_sched", "vision slot", self._vision_flops(), t_vision),
+                (f"prefix ({seq_len} tok)", "PREFIX", "_prefix_sched", "prefix", self._prefix_flops(seq_len), t_prefix)])
+            + [(f"denoise ({self.AE_NUM_DENOISE_STEPS} steps)", "DENOISE", "_denoise_sched", "denoise_loop",
+                self._denoise_flops(), t_denoise)])
 
         total = t_vision + t_prefix + t_denoise
         # Split ONE-TIME compilation out of the wall clock. The stage timers wrap
@@ -7504,6 +7548,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 f"[{label}] FPGA queue still busy after {timeout:.0f}s timeout -- "
                 f"real hang, not a silent success. wait_queue() does not raise on "
                 f"its own; this check exists specifically to catch that.")
+        # Device latency counter of the program that just halted (register read only), kept
+        # per launch so the TEST_RESULT line can report hardware seconds instead of wall.
+        self.__dict__.setdefault("_device_latency_log", []).append((label, self.report_latency_in_us()))
         _original_print(f"  [{label}] done in {time.perf_counter()-t0:.1f}s" + " " * 20)
 
     def _compile_and_run(self, compile_fn, label="compile_and_run", timeout=250.0):
@@ -9117,6 +9164,26 @@ def main():
 
     if args.probe_step0:
         ue.probe_nan_report()
+
+    # One machine-readable line for model_auto_test.py (the harness takes the LAST one).
+    finite = not (bool(np.isnan(actions).any()) or bool(np.isinf(actions).any()))
+    if args.debug:
+        shown, space = actions, "normalized [-1,1]"
+        src = f"prefix K/V cache reloaded from {PREFIX_KV_DUMP_PATH} (--debug: vision + prefix skipped)"
+    else:
+        shown, space = actions_unnorm, "real robot actions (unnormalized)"
+        src = {"prompt": _CFG['defaults'].get('prompt', 'pick up the object'),
+               "image": "test_samples/pi05_libero_base.png",
+               "image2": "test_samples/pi05_libero_wrist.png",
+               "state": f"sample robot state, digitized into the prompt ({len(prompt_tokens)} tokens)",
+               "noise": "np.random.RandomState(0).randn(10, 7)"}
+    result = {"input": src,
+              "output": (f"action chunk {shown.shape[0]}x{shown.shape[1]} ({space}), min {float(shown.min()):.4f} "
+                         f"max {float(shown.max()):.4f}; normalized min {float(actions.min()):.4f} "
+                         f"max {float(actions.max()):.4f}, finite={finite}"),
+              "actions_finite": finite}
+    result.update(getattr(ue, "_stage_report", None) or {})
+    print("TEST_RESULT: " + json.dumps(result))
 
 
 if __name__ == "__main__":

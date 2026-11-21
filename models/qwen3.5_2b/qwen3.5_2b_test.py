@@ -127,6 +127,78 @@ def quantize_lm_head_fp4(embed_w: torch.Tensor, rows_per_chunk: int = 4096):
 # Stdout noise filter (blanks out user_dma_core chatter during capture/exec)
 # ============================================================================
 
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
+
+
+class _FlopSum:
+    """Sum of the compile-time FLOP counts the user_dma_core ops return (accounting only).
+    ``value`` is None as soon as one op returned no count, so a partial sum is never reported."""
+
+    def __init__(self):
+        self.total = 0
+        self.missing = False
+
+    def add(self, flops):
+        if isinstance(flops, (int, float)) and not isinstance(flops, bool):
+            self.total += int(flops)
+        else:
+            self.missing = True
+
+    def __iadd__(self, flops):
+        self.add(flops)
+        return self
+
+    @property
+    def value(self):
+        return None if self.missing else self.total
+
+
 class _NoiseFilterStdout:
     NOISE = (
         "M_chunk", "N_chunk", "While-loop body size",
@@ -1901,6 +1973,18 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
 
         generated = tokenizer.decode(out_tokens, skip_special_tokens=True)
         self._decoded_token_ids = out_tokens
+        # Decode-loop accounting for the TEST_RESULT line (read by _print_test_result).
+        self._report_decode = {
+            "generated_text": generated,
+            "token_ids": [int(t) for t in out_tokens],
+            "n_tokens": n,
+            "steps": len(self._decode_step_us),
+            "hw_us": float(sum(self._decode_step_us)),
+            "first_hw_us": float(self._decode_step_us[0]) if self._decode_step_us else None,
+            "flops_per_step": int(flops),
+            "wall_s": total_dt,
+            "one_shot": bool(one_shot),
+        }
         return {
             "token_ids":      out_tokens,
             "generated_text": generated,
@@ -3983,6 +4067,13 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
 
     # Surface timing through the same field the caller's pretty-printer uses.
     ue._step_hw_latency_us = total_hw_us
+    # Prefill accounting for the TEST_RESULT line (same numbers as the line printed below).
+    ue._report_prefill = {
+        "tokens": T_prompt,
+        "hw_us": float(total_hw_us),
+        "flops": int(_theoretical_flops_per_step(ue, 1) * T_prompt),
+        "wall_s": time.time() - t_wall_start,
+    }
     if verbose:
         dt = time.time() - t_wall_start
         flops = _theoretical_flops_per_step(ue, 1) * T_prompt
@@ -4356,6 +4447,8 @@ def write_unified_bin(ue, bin_dir: str, encoder_bytes: bytes, vis_meta: dict,
         "decoder_final_norm_dram": ue._decoder_final_norm_dram,
         "max_context": ue.max_context,
         "n_patches": vis_meta.get("n_patches"),
+        # Compile-time FLOP count of the encoder section (accounting only; None if unknown).
+        "encoder_flops": vis_meta.get("encoder_flops"),
         "mg_out":    vis_meta.get("mg_out"),
         "n_merged":  vis_meta.get("n_merged"),
         "fc2_dim":   vis_meta.get("fc2_dim"),
@@ -4384,6 +4477,12 @@ def run_vision_from_bin(ue, raw: bytes, meta: dict, model_dir: str, hf_inputs) -
     ue.allocate_program_dram(meta["encoder_size"])
     ue.start_execute_from_dram(enc_addr)
     ue.wait_queue(120.0)
+    # Accounting for the TEST_RESULT line: device latency counter of the encoder program, and
+    # the FLOP count recorded when this encoder section was built (absent in older bins).
+    ue._vis_hw_latency_us = ue.report_latency_in_us()
+    _enc_flops = meta.get("encoder_flops")
+    ue._vis_encoder_flops = (_enc_flops if (isinstance(_enc_flops, (int, float))
+                                            and meta.get("n_patches") == ue._vis_n_patches) else None)
     return _read_dram_bf16(ue, ue._vis_encoder_out_dram, (ue._vis_n_merged, ue._vis_fc2_dim))
 
 
@@ -4595,19 +4694,23 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         for src, dst in ((q_src, VIS_FLASH_Q), (k_src, VIS_FLASH_K), (v_src, VIS_FLASH_V)):
             ue.accelerator_memory_to_sram(src, 0x00000, elems)
             ue.sram_to_accelerator_memory(0x00000, dst, elems)
-        ue.flash_attention_core_cached(
+        _attn_flops = ue.flash_attention_core_cached(
             head_dim=HEAD_D, seq_len=N_P,
             Q_DRAM_ADDR=VIS_FLASH_Q, K_DRAM_ADDR=VIS_FLASH_K, V_DRAM_ADDR=VIS_FLASH_V,
             OUTPUT_DRAM_ADDR=VIS_FLASH_OUT, SCRATCH_DRAM_ADDR=ATTN_SCRATCH,
             IDENTITY_DRAM_ADDR=VIS_EYE, BIAS_DRAM_ADDR=VIS_BIAS)
+        _vis_flops.add(_attn_flops)
         ue.accelerator_memory_to_sram(VIS_FLASH_OUT, 0x00000, elems)
         ue.sram_to_accelerator_memory(0x00000, out_dst, elems)
 
+    # FLOP accounting only: sum what matmul / layer-norm / RoPE / attention return at compile
+    # time. The chunked residual adds (eltwise_add_core returns no count) are not included.
+    _vis_flops = _FlopSum()
     ue.start_capture()
     ue.generate_instruction_add_set(vis_M, N_P)
 
     # Phase 2: patch_embed + pos.
-    ue.matmat_mul_core(M=N_P, K=K_PIXEL, N=HIDDEN,
+    _vis_flops += ue.matmat_mul_core(M=N_P, K=K_PIXEL, N=HIDDEN,
         A_DRAM_ADDR=PIXEL, B_DRAM_ADDR=PATCH_W, OUTPUT_DRAM_ADDR=PATCH_OUT,
         C_DRAM_ADDR=PATCH_B, bias_mode="broadcast_N", is_B_quantized=False,
         gpr_M_reg=vis_M)
@@ -4616,11 +4719,11 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     # Phase 3: 24 layers (BLOCK_OUT is the running residual stream).
     for li in range(DEPTH):
         L = layer_addrs[li]
-        ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=BLOCK_OUT,
+        _vis_flops += ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=BLOCK_OUT,
             OUTPUT_DRAM_ADDR=LN1_OUT, GAMMA_DRAM_ADDR=L["LN1_W"],
             BETA_DRAM_ADDR=L["LN1_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS,
             INV_N_DRAM_ADDR=ln_inv_n)
-        ue.matmat_mul_core(M=N_P, K=HIDDEN, N=QKV_DIM,
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=HIDDEN, N=QKV_DIM,
             A_DRAM_ADDR=LN1_OUT, B_DRAM_ADDR=L["QKV_W_DATA"], OUTPUT_DRAM_ADDR=QKV_OUT,
             C_DRAM_ADDR=L["QKV_B"], bias_mode="broadcast_N",
             is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["QKV_W_SCALE"],
@@ -4641,7 +4744,7 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         # Batched rope on head-major Q,K: one PBI call over all N_HEADS*N_P rows.
         ue.generate_instruction_add_set(vis_M, N_HEADS * N_P)
         for buf in (Q_PERM, K_PERM):
-            ue.rope_hf_core_dram(M=N_HEADS * N_P, N=HEAD_D,
+            _vis_flops += ue.rope_hf_core_dram(M=N_HEADS * N_P, N=HEAD_D,
                 input_dram_addr=buf, output_dram_addr=buf,
                 cos_dram_addr=VIS_ROPE_COS, sin_dram_addr=VIS_ROPE_SIN,
                 gpr_M_reg=vis_M)
@@ -4658,22 +4761,22 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
             ue.ue_memcpy_to_dram(MEMCPY_TYPE.URAM.value, URAM_SECTION.URAM_A.value,
                 URAM_START_ADDR, ATTN_CONCAT + h * HEAD_D * BF16, N_P * HEAD_D * BF16,
                 stride_bytes_per_chunk=HEAD_D * BF16, stride_jump_bytes=HIDDEN * BF16)
-        ue.matmat_mul_core(M=N_P, K=HIDDEN, N=HIDDEN,
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=HIDDEN, N=HIDDEN,
             A_DRAM_ADDR=ATTN_CONCAT, B_DRAM_ADDR=L["PROJ_W_DATA"], OUTPUT_DRAM_ADDR=ATTN_PROJ,
             C_DRAM_ADDR=L["PROJ_B"], bias_mode="broadcast_N",
             is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["PROJ_W_SCALE"],
             gpr_M_reg=vis_M)
         _emit_residual_add(BLOCK_OUT, ATTN_PROJ, POST_ATTN)
-        ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=POST_ATTN,
+        _vis_flops += ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=POST_ATTN,
             OUTPUT_DRAM_ADDR=LN2_OUT, GAMMA_DRAM_ADDR=L["LN2_W"],
             BETA_DRAM_ADDR=L["LN2_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS,
             INV_N_DRAM_ADDR=ln_inv_n)
-        ue.matmat_mul_core(M=N_P, K=HIDDEN, N=MLP_INT,
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=HIDDEN, N=MLP_INT,
             A_DRAM_ADDR=LN2_OUT, B_DRAM_ADDR=L["FC1_W_DATA"], OUTPUT_DRAM_ADDR=FC1_GELU_OUT,
             C_DRAM_ADDR=L["FC1_B"], bias_mode="broadcast_N",
             is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["FC1_W_SCALE"],
             gelu_enable=True, gpr_M_reg=vis_M)
-        ue.matmat_mul_core(M=N_P, K=MLP_INT, N=HIDDEN,
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=MLP_INT, N=HIDDEN,
             A_DRAM_ADDR=FC1_GELU_OUT, B_DRAM_ADDR=L["FC2_W_DATA"], OUTPUT_DRAM_ADDR=FC2_OUT,
             C_DRAM_ADDR=L["FC2_B"], bias_mode="broadcast_N",
             is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["FC2_W_SCALE"],
@@ -4681,16 +4784,16 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         _emit_residual_add(POST_ATTN, FC2_OUT, BLOCK_OUT)
 
     # Phase 4: merger (spatial-merge implicit via M=N_M, K=K_FC reshape).
-    ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=BLOCK_OUT,
+    _vis_flops += ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=BLOCK_OUT,
         OUTPUT_DRAM_ADDR=MG_LN_OUT, GAMMA_DRAM_ADDR=MG_LN_W, BETA_DRAM_ADDR=MG_LN_B,
         gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS, INV_N_DRAM_ADDR=ln_inv_n)
     ue.generate_instruction_add_set(vis_M, N_M)
-    ue.matmat_mul_core(M=N_M, K=K_FC, N=K_FC,
+    _vis_flops += ue.matmat_mul_core(M=N_M, K=K_FC, N=K_FC,
         A_DRAM_ADDR=MG_LN_OUT, B_DRAM_ADDR=MG_FC1_D, OUTPUT_DRAM_ADDR=MG_FC1_OUT,
         C_DRAM_ADDR=MG_FC1_B, bias_mode="broadcast_N",
         is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=MG_FC1_S,
         gelu_enable=True, gpr_M_reg=vis_M)
-    ue.matmat_mul_core(M=N_M, K=K_FC, N=FC2_DIM,
+    _vis_flops += ue.matmat_mul_core(M=N_M, K=K_FC, N=FC2_DIM,
         A_DRAM_ADDR=MG_FC1_OUT, B_DRAM_ADDR=MG_FC2_D, OUTPUT_DRAM_ADDR=MG_OUT,
         C_DRAM_ADDR=MG_FC2_B, bias_mode="broadcast_N",
         is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=MG_FC2_S,
@@ -4710,6 +4813,7 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     for inst in ue.capture_buffer:
         enc_bytes.extend(inst.get_bytes())
     ue._vis_encoder_bytes = bytes(enc_bytes)
+    ue._vis_encoder_flops = _vis_flops.value
     ue._vis_encoder_addr  = prog_base
     ue._vis_encoder_out_dram = MG_OUT
     ue._vis_n_merged = N_M
@@ -4728,6 +4832,7 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     ue.clear_capture_buffer()
     ue.start_execute_from_dram(prog_base)
     ue.wait_queue(120.0)
+    ue._vis_hw_latency_us = ue.report_latency_in_us()   # device latency counter (accounting)
 
     return _read_dram_bf16(ue, MG_OUT, (N_M, FC2_DIM))
 
@@ -4740,6 +4845,8 @@ def _vis_exec_capture(ue):
     ue.allocate_program_dram(prog_size)
     ue.start_execute_from_dram(prog_addr)
     ue.wait_queue(60.0)
+    # Accounting: the legacy encoder is many captures; add up their device latency.
+    ue._vis_hw_latency_us = (getattr(ue, "_vis_hw_latency_us", None) or 0.0) + ue.report_latency_in_us()
     ue.clear_capture_buffer()
     ue.reset_program_dram_addr()
 
@@ -5214,6 +5321,7 @@ def main():
             ue.compile_decoder()
         generate(ue, tokenizer, prompt=args.prompt,
                  max_new_tokens=args.max_new_tokens, decoder_preloaded=True)
+        _print_test_result(ue, args, image_path=None, vision_ran_on_fpga=False)
         return
 
     # VLM-on-hardware: the vision encoder runs FIRST — BEFORE the LM is prepared.
@@ -5273,7 +5381,8 @@ def main():
                 precomputed_vision_tokens = _tok
             vis_encoder_bytes = ue._vis_encoder_bytes
             vis_meta = {"n_patches": ue._vis_n_patches, "mg_out": ue._vis_encoder_out_dram,
-                        "n_merged": ue._vis_n_merged, "fc2_dim": ue._vis_fc2_dim}
+                        "n_merged": ue._vis_n_merged, "fc2_dim": ue._vis_fc2_dim,
+                        "encoder_flops": getattr(ue, "_vis_encoder_flops", None)}
             ue.reset_params_dram_addr()
             ue.reset_tensor_dram_addr()
             ue.reset_program_dram_addr()
@@ -5338,6 +5447,60 @@ def main():
     # generation / full text here.  Silence main()-side epilogue to avoid
     # dumping the whole generation twice.
     del generated
+    _print_test_result(ue, args, image_path=image_path if vision_on else None,
+                       vision_ran_on_fpga=precomputed_vision_tokens is not None)
+
+
+def _print_test_result(ue, args, image_path, vision_ran_on_fpga: bool) -> None:
+    """Print the one-line ``TEST_RESULT: {json}`` that model_auto_test.py parses.
+
+    Every number comes from the run: HW seconds are the device latency counter summed over the
+    FPGA triggers of a stage, GFLOP is the script's theoretical FLOP count for what ran (the
+    analytical per-step LM count that the PREFILL / Decode summary lines print; for vision the
+    compile-time counts returned by the ops when the encoder section was built).
+    """
+    pf = getattr(ue, "_report_prefill", None) or {}
+    dec = getattr(ue, "_report_decode", None) or {}
+    stages = []
+    if vision_ran_on_fpga:
+        vis_hw_us = getattr(ue, "_vis_hw_latency_us", None)
+        vis_flops = getattr(ue, "_vis_encoder_flops", None)
+        stages.append(("vision",
+                       vis_hw_us / 1e6 if vis_hw_us is not None else None,
+                       vis_flops / 1e9 if vis_flops is not None else None))
+    stages.append(("prefill",
+                   pf["hw_us"] / 1e6 if "hw_us" in pf else None,
+                   pf["flops"] / 1e9 if "flops" in pf else None))
+    dec_steps = dec.get("steps", 0)
+    stages.append(("decode",
+                   dec["hw_us"] / 1e6 if "hw_us" in dec else None,
+                   dec["flops_per_step"] * dec_steps / 1e9 if "flops_per_step" in dec else None))
+    first_hw_us = dec.get("first_hw_us")
+    wall_s = dec.get("wall_s") or 0.0
+    result = {
+        "decoded_text": dec.get("generated_text", ""),
+        "generated_token_ids": dec.get("token_ids"),
+        "mode": "vlm" if image_path else "text",
+        "image": image_path,
+        "vision_on_fpga": bool(vision_ran_on_fpga) if image_path else None,
+        "multi_core": ue.multi_core,
+        "prefill_speed_tok_s": (round(pf["tokens"] / pf["wall_s"], 2)
+                                if pf.get("wall_s") else None),
+        "decode_speed_tok_s": round(dec_steps / wall_s, 2) if (dec_steps and wall_s > 0) else None,
+        "prefill_hw_ms": pf["hw_us"] / 1e3 if "hw_us" in pf else None,
+        "decode_first_hw_ms": first_hw_us / 1e3 if first_hw_us else None,
+        "decode_avg_hw_ms": dec["hw_us"] / dec_steps / 1e3 if dec_steps else None,
+        # decode_first_tok_s: HW-latency rate of the first decode step; decode_avg_tok_s: the
+        # wall-clock average of the "Decode summary" line. decoded_tokens is that line's count
+        # (decode-loop steps; the text also holds the first token, which prefill produced).
+        **_shared_report(
+            {"prompt": args.prompt, "image": image_path} if image_path else args.prompt,
+            ue.multi_core, stages,
+            prefill_tokens=pf.get("tokens"), decoded_tokens=dec.get("n_tokens"),
+            decode_first_tok_s=(1e6 / first_hw_us) if first_hw_us else None,
+            decode_avg_tok_s=(dec_steps / wall_s) if (dec_steps and wall_s > 0) else None),
+    }
+    print("TEST_RESULT: " + json.dumps(result, ensure_ascii=False))
 
 
 def _model_info(text_model) -> str:

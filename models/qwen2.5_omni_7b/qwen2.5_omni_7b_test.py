@@ -286,6 +286,55 @@ _FIT_FILLER_SENTENCES = (
 )
 
 
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
+
+
 def _filler_words(count: int) -> str:
     """``count`` words, cycling the filler sentences in order."""
     words: list[str] = []
@@ -4638,6 +4687,27 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         "prompt_tokens": reported_prefill_tokens + 1,
         "rope_delta": rope_delta,
     }
+    # Shared report keys (model_auto_test.py), built from the stage_metrics rows above: per
+    # stage the HW-counter latency and the FLOPs the engine issued (the "flops" column, the one
+    # the % of peak figures use; the model-dimension count stays in model_gflop_work).
+    # decode_first_tok_s is the HW rate of the first decode step, decode_avg_tok_s the
+    # wall-clock average over the loop (= decode_speed_tok_s).
+    _stage_names = {"Vision encoder": "vision", "Audio encoder": "audio",
+                    "Prefill": "prefill", "Decode": "decode"}
+    _report_input = {"prompt": prompt}
+    if args.image:
+        _report_input["image"] = os.path.abspath(args.image)
+    if args.audio:
+        _report_input["audio"] = os.path.abspath(args.audio)
+    _engines = int(getattr(ue, "multi_core", None) or REQUIRED_ENGINES)
+    result.update(_shared_report(
+        _report_input if (args.image or args.audio) else prompt,
+        _engines,
+        [(_stage_names.get(row["stage"], row["stage"]), row["us"] / 1e6, row["flops"] / 1e9)
+         for row in _summary_rows],
+        prefill_tokens=reported_prefill_tokens, decoded_tokens=generated,
+        decode_first_tok_s=result["first_token_tok_s"], decode_avg_tok_s=decode_tok_s,
+        peak_gflops=ue.vis_peak_gflops() or None))
     print("TEST_RESULT: " + json.dumps(result, ensure_ascii=False))
     _write_summary()
 

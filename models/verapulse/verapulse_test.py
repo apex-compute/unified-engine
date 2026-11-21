@@ -271,6 +271,137 @@ from multi_engine_shard import (  # noqa: E402
 
 
 # ======================================================================================
+# FLOP accounting for the TEST_RESULT line (model_auto_test.py). ACCOUNTING ONLY: nothing
+# here changes an emitted instruction.
+# ======================================================================================
+class _FlopTally:
+    """Sum the theoretical FLOPs the user_dma_core ops RETURN while one program compiles.
+
+    Every op kernel in user_dma_core returns its FLOP count (2*M*K*N for a matmul, 4*M*N
+    for an RMS norm, ...) and this file drops those returns. Rather than thread a counter
+    through ~80 call sites and every sharded-region helper in multi_engine_shard, the op
+    entry points are wrapped ON THE CLASS for the duration of a compile -- so calls made
+    on worker engines, through a _ShardedEngineProxy, or from inside the scheduler are
+    all seen -- and unwrapped again in __exit__. The wrapper calls the original with the
+    caller's arguments and hands back its return value untouched.
+
+    Rules:
+      * only the OUTERMOST wrapped call counts (unified_attention_core already sums the
+        matmuls it emits; counting those again would double them). If an outer call
+        returns no number, its wrapped children are counted instead.
+      * a call inside hardware loop_start(loop_cnt=n) ... loop_end() runs n times, so it
+        is multiplied by the product of the open loops on ITS engine (that is what makes
+        DENOISE_ROLLED and the static unroll report the same total). A loop with a
+        runtime trip count (gpr_loop_cnt) cannot be resolved here: the tally is then
+        reported as None, never guessed.
+      * with gpr_M_reg the op's M literal is "template/FLOPs only"; this file passes the
+        real row count there, so the literal is what is counted.
+    NOT counted: raw SRAM-level work with no returned figure (the eltwise multiply inside
+    silu_core_dram, permutes, DRAM<->SRAM copies) -- they return nothing to sum.
+    """
+    OPS = ("matmat_mul_core", "matmat_mul_core_legacy", "matmat_mul_core_dynamic",
+           "quantized_matmat_core", "activation_core",
+           "eltwise_core_dram", "eltwise_core_dram_legacy", "eltwise_core_dram_pbi",
+           "eltwise_core_dram_dynamic",
+           "rms_norm_core_dram", "rms_norm_core_dram_legacy", "rms_norm_core_dram_pbi",
+           "rms_norm_core_dram_dynamic",
+           "layer_norm_core_dram", "layer_norm_core_dram_legacy", "layer_norm_core_dram_pbi",
+           "layer_norm_core_dram_dynamic",
+           "rope_hf_core_dram", "rope_hf_core_dram_legacy", "rope_hf_core_dram_dynamic",
+           "rope_hf_core_dram_gqa", "rope_hf_core_dram_gqa_legacy",
+           "rope_hf_core_dram_gqa_dynamic",
+           "unified_attention_core", "unified_attention_core_legacy",
+           "unified_attention_core_dynamic")
+    # nn_lib helpers imported into this module that return their element count (= FLOPs)
+    # and do the work with raw SRAM ops no class wrapper sees.
+    MODULE_OPS = ("eltwise_add_core_dram", "eltwise_mul_core_dram")
+
+    def __init__(self):
+        self.total = 0
+        self.unresolved_loops = 0
+        self._frames = []           # open wrapped calls: [children_sum]
+        self._loops = {}            # id(engine) -> [trip count | None] of its open loops
+        self._saved_cls, self._saved_mod = {}, {}
+
+    def flops(self):
+        """Total FLOPs of the compiled program, or None if a runtime-count loop hid some."""
+        return None if self.unresolved_loops else int(self.total)
+
+    def _multiplier(self, engine):
+        m = 1
+        for n in self._loops.get(id(engine), ()):
+            if n is None:
+                self.unresolved_loops += 1
+            else:
+                m *= n
+        return m
+
+    def _wrap_op(self, fn, engine_of):
+        tally = self
+
+        def counted(*a, **kw):
+            frame = [0]
+            tally._frames.append(frame)
+            try:
+                ret = fn(*a, **kw)
+            finally:
+                tally._frames.pop()
+            num = isinstance(ret, (int, float)) and not isinstance(ret, bool)
+            value = ret if num else frame[0]
+            if tally._frames:
+                tally._frames[-1][0] += value
+            elif value:
+                tally.total += value * tally._multiplier(engine_of(a, kw))
+            return ret
+        counted.__wrapped__ = fn
+        return counted
+
+    def __enter__(self):
+        tally = self
+        for name in self.OPS:
+            fn = UnifiedEngine.__dict__.get(name)
+            if callable(fn):
+                self._saved_cls[name] = fn
+                setattr(UnifiedEngine, name, self._wrap_op(fn, lambda a, kw: a[0]))
+        g = globals()
+        for name in self.MODULE_OPS:
+            fn = g.get(name)
+            if callable(fn):
+                self._saved_mod[name] = fn
+                g[name] = self._wrap_op(fn, lambda a, kw: a[0] if a else kw.get("ue"))
+        ls, le = UnifiedEngine.__dict__.get("loop_start"), UnifiedEngine.__dict__.get("loop_end")
+        if callable(ls) and callable(le):
+            self._saved_cls["loop_start"], self._saved_cls["loop_end"] = ls, le
+
+            def loop_start(ue, *a, **kw):
+                # Inside a counted op the op's own return already covers its loops: push
+                # a neutral 1 so the matching loop_end still pops the right entry.
+                if tally._frames:
+                    n = 1
+                else:
+                    gpr = kw.get("gpr_loop_cnt", a[1] if len(a) > 1 else None)
+                    n = None if gpr is not None else kw.get("loop_cnt", a[0] if a else 0)
+                tally._loops.setdefault(id(ue), []).append(n)
+                return ls(ue, *a, **kw)
+
+            def loop_end(ue, *a, **kw):
+                stack = tally._loops.get(id(ue))
+                if stack:
+                    stack.pop()
+                return le(ue, *a, **kw)
+            UnifiedEngine.loop_start, UnifiedEngine.loop_end = loop_start, loop_end
+        return self
+
+    def __exit__(self, *exc):
+        for name, fn in self._saved_cls.items():
+            setattr(UnifiedEngine, name, fn)
+        g = globals()
+        for name, fn in self._saved_mod.items():
+            g[name] = fn
+        return False
+
+
+# ======================================================================================
 # config
 # ======================================================================================
 
@@ -7357,7 +7488,10 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 self._preclear_flags_once(sched)
                 sched.start_workers(self._vis_worker_prog_addrs)
             with PHASES.track(label, "exec"):
-                self.program_execute(prog, timeout=self.EXEC_TIMEOUT)
+                _lat = self.program_execute(prog, timeout=self.EXEC_TIMEOUT)
+            # program_execute already read the device latency counter; keep it (TEST_RESULT).
+            self.__dict__.setdefault("_device_latency_log", []).append(
+                (label, float(_lat[0]) if _lat else None))
             if multi:
                 # The primary retires its halt as soon as the last rendezvous clears; a
                 # worker may still be draining its (write-free) margin NOPs.
@@ -7556,6 +7690,10 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 f"not a silent success. wait_queue() does not raise on its own; this "
                 f"check exists precisely to catch that. Do not trust any downstream "
                 f"result from this run.")
+        # Device latency counter of the program that just halted (a register read), kept
+        # per launch for the TEST_RESULT line: the PHASES "exec" rows are host wall.
+        self.__dict__.setdefault("_device_latency_log", []).append(
+            (label, float(self.report_latency_in_us())))
         _original_print(f"  [{label}] done in {time.perf_counter() - t0:.1f}s" + " " * 20)
 
     def _compile_once(self, key, compile_fn, label="compile_once"):
@@ -7582,11 +7720,15 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 f"precompile_all(stages=...) instead of compiling lazily.")
         _original_print(f"  [{label}] compiling ONCE...", end="\r", flush=True)
         before = self.get_program_dram_addr()
-        with PHASES.track(f"compile {label}", "compile"), silenced():
+        with PHASES.track(f"compile {label}", "compile"), silenced(), _FlopTally() as _tally:
             addr = compile_fn()
         secs = PHASES.rows[-1][2]
         size = self.get_program_dram_addr() - before
         cache[key], meta[key] = addr, (addr, size)
+        # Theoretical FLOPs of ONE execution of this program, all engines (TEST_RESULT).
+        # A new instance attribute published during precompile_all, so the compile-attr
+        # diff persists it into the bin manifest and a bin run gets it back on load.
+        self.__dict__.setdefault("_prog_flops", {})[key] = _tally.flops()
         _original_print(f"  [{label}] compiled in {secs:.2f}s  {size / 1e6:.2f} MB "
                         f"@0x{addr:X}" + " " * 16)
         return addr
@@ -7677,6 +7819,51 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
               f"actions {tuple(actions.shape)} absmax={actions.abs().max():.4f}")
         return actions
 
+    def stage_report(self):
+        """The shared TEST_RESULT keys (model_auto_test.py) for the last run_inference.
+
+        hw_s   device latency counter, summed over the stage's launches (vision launches
+               once per camera slot unless batched) -- the primary engine's counter; it
+               ends at the last rendezvous, so it covers the workers' work too.
+        gflop  _prog_flops[stage] (the op kernels' returned theoretical FLOPs for ONE
+               execution, every engine -- see _FlopTally) x the number of launches.
+               None when the program was loaded from a bin set dumped before the count
+               was persisted: nothing was compiled, so there is nothing to sum.
+        peak   user_dma_core.UE_PEAK_GFLOPS per engine x the engines the stage ran on.
+        """
+        per_engine = (user_dma_core.CORE_CLOCK_FREQ_HZ * 128 / 1e9 if user_dma_core.CORE_CLOCK_FREQ_HZ else None)  # GFLOP/s per engine
+        eng = self._bin_engines()
+        flops = self.__dict__.get("_prog_flops") or {}
+        log = list(self.__dict__.get("_device_latency_log", []))
+        spec = (("vision", "exec vision", "vision"), ("prefix", "prefix", "prefix"),
+                ("denoise", "denoise", f"denoise ({self.N_STEPS} steps)"))
+        stages = []
+        for key, label, name in spec:
+            lat = [us for lb, us in log if lb.startswith(label)]
+            if not lat:
+                continue                                  # stage did not run (--stop-after)
+            ne = int(eng[key])
+            hw_s = sum(lat) / 1e6 if all(us is not None for us in lat) else None
+            f = flops.get(key)
+            gflop = f * len(lat) / 1e9 if f is not None else None
+            gflops = gflop / hw_s if (gflop is not None and hw_s) else None
+            if key == "vision":
+                name = f"vision ({len(lat)} launch{'es' if len(lat) > 1 else ''})"
+            stages.append({"name": name, "hw_s": hw_s, "gflop": gflop, "gflops": gflops,
+                           "pct_peak": (100 * gflops / (per_engine * ne)
+                                        if (gflops is not None and per_engine) else None),
+                           "engines": ne, "launches": len(lat)})
+        engines = max([st["engines"] for st in stages] or [1])
+        peak = per_engine * engines if per_engine else None
+        have_t = bool(stages) and all(st["hw_s"] is not None for st in stages)
+        have_f = bool(stages) and all(st["gflop"] is not None for st in stages)
+        total_hw_s = sum(st["hw_s"] for st in stages) if have_t else None
+        total_gflop = sum(st["gflop"] for st in stages) if have_f else None
+        avg = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+        return {"engines": engines, "peak_gflops": peak, "stages": stages,
+                "total_hw_s": total_hw_s, "total_gflop": total_gflop, "avg_gflops": avg,
+                "avg_pct_peak": (100 * avg / peak) if (avg is not None and peak) else None}
+
     def run_inference(self, images_hwc, token_ids, state, noise=None, snr=False,
                       stop_after=None, strict_gates=False):
         """vision -> prefix -> denoise on hardware. Returns the EXECUTED action slice
@@ -7712,6 +7899,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # the model runs vision -> prefix -> denoise back to back and is timed once
         # rather than reconstructed by adding three device counters together.
         _fwd = PHASES.mark_forward_start()
+        self.__dict__.setdefault("_device_latency_log", []).clear()
 
         # ---- 1. vision (ViT x2 slots + connector) --------------------------------
         with PHASES.track("stage vision", "stage"):
@@ -11156,6 +11344,7 @@ def main():
     # --- observation -------------------------------------------------------------
     V = _CFG["vision"]
     slots, IMG, CH = V["num_image_slots"], V["image_size"], V["num_channels"]
+    _img_src = f"images {args.images}" if args.images else "sample observation images"
     if args.images:
         import numpy as np
         images = torch.as_tensor(np.load(args.images))
@@ -11163,6 +11352,7 @@ def main():
         try:
             images = load_sample_observation()[0]
         except NotImplementedError:
+            _img_src = f"deterministic synthetic images (torch.randint, seed={args.seed})"
             # Deterministic synthetic cameras. The gate scores HW against the oracle on
             # whatever pixels were actually fed, so image REALISM is irrelevant to
             # correctness -- but determinism is not: the run must be reproducible, and
@@ -11272,10 +11462,13 @@ def main():
         # NOT in this run -- say so rather than let a plausible action table imply the
         # robot was told anything.
         text_mask = None
+        _tok_src = f"prompt={args.prompt!r}"
         try:
             token_ids, text_mask = tokenize(args.prompt, L["tokenizer_max_length"],
                                             return_mask=True)
         except NotImplementedError:
+            _tok_src = (f"RANDOM token ids (tokenize() is a stub; prompt {args.prompt!r} "
+                        f"NOT encoded)")
             token_ids = torch.randint(0, L["vocab_size"], (L["tokenizer_max_length"],),
                                       generator=g)
             print(f"  (tokenize() is a stub -- using deterministic RANDOM token ids, "
@@ -11399,6 +11592,27 @@ def main():
             ue.dump_bins(BIN_DIR)
 
         PHASES.summary("hardware timing (compile is paid once, exec every inference)")
+
+        # One machine-readable line for model_auto_test.py (it takes the LAST one).
+        _ex = torch.as_tensor(executed).float()
+        _chunk = torch.as_tensor(ue._last_inference["actions_chunk"]).float()
+        _fwd_rows = [r[2] for r in PHASES.rows if r[1] == "forward"]
+        result = {
+            "input": (f"{_tok_src}; {tuple(images.shape)} {_img_src}; state "
+                      f"torch.randn({HEADC['state_dim']}) and denoise noise from seed {args.seed} "
+                      f"(not a real proprioception vector)"),
+            "output": (f"action chunk {_chunk.shape[0]}x{_chunk.shape[1]} (normalized), absmax "
+                       f"{float(_chunk.abs().max()):.4f}; executed slice {_ex.shape[0]}x{_ex.shape[1]} "
+                       f"min {float(_ex.min()):.4f} max {float(_ex.max()):.4f}, "
+                       f"finite={bool(torch.isfinite(_chunk).all())}"),
+            "actions_finite": bool(torch.isfinite(_chunk).all()),
+            "actions_absmax": float(_chunk.abs().max()),
+            "variant": VARIANT,
+            "programs_from_bin": bool(_use_bins),
+            "forward_wall_s": _fwd_rows[-1] if _fwd_rows else None,
+        }
+        result.update(ue.stage_report())
+        _original_print("TEST_RESULT: " + json.dumps(result))
         return
 
     tokens = ue.run_vision(images)

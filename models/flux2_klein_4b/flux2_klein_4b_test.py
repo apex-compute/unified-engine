@@ -1191,6 +1191,14 @@ def main(argv=None) -> int:
                 _log("  exporting weights (one-time)...")
                 W.build_all(cfg)
                 break
+        if args.vae == "fpga":
+            stale = W.vae_weights_stale(paths["vae_weights"])
+            if stale:
+                if args.no_compile:
+                    raise RuntimeError(f"{paths['vae_weights']}: {stale}; re-export it with "
+                                       "flux2_klein_4b_weights.py --only vae --force")
+                _log(f"  vae_weights.pt {stale}; re-exporting the VAE weights...")
+                W.build_all(cfg, which=("vae",))
         user_dma_core.set_dma_device(args.dev)
         user_dma_core.configure_clock_from_hardware()
     ne = resolve_engines(args.engines, args.compile_only)
@@ -1277,6 +1285,32 @@ def main(argv=None) -> int:
         _log(f"  vs IF4 host reference: embeds {result['embeds_snr_db']:.1f} dB, step-0 velocity "
              f"{result['velocity0_snr_db']:.1f} dB, per-step latents {[round(x, 1) for x in result['step_latents_snr_db']]} dB, "
              f"image PSNR {result['image_psnr_db']:.1f} dB")
+    # ---------------- shared report keys (model_auto_test.py) ----------------
+    # hw_s = the device latency counter of each FPGA phase (te_s / dit_s / vae_s above are
+    # host wall around it); gflop = the FLOP total the compiler counted for that program.
+    peak = user_dma_core.CORE_CLOCK_FREQ_HZ * 128 / 1e9 * ne if user_dma_core.CORE_CLOCK_FREQ_HZ else None
+    stages = []
+    for key, label in (("te", "text_encoder"), ("dit", f"dit ({geo.num_inference_steps} steps)"), ("vae", "vae")):
+        hw_s, flops = ue.timings.get(f"{key}_device_s"), ue.timings.get(f"{key}_flops")
+        if hw_s is None or flops is None:
+            continue                                  # phase ran on the host (or not at all)
+        gflop = flops / 1e9
+        gflops = gflop / hw_s if hw_s > 0 else None
+        stages.append({"name": label, "hw_s": hw_s, "gflop": gflop, "gflops": gflops,
+                       "pct_peak": 100.0 * gflops / peak if (gflops is not None and peak) else None})
+    total_hw_s = sum(st["hw_s"] for st in stages)
+    total_gflop = sum(st["gflop"] for st in stages)
+    avg_gflops = total_gflop / total_hw_s if total_hw_s > 0 else None
+    host_phases = [n for n, where in (("text encoder", args.text_encoder), ("VAE", args.vae)) if where == "host"]
+    result["input"] = (f"prompt={args.prompt!r}, seed={args.seed}, {geo.height}x{geo.width}, "
+                       f"{geo.n_txt} text tokens, {geo.num_inference_steps} steps")
+    psnr = result.get("image_psnr_db")
+    result["output"] = (f"{geo.height}x{geo.width} image {out}, finite={result['finite']}"
+                        + (f", PSNR {psnr:.1f} dB vs IF4 host reference" if psnr is not None else "")
+                        + (f" ({' and '.join(host_phases)} on the host: not in stages)" if host_phases else ""))
+    result.update({"peak_gflops": peak, "stages": stages, "total_hw_s": total_hw_s, "total_gflop": total_gflop,
+                   "avg_gflops": avg_gflops,
+                   "avg_pct_peak": 100.0 * avg_gflops / peak if (avg_gflops is not None and peak) else None})
     print("TEST_RESULT: " + json.dumps(result))
     return 0
 

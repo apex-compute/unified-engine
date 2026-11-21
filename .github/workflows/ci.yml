@@ -145,6 +145,44 @@ jobs:
             user_hw_test_summary.md
           if-no-files-found: warn
 
+      - name: Publish results to the job summary
+        # Shows model_auto_test_results.txt on the run page itself (the Summary
+        # tab), not only in the artifact or a PR comment. A full run shows both
+        # passes; user_hw_test_summary.md goes in a collapsed block below.
+        if: always()
+        run: |
+          MAX=400000   # bytes per file: GitHub caps a step summary at 1 MiB
+          show() {     # show TITLE FILE
+            [ -f "$2" ] || return 0
+            echo "### $1"
+            echo
+            echo '```text'
+            head -c "$MAX" "$2"
+            [ "$(wc -c < "$2")" -gt "$MAX" ] && echo "... truncated: the full file is in the model-hw-ci-results artifact"
+            echo '```'
+            echo
+          }
+          {
+            echo "## Unified Engine HW CI: model_auto_test.py"
+            echo
+            if [ -f model_auto_test_results_pass1.txt ]; then
+              show "Pass 1: compile + run" model_auto_test_results_pass1.txt
+              show "Pass 2: run from bin, shuffled" model_auto_test_results_shuffle.txt
+            elif [ -f model_auto_test_results.txt ]; then
+              show "model_auto_test_results.txt" model_auto_test_results.txt
+            else
+              echo "_model_auto_test_results.txt was not produced; see the job log._"
+              echo
+            fi
+            if [ -f user_hw_test_summary.md ]; then
+              echo "<details><summary>user_hw_test.py summary</summary>"
+              echo
+              head -c "$MAX" user_hw_test_summary.md
+              echo
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Comment CI results on PR
         if: always()
         uses: actions/github-script@v7
