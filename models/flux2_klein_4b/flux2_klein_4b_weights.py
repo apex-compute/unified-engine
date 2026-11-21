@@ -526,6 +526,25 @@ def load_config(path: str | None = None) -> dict:
         return json.load(f)
 
 
+def vae_weights_stale(path: str) -> str | None:
+    """Why vae_weights.pt cannot be used as it is, or None when it is current.
+
+    Since the VAE convs use the checkpoint's BF16 weights (8c157e5), every conv entry
+    must carry "weight" next to its IF8 codes. An older export has codes only, and
+    build_all() used to keep it because it only checked that the file exists."""
+    if not os.path.exists(path):
+        return "missing"
+    try:
+        convs = torch.load(path, map_location="cpu")["convs"]
+    except Exception as e:                       # truncated / foreign file
+        return f"unreadable ({e})"
+    old = [k for k, c in convs.items() if "weight" not in c]
+    if old:
+        return (f"old format: {len(old)} of {len(convs)} convs have no native BF16 weights "
+                f"(first: {old[0]})")
+    return None
+
+
 def build_all(cfg: dict, snap: str | None = None, force: bool = False, which=("te", "dit", "vae")) -> None:
     snap = snap or ref.snapshot_dir(cfg["paths"]["hf_model_repo"])
     q = cfg["quantization"]
@@ -536,8 +555,12 @@ def build_all(cfg: dict, snap: str | None = None, force: bool = False, which=("t
     if "dit" in which and (force or not os.path.exists(paths["params_dit_bin"])):
         build_dit_bin(snap, cfg, paths["params_dit_bin"], paths["params_dit_meta"],
                       q["precision"], q["block_size"], q["bf16_keys"])
-    if "vae" in which and (force or not os.path.exists(paths["vae_weights"])):
-        build_vae_weights(snap, cfg, paths["vae_weights"])
+    if "vae" in which:
+        stale = None if force else vae_weights_stale(paths["vae_weights"])
+        if force or stale:
+            if stale and stale != "missing":
+                print(f"[weights] {paths['vae_weights']}: {stale}; re-exporting")
+            build_vae_weights(snap, cfg, paths["vae_weights"])
 
 
 if __name__ == "__main__":

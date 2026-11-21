@@ -1191,6 +1191,14 @@ def main(argv=None) -> int:
                 _log("  exporting weights (one-time)...")
                 W.build_all(cfg)
                 break
+        if args.vae == "fpga":
+            stale = W.vae_weights_stale(paths["vae_weights"])
+            if stale:
+                if args.no_compile:
+                    raise RuntimeError(f"{paths['vae_weights']}: {stale}; re-export it with "
+                                       "flux2_klein_4b_weights.py --only vae --force")
+                _log(f"  vae_weights.pt {stale}; re-exporting the VAE weights...")
+                W.build_all(cfg, which=("vae",))
         user_dma_core.set_dma_device(args.dev)
         user_dma_core.configure_clock_from_hardware()
     ne = resolve_engines(args.engines, args.compile_only)
