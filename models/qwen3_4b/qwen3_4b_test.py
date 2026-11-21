@@ -69,6 +69,46 @@ builtins.print = quiet_print
 # down_proj K=6144 ≤ SCALE_BRAM_ELEMENTS=8192 — no K-split needed.
 # (Previously was 8960 which required splitting; mlp_elements corrected to 6144.)
 
+def _attention_flops(batch: int, aligned: int, head_dim: int, pre_scaled: bool) -> int:
+    """FLOPs unified_attention_core returns for one call: optional Q pre-scale, Q.K^T with
+    softmax and full-matrix bias, then scores.V  (matmat_mul_core: 2*M*K*N, +5*M*N softmax,
+    +M*N bias)."""
+    flops = 0 if pre_scaled else batch * head_dim
+    flops += 2 * batch * head_dim * aligned + 6 * batch * aligned
+    flops += 2 * batch * aligned * head_dim
+    return flops
+
+
+def _prefill_flops(ue, inst_meta: dict, actual_seq_len: int, pre_scaled: bool) -> int:
+    """FLOPs the prefill program runs for ``actual_seq_len`` rows.
+
+    The meta holds the count at the compile-time template length. Everything except
+    attention is linear in the rows; attention is batch x context, and at run time its
+    context is the 64-aligned ACTUAL length, so it is taken out of the template count and
+    put back at the real size. Scaling the whole template linearly counted attention at the
+    template's context width and gave prefill rates above the hardware peak."""
+    template = int(inst_meta["prefill_template_seq_len"])
+    calls = int(ue.LAYER_SIZE) * int(ue.num_kv_heads)
+    def attention(rows):
+        q_rows = rows * int(ue.group_size)
+        return calls * _attention_flops(q_rows, ((q_rows + 63) // 64) * 64,
+                                        int(ue.actual_head_dim), pre_scaled)
+    linear = int(inst_meta["prefill_template_flops"]) - attention(template)
+    return linear * actual_seq_len // max(template, 1) + attention(actual_seq_len)
+
+
+def _decode_flops(ue, inst_meta: dict, first_context: int, steps: int, pre_scaled: bool) -> list:
+    """Per-step FLOPs of the decode program for ``steps`` tokens, the first one attending
+    over ``first_context`` positions. The meta count has attention at the compiled context
+    (DECODER_ALIGNED_SEQ_LEN); each step really runs it over the 64-aligned live context."""
+    calls = int(ue.LAYER_SIZE) * int(ue.num_kv_heads)
+    def attention(aligned):
+        return calls * _attention_flops(int(ue.group_size), aligned,
+                                        int(ue.actual_head_dim), pre_scaled)
+    fixed = int(inst_meta["decoder_total_flops"]) - attention(int(ue.DECODER_ALIGNED_SEQ_LEN))
+    return [fixed + attention(((first_context + i + 63) // 64) * 64) for i in range(steps)]
+
+
 def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
                    decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
     """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
@@ -1471,6 +1511,10 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
+        # Optional cap on generated tokens (--max-new-tokens).
+        _limit = getattr(self, "max_new_tokens", None)
+        if _limit:
+            max_seq_len = min(max_seq_len, self.seq_len + int(_limit))
 
         # On-FPGA repetition-penalty state. _generated_tokens is seeded with the prompt by
         # main() (or run_from_bin); decoded ids are appended below. The penalty is folded
@@ -1605,6 +1649,8 @@ def main():
     pen_group.add_argument('--rep-window', type=int, default=256,
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
                              'special tokens). Default 256.')
+    parser.add_argument("--max-new-tokens", dest="max_new_tokens", type=int, default=None, metavar="N",
+                        help="Stop decoding after N generated tokens (default: run to the stop token or the context).")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1624,6 +1670,7 @@ def main():
     user_dma_core.configure_clock_from_hardware()
 
     ue = Qwen3_4b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    ue.max_new_tokens = args.max_new_tokens
     cfg = _load_config(script_dir)
     # Always tokenize via apply_chat_template — no hardcoded ids in the config.
     user_prompt = args.prompt if args.prompt is not None else cfg.get("default_prompt", "What is 3 + 5?")
@@ -1672,12 +1719,9 @@ def main():
     decoder_total_flops  = inst_meta["decoder_total_flops"]
 
     actual_seq_len = len(prefill_seq) - 1
-    # Rescale prefill FLOPs from the compile-time template to the actual seq_len.
-    # The meta records FLOPs for ``prefill_template_seq_len`` rows; runtime ops execute
-    # ``actual_seq_len`` rows (via gpr_seq_len-driven PBI loops), so linear scaling gives
-    # the real work count for the GFLOPS report.
-    template_seq_len = int(inst_meta["prefill_template_seq_len"])
-    gflops_prefill = inst_meta["prefill_template_flops"] * actual_seq_len // max(template_seq_len, 1)
+    # FLOPs for the rows that really run (see _prefill_flops / _decode_flops).
+    gflops_prefill = _prefill_flops(ue, inst_meta, actual_seq_len, pre_scaled=False)
+    decoder_total_flops = _decode_flops(ue, inst_meta, actual_seq_len + 1, 1, pre_scaled=False)[0]
     print(f"\n--- Starting prefill (actual {actual_seq_len} tokens, dynamic seq_len) ---")
     print(f"Prompt tokens ({len(prefill_seq)}): {prefill_seq}")
     print(f"Prompt text: {ue.tokenizer.decode(prefill_seq, skip_special_tokens=False)!r}")
@@ -1721,7 +1765,8 @@ def main():
         **_shared_report(
             user_prompt, 1,
             [("prefill", _pf_hw_us / 1e6 if _pf_hw_us is not None else None, gflops_prefill / 1e9),
-             ("decode", _dec_hw_us / 1e6, decoder_total_flops * len(_dec_lats_us) / 1e9)],
+             ("decode", _dec_hw_us / 1e6,
+              sum(_decode_flops(ue, inst_meta, actual_seq_len + 1, len(_dec_lats_us), pre_scaled=False)) / 1e9)],
             prefill_tokens=actual_seq_len, decoded_tokens=len(_dec_lats_us),
             decode_first_tok_s=(1e6 / _dec_lats_us[0]) if (_dec_lats_us and _dec_lats_us[0]) else None,
             decode_avg_tok_s=(decoded_tokens / latency_decoder) if (_dec_lats_us and latency_decoder > 0) else None),

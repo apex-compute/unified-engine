@@ -241,8 +241,8 @@ def main():
         if worst is not None:
             output += f"; worst of {len(snrs)} section SNRs vs CPU: {worst[1]:.2f} dB (section {worst[0]})"
         result = dict(_shared_report(
-            f"text ({len(args.prompt)} chars, {len(phonemes)} phonemes, voice {args.voice}, "
-            f"speed {args.speed:g}): {args.prompt}",
+            {"prompt": args.prompt,
+             "voice": f"{args.voice}, speed {args.speed:g} ({len(args.prompt)} chars, {len(phonemes)} phonemes)"},
             rep["engines"], rep["stages"]))
         result["output"] = output
         result["audio_s"] = round(audio_s, 3)

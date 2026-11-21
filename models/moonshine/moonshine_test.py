@@ -1595,8 +1595,9 @@ def main():
     enc_flops, dec_flops = st.get("enc_flops"), st.get("dec_flops")
     result = {"decoded_text": text}
     result.update(_shared_report(
-        f"{os.path.basename(args.audio)} ({st['audio_s']:.2f} s audio, {st['frames'][2]} encoder frames; "
-        f"programs compiled for {ue.max_seconds:g} s = {st['compiled_frames'][2]} frames)",
+        {"audio": args.audio,
+         "length": f"{st['audio_s']:.2f} s, {st['frames'][2]} encoder frames (programs compiled for "
+                   f"{ue.max_seconds:g} s = {st['compiled_frames'][2]} frames)"},
         ue.NE,
         [("stem+encoder+cross_kv", st["enc_hw_s"], enc_flops / 1e9 if enc_flops is not None else None),
          (f"decode_{len(step_us)}_steps", st["dec_hw_s"], dec_flops / 1e9 if dec_flops is not None else None)],

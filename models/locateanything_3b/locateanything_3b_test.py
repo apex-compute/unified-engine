@@ -19,6 +19,7 @@ Run (apex-compute env, board attached):
 import json
 import math
 import os
+import re
 import sys
 
 import numpy as np
@@ -3475,9 +3476,29 @@ def _gpu_vision(query, prompt_kind, image_path, device="cpu", compute_vit=True,
     vis_xform (letterbox geometry or None)."""
     import locateanything_3b_cpu_test as la
     cfg = json.load(open(os.path.join(LA_DIR, "locateanything_3b_config.json")))
-    print("  loading weights ...", flush=True)
-    model = la.LocateAnything(cfg).eval()
-    la.load_weights(model, la.MODEL_DIR, device, torch.bfloat16)
+    # The FPGA path only needs two small host pieces of the model: the vision patch embed
+    # and the 2D RoPE table builder (moonvit_prepare_input). They are cached next to the
+    # prepared MoonViT weights, so a run from bins does not load the whole 3B checkpoint
+    # on the host (about 12 s) just to reach them.
+    import types
+    frontend_cache = os.path.join(_BIN_DIR, "moonvit_frontend.pt")
+    weights_cached = any(os.path.exists(os.path.join(_BIN_DIR, f"moonvit_weights_{p}_compact.pt"))
+                         for p in ("if4", "bf16"))
+    if not compute_vit and keep_model and weights_cached and os.path.exists(frontend_cache):
+        front = torch.load(frontend_cache, weights_only=False)
+        model = types.SimpleNamespace(vision_model=types.SimpleNamespace(
+            patch_embed=front["patch_embed"],
+            encoder=types.SimpleNamespace(rope_2d=front["rope_2d"])))
+        print(f"  vision front end: loaded cache {os.path.basename(frontend_cache)}", flush=True)
+    else:
+        print("  loading weights ...", flush=True)
+        model = la.LocateAnything(cfg).eval()
+        la.load_weights(model, la.MODEL_DIR, device, torch.bfloat16)
+        try:
+            torch.save({"patch_embed": model.vision_model.patch_embed,
+                        "rope_2d": model.vision_model.encoder.rope_2d}, frontend_cache)
+        except Exception as exc:                      # cache is an optimisation only
+            print(f"  vision front end: not cached ({exc})")
 
     improc = la.ImageProcessor(merge_kernel_size=tuple(cfg["vision_config"]["merge_kernel_size"]))
     img = Image.open(image_path).convert("RGB")
@@ -4238,7 +4259,8 @@ def main():
     _stages.append(("decode", sum(_dec_lats_us) / 1e6,
                     gpt * len(_dec_lats_us) / 1e9 if isinstance(gpt, (int, float)) else None))
     _original_print("TEST_RESULT:" + json.dumps({
-        "decoded_text":        answer.strip(),
+        # the decode loop's own "Stop token N reached." status line is not model output
+        "decoded_text":        re.sub(r"\n?Stop token \d+ reached\.\s*$", "", answer.strip()).strip(),
         "decoded_tokens":      n_new,
         "prefill_tokens":      len(prefill_seq),
         "prefill_speed_tok_s": round(prefill_tok_s, 2),

@@ -9172,10 +9172,12 @@ def main():
         src = f"prefix K/V cache reloaded from {PREFIX_KV_DUMP_PATH} (--debug: vision + prefix skipped)"
     else:
         shown, space = actions_unnorm, "real robot actions (unnormalized)"
-        src = (f"prompt={_CFG['defaults'].get('prompt', 'pick up the object')!r} with the sample robot state "
-               f"digitized into it ({len(prompt_tokens)} tokens); images test_samples/pi05_libero_base.png, "
-               f"test_samples/pi05_libero_wrist.png + all-zero 3rd camera slot")
-    result = {"input": src + "; denoise noise np.random.RandomState(0).randn(10, 7)",
+        src = {"prompt": _CFG['defaults'].get('prompt', 'pick up the object'),
+               "image": "test_samples/pi05_libero_base.png",
+               "image2": "test_samples/pi05_libero_wrist.png",
+               "state": f"sample robot state, digitized into the prompt ({len(prompt_tokens)} tokens)",
+               "noise": "np.random.RandomState(0).randn(10, 7)"}
+    result = {"input": src,
               "output": (f"action chunk {shown.shape[0]}x{shown.shape[1]} ({space}), min {float(shown.min()):.4f} "
                          f"max {float(shown.max()):.4f}; normalized min {float(actions.min()):.4f} "
                          f"max {float(actions.max()):.4f}, finite={finite}"),

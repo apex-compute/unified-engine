@@ -1883,7 +1883,7 @@ def main():
     _flops = getattr(ue, "program_flops", None)
     result = {"decoded_text": label}
     result.update(_shared_report(
-        f"{os.path.basename(image_path)} ({_orig}, resized to 384x384)", 1,
+        {"image": image_path, "size": f"{_orig}, resized to 384x384"}, 1,
         [("full_fused", ue.last_inference_hw_us / 1e6, _flops / 1e9 if _flops is not None else None)]))
     result["output"] = f"top-1: {label} (class {predicted_idx})"
     result["predicted_class"] = int(predicted_idx)

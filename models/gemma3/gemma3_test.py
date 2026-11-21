@@ -3932,7 +3932,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         _original_print(f"Decode  ({tokens_decoded} tokens): HW={hw_decode_avg_ms:,.1f} ms/tok  CPU={cpu_decode_avg_ms:,.1f} ms/tok  ({tokens_decoded/latency_decoder:.2f} tok/s)")
         peak_tokens_per_s = 1000.0 / hw_decode_first_ms if hw_decode_first_ms > 0 else 0.0
         avg_tokens_per_s = tokens_decoded / latency_decoder if latency_decoder > 0 else 0.0
-        return {
+        result = {
             "prefill_tokens": prefill_seq_len,
             "total_tokens": self.seq_len,
             "decoded_text": decoded_text,
@@ -3971,6 +3971,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 decode_first_tok_s=peak_tokens_per_s if hw_decode_lats_us else None,
                 decode_avg_tok_s=avg_tokens_per_s if tokens_decoded else None),
         }
+        # host wall time per stage, which the harness uses for its rates
+        result["stages"][0]["wall_s"] = round(latency_prefill, 6)
+        result["stages"][1]["wall_s"] = round(latency_decoder, 6)
+        return result
 
     def run_gemma3(self, numeric: bool = False) -> dict:
         """Convenience wrapper: run one prefill pass, then one decode pass against it.

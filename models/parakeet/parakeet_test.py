@@ -2166,7 +2166,7 @@ def main():
     first_us = getattr(engine, "dec_first_step_us", None)
     result = {"decoded_text": hw_text}
     result.update(_shared_report(
-        f"{os.path.basename(audio_path)} ({audio_dur:.2f} s audio, {T_mel} mel frames, {L} encoder frames)",
+        {"audio": audio_path, "length": f"{audio_dur:.2f} s, {T_mel} mel frames, {L} encoder frames"},
         1,
         [("mel+subsampling", sub_hw_us / 1e6,
           (mel_flops + pf["subsampling"]) / 1e9 if "subsampling" in pf else None),

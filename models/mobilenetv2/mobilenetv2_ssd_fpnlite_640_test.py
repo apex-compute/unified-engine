@@ -2434,7 +2434,7 @@ def main():
         "n_detections": len(det_labels),
     }
     result.update(_shared_report(
-        f"{os.path.basename(image_path)} ({W0}x{H0}, resized to {size}x{size})", 1,
+        {"image": image_path, "size": f"{W0}x{H0}, resized to {size}x{size}"}, 1,
         [("full_fused", ue.last_inference_hw_us / 1e6, _flops / 1e9 if _flops is not None else None)]))
     if det_labels:
         result["output"] = f"{len(det_labels)} detection(s) at score >= {args.score_thresh}: " + ", ".join(

@@ -2977,15 +2977,23 @@ def main():
         _original_print(f"\r  Vision encoder ({enc_time:.2f}s) done")
     # --- Prefill ---
     timer = time.perf_counter()
-    padded_seq = ((seq_len + 63) // 64) * 64
-    S = padded_seq
+    # FLOPs of what the prefill program runs for THIS prompt. The row count is a runtime
+    # register: projections, norms, RoPE and the residual adds run seq_len rows, attention
+    # runs seq_len*G query rows against the 64-aligned key length, and only the two flat
+    # MLP eltwise ops run the static PREFILL_MAX_SEQ_LEN rows. (This used the 64-padded
+    # length for every term, which overcounted a short prompt and gave rates above peak.)
+    S = seq_len
+    PM = int(ue.PREFILL_MAX_SEQ_LEN)
     H, D, I = ue.HIDDEN_SIZE, ue.HEAD_DIM, ue.INTERMEDIATE_SIZE
     KVH, QH, G = ue.NUM_KV_HEADS, ue.NUM_HEADS, ue.GROUP_SIZE
     KV = KVH * D
-    attn_per_group = (D * S + G * (S * D + 2 * S * D * S + S * S + S * S * 5 + 2 * S * S * D))
+    QS = S * G
+    AQ = ((QS + 63) // 64) * 64
+    # unified_attention_core per kv group: Q scale, Q.K^T (+softmax +bias), scores.V
+    attn_per_group = QS * D + (2 * QS * D * AQ + 6 * QS * AQ) + 2 * QS * AQ * D
     per_layer = (4 * S * H + 2 * S * H * H + 2 * 2 * S * H * KV
         + (QH + KVH) * S * D * 4 + KVH * attn_per_group
-        + 2 * S * H * H + 5 * S * H + 2 * (2 * S * H * I) + S * I + 2 * S * I * H + S * H)
+        + 2 * S * H * H + 5 * S * H + 2 * (2 * S * H * I) + PM * I + 2 * S * I * H + PM * H)
     prefill_flops = ue.NUM_LAYERS * per_layer + 4 * S * H + 2 * 1 * H * ue.VOCAB_SIZE
     stop_pf = threading.Event()
     def _pf_progress():

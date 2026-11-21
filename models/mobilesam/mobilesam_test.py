@@ -4975,7 +4975,8 @@ def main():
         enc_f, dec_f = flops.get("encoder"), flops.get("decoder")
         result = {"decoded_text": decoded_text}
         result.update(_shared_report(
-            f"vette.jpg ({_img_orig_wh[0]}x{_img_orig_wh[1]}, resized to {ENC_IN_W}x{ENC_IN_H})", 1,
+            {"image": "test_samples/vette.jpg",
+             "size": f"{_img_orig_wh[0]}x{_img_orig_wh[1]}, resized to {ENC_IN_W}x{ENC_IN_H}"}, 1,
             [("image_encoder", enc_us / 1e6 if enc_us is not None else None,
               enc_f / 1e9 if enc_f is not None else None),
              (f"mask_decoder_x{len(dec_log)}", sum(dec_log) / 1e6 if dec_log else None,
