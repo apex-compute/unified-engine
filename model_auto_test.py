@@ -727,7 +727,7 @@ TESTS = [
 
     # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
     # currently not working.
-    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 2},
+    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 8},
     # Gemma4 E2B FPGA vision. No --device: this script reads AXI width, clock,
     # DRAM size and engine count from HW_INFO (see resolve_engine_config).
     # The normal entry compiles fresh (--bin-reuse is off by default) with the
@@ -749,13 +749,13 @@ TESTS = [
     {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "gemma4_e4b_run_from_bin", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 2},
+    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 8},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2,
+    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 8,
      "multi_engine_warning": "qwen3_0.6b PREFILL RUNS ON ONE ENGINE: only decode is sharded, so --multi-core N speeds up decode alone (2 engines on kintex7: prefill 1.00x, decode 1.44x)."},
     {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",   "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
     {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_test.py",       "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
-    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2,
+    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 8,
      "multi_engine_warning": "qwen3.5_2b PREFILL IS SINGLE-ENGINE: only decode counts as multi-engine (2 engines on kintex7: prefill 1.06x, decode ~1.07x, 0.8 tok/s)."},
     # qwen3.5_2b VLM: FPGA vision encoder (--vision-enable defaults to on-FPGA vision)
     # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
@@ -763,7 +763,7 @@ TESTS = [
     # ("multicore currently supports text-only generation"); the text entry above
     # covers the same script on several engines.
     {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "max_engines": 1, "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable", "--vision-on-hardware", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
-    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True, "multi_core_max": 2},
+    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True, "multi_core_max": 8},
 
     # Qwen2.5-Omni-7B Thinker-only modes. The model requires the 8 GiB Alveo U55
     # eight-engine layout; unlike scripts that expose --engines, --multi-core is
