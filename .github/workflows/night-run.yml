@@ -2,7 +2,10 @@ name: Unified Engine Night Run
 
 on:
   schedule:
-    - cron: "52 2 * * *"
+    # 09:15 Pacific: after andromeda's PCIe Night Run (02:52, usually done by 08:00-09:00),
+    # which also uses p2's U50 for its own hardware tests. The p2 hardware lock covers a
+    # late andromeda night.
+    - cron: "15 9 * * *"
       timezone: "America/Los_Angeles"
   workflow_dispatch:
 
