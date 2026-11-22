@@ -128,10 +128,10 @@ jobs:
           BRANCH="${{ github.head_ref || github.ref_name }}"
 
           if [[ "${{ inputs.full_run }}" == "true" ]]; then
-            # No --only: the whole model_auto_test.py registry. Then a second pass
-            # re-runs every model from its cached bin in a date-seeded shuffled
-            # order (auto-triaged) to catch cross-model NaN / contamination.
-            ARGS+=(--shuffle-pass)
+            # No --only: the whole model_auto_test.py registry, one round, in a
+            # date-seeded shuffled order so each night covers different
+            # (previous -> model) pairs for cross-model NaN / contamination.
+            ARGS+=(--shuffle)
           elif [[ "$BRANCH" == "model/verapulse" ]]; then
             # verapulse bring-up branch: run ONLY verapulse. Same reasoning as pi05
             # below -- the Gemma4 cases add ~15 min of shared-board time and cannot

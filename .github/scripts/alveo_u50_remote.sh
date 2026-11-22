@@ -4,7 +4,7 @@
 #
 #   ssh github@<p2> "bash -s -- <sha>" < .github/scripts/alveo_u50_remote.sh
 #
-# Same suite as the kintex7 job (run_ci.sh --shuffle-pass) on p2's U50 (xdma0, 8 engines),
+# Same suite as the kintex7 job (run_ci.sh --shuffle) on p2's U50 (xdma0, 8 engines),
 # in the persistent ~/unified-engine checkout that andromeda's p2 CI also uses, so the
 # model weights already cached there are reused. Results are copied to
 # ~/ue_ci_alveo_u50/ for the runner to collect.
@@ -56,7 +56,7 @@ fi
 export DMA_DEV=xdma0          # p2: U50 on xdma0, kintex7 on xdma1
 export UE_CI_CONV_IMAGE=1     # the U50 image carries the conv blocks
 
-./run_ci.sh --shuffle-pass
+./run_ci.sh --shuffle
 RC=$?
 
 for f in model_auto_test_results.txt model_auto_test_results_pass1.txt \

@@ -122,7 +122,7 @@ jobs:
               '',
               `${icon} <${completedRun.html_url}|Full Model HW CI> — ${completedRun.conclusion}`,
               '',
-              `Model scope: all registered models (compile pass + shuffled run-from-bin pass)`,
+              `Model scope: all registered models (one round, date-seeded shuffled order)`,
               `Boards: kintex7 (p620) + Alveo U50 (p2 xdma0)`,
               `Branch: \`${branch}\``,
               `Commit: \`${completedRun.head_sha.slice(0, 12)}\``,
