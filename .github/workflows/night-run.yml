@@ -14,7 +14,7 @@ jobs:
   run-model-ci:
     name: Run and collect full model CI
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 310
     outputs:
       slack-message: ${{ steps.run.outputs.slack-message }}
     steps:
@@ -55,6 +55,8 @@ jobs:
               inputs: {
                 full_run: 'true',
                 clean_bins: 'false',
+                // Also run p2's Alveo U50 (xdma0) over SSH, alongside the kintex7.
+                alveo_u50: 'true',
                 // TODO(after model/pi05_libero merges): add `pi05_first: 'true'` to run
                 // the model round before the HW op tests with pi05 hoisted to the front,
                 // for a ~2-minute pi05 verdict. It CANNOT be sent yet: this dispatch
@@ -118,6 +120,7 @@ jobs:
               `${icon} <${completedRun.html_url}|Full Model HW CI> — ${completedRun.conclusion}`,
               '',
               `Model scope: all registered models (compile pass + shuffled run-from-bin pass)`,
+              `Boards: kintex7 (p620) + Alveo U50 (p2 xdma0)`,
               `Branch: \`${branch}\``,
               `Commit: \`${completedRun.head_sha.slice(0, 12)}\``,
               `<${schedulerUrl}|View nightly scheduler run>`,
@@ -143,17 +146,22 @@ jobs:
               fs.mkdirSync(dir, { recursive: true });
               fs.writeFileSync(`${dir}.zip`, Buffer.from(zip.data));
               execSync(`unzip -o -q "${dir}.zip" -d "${dir}"`);
-              const MAX = 400000;   // a step summary is capped at 1 MiB
-              const files = fs.existsSync(`${dir}/model_auto_test_results_pass1.txt`)
-                ? [['Pass 1: compile + run', 'model_auto_test_results_pass1.txt'],
-                   ['Pass 2: run from bin, shuffled', 'model_auto_test_results_shuffle.txt']]
-                : [['model_auto_test_results.txt', 'model_auto_test_results.txt']];
-              core.summary.addHeading('model_auto_test.py', 2);
-              for (const [title, name] of files) {
-                if (!fs.existsSync(`${dir}/${name}`)) continue;
-                let text = fs.readFileSync(`${dir}/${name}`, 'utf8');
-                if (text.length > MAX) text = text.slice(0, MAX) + '\n... truncated: see the artifact';
-                core.summary.addHeading(title, 3).addCodeBlock(text, 'text');
+              const MAX = 200000;   // a step summary is capped at 1 MiB; two boards share it
+              for (const [board, sub] of [['kintex7 (p620)', ''], ['Alveo U50 (p2 xdma0)', 'alveo_u50/']]) {
+                const files = fs.existsSync(`${dir}/${sub}model_auto_test_results_pass1.txt`)
+                  ? [['Pass 1: compile + run', 'model_auto_test_results_pass1.txt'],
+                     ['Pass 2: run from bin, shuffled', 'model_auto_test_results_shuffle.txt']]
+                  : [['model_auto_test_results.txt', 'model_auto_test_results.txt']];
+                core.summary.addHeading(`model_auto_test.py: ${board}`, 2);
+                let shown = 0;
+                for (const [title, name] of files) {
+                  if (!fs.existsSync(`${dir}/${sub}${name}`)) continue;
+                  let text = fs.readFileSync(`${dir}/${sub}${name}`, 'utf8');
+                  if (text.length > MAX) text = text.slice(0, MAX) + '\n... truncated: see the artifact';
+                  core.summary.addHeading(title, 3).addCodeBlock(text, 'text');
+                  shown++;
+                }
+                if (!shown) core.summary.addRaw(`\n_No ${board} report in the artifact; see the Full Model HW CI run._\n`);
               }
             } catch (error) {
               core.summary.addRaw(`\n_Model report not attached (${error.message}); see the Full Model HW CI run._\n`);
