@@ -82,14 +82,13 @@ jobs:
         with:
           clean: false
 
-      - name: Clean workspace and program bins
+      - name: Clean workspace
         run: |
           # Restore tracked files, then wipe untracked cruft everywhere EXCEPT
-          # models/ (keeps weights + HF cache). clean_program_bins.sh then removes
-          # only the runtime-generated programs.bin/json inside models/*/*_bin.
+          # models/ (keeps weights + HF cache). Program images need no cleaning:
+          # every model recompiles its program unless run with --run-from-bin.
           git reset --hard HEAD
           git clean -ffdx -e models
-          ./clean_program_bins.sh
 
       - name: Start the Alveo U50 leg on p2
         # The same suite on p2's U50 (xdma0), run by github@p2 over SSH from this

@@ -1744,7 +1744,12 @@ def main():
     ap.add_argument("--min-snr", type=float, default=20.0, help="vision / projector gate vs the hw-gelu reference (dB)")
     ap.add_argument("--min-cos", type=float, default=0.99)
     ap.add_argument("--max-traj-err", type=float, default=0.5, help="gate: max |xyz error| vs the device-equivalent reference (m)")
+    ap.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                    help="not supported: this script always compiles and never writes or loads a program image")
     args = ap.parse_args()
+    if args.run_from_bin:
+        sys.exit("--run-from-bin: alpamayo2_edge_test.py has no program-image cache (it always compiles); "
+                 "there is nothing to replay")
     if args.probe:
         args.max_new = 1
     vision_only = args.stop_at == "vision" or args.staged == "vision"

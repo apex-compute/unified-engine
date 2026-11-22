@@ -15,14 +15,16 @@ can optionally replace them with a real checkpoint + CPU golden reference.npz):
   reference.npz   the exact model inputs used for the golden run + CPU intermediates
 
 Usage:
-  python act_test.py --engines 8        # first run: compile + cache; later runs: load bins + run
+  python act_test.py --engines 8        # compile + dump programs (params.bin reused if current)
+  python act_test.py --engines 8 --run-from-bin   # load cached programs + run, no compile
   python act_test.py --engines 8 --profile   # per-section ms / GFLOP / utilization
   python act_test.py --cleanup          # drop cached params/programs
   python act_test.py --dev xdma0 --device kintex7
 
 Bins (act_bin/): params.bin is the weight blob (engine-count independent); programs_e<N>/ holds
 the primary + worker instruction streams and the compile-time constants for N engines. The cache
-key is the weights file + a hash of this source, so stale bins are never loaded.
+key is the weights file + a hash of this source, so stale bins are never loaded. Every run
+compiles and re-dumps programs_e<N>/; only --run-from-bin loads it (error if missing or stale).
 
 Execution model: one instruction stream per engine, one host launch per inference. Every stage
 is a sharded region replayed on all engines (MultiEngineScheduler, master/worker four-phase
@@ -1309,7 +1311,12 @@ def main():
     ap.add_argument("--debug", action="store_true", help="per-stage SNRs vs the CPU reference + NaN localizer")
     ap.add_argument("--conv-router", action="store_true",
                     help="layer2-4 3x3/s1 convs via conv2d_auto(strategy='wino') (own programs_e<N>_wino/ cache)")
+    ap.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                    help="skip compile; load act_bin/programs_e<N>/ (error if missing or stale). "
+                         "Default: compile and re-dump.")
     args = ap.parse_args()
+    if args.run_from_bin and args.profile:
+        ap.error("--profile always compiles; it cannot be combined with --run-from-bin")
 
     bin_dir = os.path.join(SCRIPT_DIR, ACT_UnifiedEngine.BIN_SUBDIR)
     if args.cleanup:
@@ -1383,7 +1390,11 @@ def main():
         gf = prev_f / 1e9
         _original_print(f"  {'TOTAL':12s} {prev_t:8.1f} {gf:8.2f} {gf / (prev_t / 1e3):8.1f} {100 * gf / (prev_t / 1e3) / peak:5.0f}%")
         return
-    prog_addr = ue.load_programs() if ue.USE_BIN_CACHE else None
+    prog_addr = ue.load_programs() if (ue.USE_BIN_CACHE and args.run_from_bin) else None
+    if prog_addr is None and args.run_from_bin:
+        _original_print(f"ERROR: --run-from-bin: {os.path.relpath(ue._prog_dir(), SCRIPT_DIR)}/ missing or stale "
+                        f"(weights/source/engine count changed); run without --run-from-bin first")
+        sys.exit(1)
     if prog_addr is None:
         if ue.params_from_bin:
             # weights are in DRAM but their compile-time addresses are not: rebuild them

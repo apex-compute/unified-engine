@@ -13,6 +13,12 @@ Usage:
   python swin_test.py
   python swin_test.py --image path/to/image.jpg
   python swin_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python swin_test.py --run-from-bin   # reuse swin_bin/params.bin + programs.bin
+
+Every run repacks params from weights_swin_hf.bin and recompiles, then dumps
+swin_bin/params.bin + programs.bin (params carry the layout the program embeds, so
+they are regenerated together). --run-from-bin loads both instead and fails if
+they are missing or stale.
 
 Fixed layout: swin_test.py, swin_config.json, and swin_bin/ live in the same folder.
   user_dma_core.py is two folders up (repo root); that directory is added to sys.path.
@@ -731,7 +737,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
     STAGE_SPATIAL   = [96, 48, 24, 12]
     WINDOW_AREA     = 144
 
-    def __init__(self, script_dir: str = SCRIPT_DIR, weights_bin: str | None = None):
+    def __init__(self, script_dir: str = SCRIPT_DIR, weights_bin: str | None = None,
+                 run_from_bin: bool = False):
         super().__init__(params_dram_base=SWIN_PARAMS_BASE,
                          tensor_dram_base=SWIN_TENSOR_BASE,
                          program_dram_base=SWIN_PROGRAM_BASE)
@@ -740,7 +747,12 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.script_dir = script_dir
         self.weights_bin = weights_bin or os.path.join(script_dir, cfg["paths"]["weights_bin"])
 
-        self.params_from_bin = self.load_params()
+        # params.bin holds compile-time layout: only reuse it with --run-from-bin,
+        # together with programs.bin; otherwise repack from the weights bin.
+        self.params_from_bin = self.load_params() if run_from_bin else False
+        if run_from_bin and not self.params_from_bin:
+            raise SystemExit(f"--run-from-bin: swin_bin/params.bin missing or stale in {script_dir}; "
+                             f"run without --run-from-bin first")
         if not self.params_from_bin:
             self.weight_init()
             self.dump_params()
@@ -1797,6 +1809,9 @@ def main():
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
+    parser.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                        help="Skip params packing and compile; load params.bin + programs.bin from swin_bin/ "
+                             "(error if missing or stale). Default: repack and recompile.")
     args = parser.parse_args()
 
     global _SILENT_MODE
@@ -1819,7 +1834,7 @@ def main():
     # Create engine (loads weights from bin or HF model)
     import time as _time
     t0 = _time.perf_counter()
-    ue = Swin_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue = Swin_UnifiedEngine(script_dir=SCRIPT_DIR, run_from_bin=args.run_from_bin)
     flop_meter = _install_flop_meter(ue)
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
@@ -1832,10 +1847,12 @@ def main():
             elapsed = _time.perf_counter() - start_time
             _original_print(f"\r  {label} ({elapsed:.0f}s)", end="", flush=True)
 
-    prog_addr = ue.load_programs()
+    prog_addr = ue.load_programs() if args.run_from_bin else None
     if prog_addr is None:
-        if ue.params_from_bin:
-            raise RuntimeError("Cannot compile without weight addresses — delete swin_bin/ and re-run")
+        if args.run_from_bin:
+            _original_print("ERROR: --run-from-bin: swin_bin/programs.bin missing or stale; "
+                            "run without --run-from-bin first")
+            sys.exit(1)
         stop_c = threading.Event()
         timer_c = threading.Thread(target=_progress_timer,
             args=("Compiling (this will take some time, swin has a lot of batched operations)", t_weights, stop_c), daemon=True)

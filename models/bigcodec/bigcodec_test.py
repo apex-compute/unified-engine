@@ -7,8 +7,9 @@ input clip (compiled_samples is baked in), and bigcodec_run_from_bin.py encodes
 + quantizes + decodes that clip on the FPGA. This wrapper gives the harness its
 one-script contract:
 
-  1. fetch the checkpoint and compile the bin for test_samples/apex.wav when the
-     bin is missing or --force (README's compensated-decoder flag set);
+  1. fetch the checkpoint (if missing) and recompile the bin for test_samples/apex.wav,
+     overwriting it (README's compensated-decoder flag set), unless --run-from-bin,
+     which reuses the bin on disk and fails if it is missing;
   2. run the round trip on the board;
   3. unless --no-ref, run the CPU round trip (bigcodec_run_cpu.py) and compare
      waveforms + tokens with bigcodec_compare.py (snr_db, cosine_similarity,
@@ -20,7 +21,7 @@ Hardware needs the RK AXI-256 CONV/MAXPOOL queue-CONFIG image.
 
 Usage:
   python models/bigcodec/bigcodec_test.py --dev xdma0 [--input test_samples/apex.wav]
-                                          [--force] [--no-ref]
+                                          [--run-from-bin] [--no-ref]
 """
 
 from __future__ import annotations
@@ -115,7 +116,10 @@ def main(argv=None) -> int:
     ap.add_argument("--input", type=Path, default=DEFAULT_INPUT,
                     help="WAV clip; the bin is compiled for exactly this clip's length")
     ap.add_argument("--timeout", type=float, default=300.0)
-    ap.add_argument("--force", action="store_true", help="rebuild the bin even if present")
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild the bin (now the default; kept for compatibility)")
+    ap.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                    help="skip compiling and run the existing bin (error if missing)")
     ap.add_argument("--no-ref", action="store_true",
                     help="skip the CPU round trip and the waveform/token comparison")
     args = ap.parse_args(argv)
@@ -128,7 +132,7 @@ def main(argv=None) -> int:
     _discard_corrupt(CHECKPOINT, zip_archive=True, sha256=manifest["checkpoint"]["sha256"],
                      tag="bigcodec_test")
 
-    if args.force or not BIN.is_file():
+    if not args.run_from_bin:
         t0 = time.perf_counter()
         if not CHECKPOINT.is_file():
             rc, _, _ = _stream([py, "-u", str(FETCH), "--output", str(CHECKPOINT)])
@@ -137,13 +141,16 @@ def main(argv=None) -> int:
                 return rc or 1
         cmd = [py, "-u", str(COMPILE), "--input", str(clip), "--checkpoint", str(CHECKPOINT),
                "--output", str(BIN)] + COMPILE_FLAGS
-        if args.force:
-            cmd.append("--force")
+        cmd.append("--force")
         rc, _, _ = _stream(cmd)
         timings["compile_s"] = round(time.perf_counter() - t0, 3)
         if rc != 0 or not BIN.is_file():
             print(f"[bigcodec_test] compile failed (rc={rc}); bin missing: {BIN}")
             return rc or 1
+    elif not BIN.is_file():
+        print(f"[bigcodec_test] --run-from-bin: bin missing: {BIN} "
+              f"(run once without --run-from-bin to compile it)")
+        return 1
     else:
         print(f"[bigcodec_test] reusing bin {BIN}")
         timings["compile_s"] = 0.0

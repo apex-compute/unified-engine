@@ -742,6 +742,10 @@ qwen2.5_vl_3b_numeric.py.""")
                              "column: it says which phase is worth sharding. Covers the "
                              "vision encoder, LM prefill, and two decode steps. Works "
                              "with --multi-core.")
+    parser.add_argument("--run-from-bin", action="store_true", dest="run_from_bin",
+                        help="Reuse a cached program image instead of compiling. Not supported: "
+                             "this script compiles every program in-process each run and keeps "
+                             "no program image on disk, so the flag exits with an error.")
     add_engine_args(parser)
     return parser
 
@@ -860,6 +864,11 @@ def process_image(image_path: str, size: int = 336) -> torch.Tensor:
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.run_from_bin:
+        print("ERROR: --run-from-bin: qwen2.5_vl_3b keeps no program image on disk (vision, "
+              "prefill and decode are compiled in-process every run). Rerun without "
+              "--run-from-bin.", file=sys.stderr, flush=True)
+        sys.exit(1)
     global IMAGE_SIZE
     IMAGE_SIZE = args.image_size
 

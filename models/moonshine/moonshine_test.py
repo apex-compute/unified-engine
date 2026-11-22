@@ -63,14 +63,15 @@ Layout conventions (all bf16, all row-major, every innermost dim a multiple of 6
               the GroupNorm 1/count vector, so one frozen image serves every clip <= cap.
               Real output frames depend only on real input frames (convs are local), so
               this is exact w.r.t. HF on the unpadded clip.
-  bins        after a compile run, params.bin / programs.bin / programs.json are dumped to
-              moonshine_bin/ (mobilesam pattern) with a signature (code sha1, weights sha1,
-              cap geometry, DRAM bases). The NEXT run finds a matching image and replays it:
-              no weight upload, no compilation. A signature mismatch (code/config/weights/cap
-              changed) silently falls back to a fresh compile + re-dump; --clean forces it.
+  bins        every run uploads weights and compiles, then dumps params.bin / programs.bin /
+              programs.json to moonshine_bin/ (mobilesam pattern) with a signature (code sha1,
+              weights sha1, cap geometry, DRAM bases). --run-from-bin replays that image
+              instead (no weight upload, no compilation); a missing image or a signature
+              mismatch (code/config/weights/cap changed) is an error. --clean deletes it first.
 
 Usage (repo root):
   python models/moonshine/moonshine_test.py --dev xdma0 [--audio x.wav] [--no-snr] [--clean] [--verbose]
+  python models/moonshine/moonshine_test.py --dev xdma0 --run-from-bin
 """
 import argparse
 import builtins
@@ -471,8 +472,9 @@ class MoonshineEngine(UnifiedEngine):
     WORKER_ISA_BYTES = 96 << 20        # per-engine worker program slice (multiple of 16 MiB)
 
     def __init__(self, ref: MoonshineReference = None, dev=None, max_seconds=None, from_bin=False, engines=1):
-        """ref=None + from_bin=True: load params/programs from moonshine_bin/ (no HF weights,
-        no compile). Otherwise upload weights from `ref` and compile everything at the cap."""
+        """from_bin=True: load params/programs from moonshine_bin/ (no HF weights needed, no
+        compile); exits with an error if no matching image exists. Otherwise upload weights
+        from `ref` and compile everything at the cap."""
         lay = CFG["dram_layout"]
         bases = [_parse_addr(lay["params_dram_base"]), _parse_addr(lay["tensor_dram_base"]),
                  _parse_addr(lay["program_dram_base"]), self.PRIMARY_PROGRAM_LIMIT]
@@ -536,7 +538,10 @@ class MoonshineEngine(UnifiedEngine):
         self._register_per_engine()
         self._rope_host = self._rope_tables_host(self.CAP_POS)
         self.from_bin = False
-        if from_bin and self.bins_match(BIN_DIR):
+        if from_bin:
+            if not self.bins_match(BIN_DIR):
+                raise SystemExit(f"ERROR: --run-from-bin: no frozen image in {BIN_DIR} matching this "
+                                 f"code/config/weights/cap/--engines; run without --run-from-bin first")
             self.load_bins(BIN_DIR)
             self.from_bin = True
         else:
@@ -1482,14 +1487,16 @@ class MoonshineEngine(UnifiedEngine):
         """True iff a complete frozen image exists whose signature matches this code/config/weights/cap."""
         if any(not os.path.exists(os.path.join(bin_dir, f)) for f in BIN_FILES):
             return False
-        sig = self._signature()
+        # Compare as stored: JSON turns the windows' tuples into lists, so the live
+        # signature goes through the same round trip (without it no image ever matched).
+        sig = json.loads(json.dumps(self._signature()))
         for name in ("params.json", "programs.json"):
             with open(os.path.join(bin_dir, name)) as f:
                 got = json.load(f)["signature"]
             bad = [k for k in sig if sig[k] != got.get(k) and not (k == "weights" and sig[k] is None)]
             if bad:
                 self._report(f"[bins] image stale on {bad} (image {[got.get(k) for k in bad]} vs now "
-                             f"{[sig[k] for k in bad]}); recompiling")
+                             f"{[sig[k] for k in bad]})")
                 return False
         return True
 
@@ -1559,7 +1566,10 @@ def main():
     ap.add_argument("--no-snr", action="store_false", dest="debug_snr",
                     help="skip per-stage SNR against the CPU reference (default: on)")
     ap.add_argument("--clean", action="store_true",
-                    help="ignore + delete the frozen image: recompile and re-dump (weights are kept)")
+                    help="delete the frozen image before running (weights are kept)")
+    ap.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                    help="replay the frozen image in moonshine_bin/ instead of compiling "
+                         "(error if missing or stale). Default: upload weights, compile, re-dump.")
     ap.add_argument("--verbose", action="store_true", help="show the cores' compile/tiling prints")
     ap.add_argument("--engines", type=int, default=1, help="engines for the stem/encoder (1 = single-engine)")
     ap.set_defaults(debug_snr=True)
@@ -1577,7 +1587,7 @@ def main():
     ref = MoonshineReference(load_state_dict(files["model.safetensors"]), CFG, device="cpu")
 
     t0 = time.time()
-    ue = MoonshineEngine(ref, dev=args.dev, max_seconds=args.max_seconds, from_bin=not args.clean, engines=args.engines)
+    ue = MoonshineEngine(ref, dev=args.dev, max_seconds=args.max_seconds, from_bin=args.run_from_bin, engines=args.engines)
     report(f"[init] {'replayed frozen image' if ue.from_bin else 'uploaded weights + compiled'} in {time.time() - t0:.1f}s")
     ids = ue.execute(pcm, args.max_new_tokens, debug_snr=args.debug_snr)
     if not ue.from_bin:

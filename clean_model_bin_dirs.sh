@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Delete entire models/*/*_bin directories (weights, HF cache, programs.bin/json
 # — everything), forcing the next test run to redownload weights from scratch
-# AND recompile. More aggressive than clean_program_bins.sh, which only clears
-# the compiled programs and leaves weights untouched.
+# AND recompile. Not needed for a fresh compile: every model script recompiles
+# its program image by default (--run-from-bin replays it).
 #
 # Usage:
 #   ./clean_model_bin_dirs.sh           # delete

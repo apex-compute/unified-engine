@@ -5,7 +5,8 @@ Andromeda two-stage port: unet_compile.py downloads the pinned milesial
 checkpoint and builds one fixed-resolution single-HALT bin; unet_run_from_bin.py
 executes it. This wrapper gives the harness its one-script contract:
 
-  1. compile the bin (with --download) when it is missing or --force;
+  1. recompile the bin (with --download; overwrites it), unless --run-from-bin,
+     which reuses the bin on disk and fails if it is missing;
   2. run it on the board with test_samples/vette.jpg and --compare, which adds
      logit_rmse and mask_agreement vs the quantized CPU reference to TEST_RESULT;
   3. re-emit that TEST_RESULT with wrapper timings added.
@@ -14,7 +15,7 @@ Hardware needs the CONV2D/MAXPOOL queue-CONFIG image (AXI-256 or AXI-512).
 
 Usage:
   python models/unet/unet_test.py --dev xdma0 [--image test_samples/vette.jpg]
-                                  [--resolution 256x256] [--force] [--cpu] [--conv-router]
+                                  [--resolution 256x256] [--run-from-bin] [--cpu] [--conv-router]
 """
 
 from __future__ import annotations
@@ -98,7 +99,10 @@ def main(argv=None) -> int:
     ap.add_argument("--resolution", default="256x256", metavar="WIDTHxHEIGHT",
                     help="compiled resolution; the bin holds exactly one")
     ap.add_argument("--timeout", type=float, default=300.0)
-    ap.add_argument("--force", action="store_true", help="rebuild the bin even if present")
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild the bin (now the default; kept for compatibility)")
+    ap.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                    help="skip compiling and run the existing bin (error if missing)")
     ap.add_argument("--cpu", action="store_true",
                     help="run the quantized CPU backend instead of the FPGA (host smoke test)")
     ap.add_argument("--conv-router", action="store_true",
@@ -114,17 +118,20 @@ def main(argv=None) -> int:
     _discard_corrupt(BIN_DIR / "unet_carvana_scale0.5_epoch2.pth", zip_archive=True,
                      sha256=cfg["source"]["weights_sha256"], tag="unet_test")
 
-    if args.force or not bin_path.is_file():
+    if not args.run_from_bin:
         t0 = time.perf_counter()
         cmd = [py, "-u", str(COMPILE), "--download", "--resolution", args.resolution,
                "--output", str(bin_path)] + router
-        if args.force:
-            cmd.append("--force")
+        cmd.append("--force")
         rc, _ = _stream(cmd)
         timings["compile_s"] = round(time.perf_counter() - t0, 3)
         if rc != 0 or not bin_path.is_file():
             print(f"[unet_test] compile failed (rc={rc}); bin missing: {bin_path}")
             return rc or 1
+    elif not bin_path.is_file():
+        print(f"[unet_test] --run-from-bin: bin missing: {bin_path} "
+              f"(run once without --run-from-bin to compile it)")
+        return 1
     else:
         print(f"[unet_test] reusing bin {bin_path}")
         timings["compile_s"] = 0.0

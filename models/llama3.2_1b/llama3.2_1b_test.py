@@ -3,9 +3,8 @@
 Llama-3.2-1B inference on accelerator: prefill + decode.
 
   - Config from llama3.2_1b_config.json; weights from a single bin (see below).
-  - Prefill: compiled each run. Decoder: if llama3.2_1b_bin/decoder_program.bin and
-    llama3.2_1b_bin/decoder_program.json exist, skip decoder compile and load
-    program sizes from meta; otherwise compile and write the bin + meta.
+  - Prefill + decoder: compiled each run into one image (llama3.2_1b_bin/programs*.bin + .json).
+    --run-from-bin skips the compile and loads that image (error if missing or stale).
   - Run prefill then decode loop.
 
 Architecture differences vs Gemma3:
@@ -1534,14 +1533,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             f"prefill_len={len(_pf) - 1}".encode())
         return digest.hexdigest()
 
-    def compile_llama(self, layer_size: int | None = None, profile: bool = False) -> None:
+    def compile_llama(self, layer_size: int | None = None, profile: bool = False,
+                      run_from_bin: bool = False) -> None:
         """Compile prefill + decoder into a single combined instruction image.
 
         Layout in program DRAM:  [prefill][decoder]
 
         Prefill is compiled with a fixed template (UE_VECTOR_SIZE) — all runtime
         loop counts are driven by GPRs primed by the preamble, so the same bin
-        works for any seq_len. A matching compiler fingerprint makes this a no-op.
+        works for any seq_len. Always recompiles unless ``run_from_bin`` is set; then a
+        matching compiler fingerprint makes this a no-op and a mismatch is an error.
 
         When ``profile`` is True, both programs are compiled with per-step HALT
         checkpoints into a separate profile image (so the normal bin is never
@@ -1580,7 +1581,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # returned worker addresses. A cache hit would skip that, so always
         # (re)compile when sharding is active.
         prefill_scheduler = self._ensure_prefill_scheduler()
-        if prefill_scheduler is None and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+        if run_from_bin and prefill_scheduler is not None:
+            sys.exit("ERROR: --run-from-bin is not supported with --multi-core > 1 (worker programs are compiled each run).")
+        if run_from_bin and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             try:
                 with open(instruction_meta_path, "r") as meta_file:
                     cached_meta = json.load(meta_file)
@@ -1592,7 +1595,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     and cached_meta.get("instruction_total_size") == cached_bin_size):
                 print(f"Reusing validated instruction image at {instruction_bin_path}")
                 return
-            print(f"Rebuilding stale instruction image at {instruction_bin_path}")
+        if run_from_bin:
+            sys.exit(f"ERROR: --run-from-bin: {instruction_bin_path} is missing or stale "
+                     "(fingerprint/size mismatch); run without --run-from-bin to compile it.")
 
         # FLOP accounting uses the REAL prompt length (len(prefill_seq)-1): the static
         # M= args and the model-side attention FLOP are then exact for this prompt
@@ -2529,6 +2534,9 @@ def main():
     parser.add_argument('--multi-core', nargs='?', type=int, const=2, default=1,
                         help='Shard prefill MLP rows and decode weight columns across N engines '
                              'using the board memory controllers (default 2; 1 = single-engine).')
+    parser.add_argument('--run-from-bin', action='store_true',
+                        help='Skip compiling and load the cached program image; error if it is missing '
+                             'or stale. Default: recompile every run. Single-engine only.')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it entirely.
@@ -2628,7 +2636,7 @@ def main():
     if args.profile:
         print("\n--- Compiling profile binary ---")
         timer = time.perf_counter()
-        ue.compile_llama(profile=True)
+        ue.compile_llama(profile=True, run_from_bin=args.run_from_bin)
         print(f"Compile done in {time.perf_counter() - timer:.2f}s")
         print("\n--- Running profile ---")
         profile_result = ue.run_llama_profile()
@@ -2681,7 +2689,7 @@ def main():
 
     print("\n--- Compiling ---")
     timer = time.perf_counter()
-    ue.compile_llama()
+    ue.compile_llama(run_from_bin=args.run_from_bin)
     print(f"Compile done in {time.perf_counter() - timer:.2f}s")
 
     print("\n--- Running ---")

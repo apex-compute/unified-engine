@@ -2470,7 +2470,11 @@ class Gemma4AudioMixin:
         # The program bakes the clip's frame counts, so reuse it only for a clip
         # of the same shape: a 4.5 s program run on a 2.55 s clip encodes garbage.
         isa_base = self._audio_isa_base()
-        if (meta is not None
+        # Reuse only on request, or a section this process already wrote (a fresh
+        # run's first store clears programs.bin, so stale sections never match).
+        if ((getattr(self, "bin_reuse", False)
+                or self._program_image_paths()[0] in getattr(self, "_programs_bin_started", ()))
+                and meta is not None
                 and int(meta.get("tensor_base", "0"), 16) == tensor_base
                 and int(meta.get("tensor_top", "0"), 16) == tensor_top
                 and int(meta.get("dram_base", "0"), 16) == isa_base
@@ -2484,6 +2488,9 @@ class Gemma4AudioMixin:
                         and m.get("num_frames") == self._aud_num_frames for m in worker_metas)):
             print("  [Audio] reusing existing audio instruction section")
             return
+        if getattr(self, "run_from_bin", False):
+            raise SystemExit("ERROR: --run-from-bin: no cached audio section matching this clip/layout "
+                             f"in {self._program_image_paths()[0]}; run without --run-from-bin to compile it.")
 
         saved_base = self._program_dram_base
         saved_next = self._next_program_dram_addr

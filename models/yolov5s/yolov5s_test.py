@@ -6,16 +6,17 @@ fixed-address bin from the pinned v7.0 checkpoint, and yolov5s_run_from_bin.py
 executes that bin on the FPGA. The harness runs ONE script per model and expects
 a TEST_RESULT: JSON line, so this wrapper:
 
-  1. compiles the bin when it is missing (or --force), via the compile script;
+  1. recompiles the bin (overwriting it) via the compile script, unless
+     --run-from-bin, which reuses the bin on disk and fails if it is missing;
   2. runs the bin on the board with a fixed test_samples/ image;
   3. re-emits the runner's TEST_RESULT with wrapper timings added.
 
-Pass 1 of the nightly compiles + runs; pass 2 (shuffled run-from-bin) finds the
-bin on disk and only runs. Hardware needs the CONV2D/MAXPOOL queue-CONFIG image.
+Pass 1 of the nightly compiles + runs; pass 2 (shuffled, --run-from-bin) reuses
+the bin on disk and only runs. Hardware needs the CONV2D/MAXPOOL queue-CONFIG image.
 
 Usage:
   python models/yolov5s/yolov5s_test.py --dev xdma0 [--image test_samples/vette.jpg]
-                                        [--resolution 640x480] [--force] [--cpu]
+                                        [--resolution 640x480] [--run-from-bin] [--cpu]
 """
 
 from __future__ import annotations
@@ -105,7 +106,10 @@ def main(argv=None) -> int:
     ap.add_argument("--image", type=Path, default=DEFAULT_IMAGE)
     ap.add_argument("--resolution", default="640x480", metavar="WIDTHxHEIGHT")
     ap.add_argument("--timeout", type=float, default=300.0)
-    ap.add_argument("--force", action="store_true", help="rebuild the bin even if present")
+    ap.add_argument("--force", action="store_true",
+                    help="rebuild the bin (now the default; kept for compatibility)")
+    ap.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                    help="skip compiling and run the existing bin (error if missing)")
     strategy = ap.add_mutually_exclusive_group()
     strategy.add_argument("--winograd", "--optimize", dest="winograd", action="store_true",
                           default=True, help="Use the optimized artifact (default)")
@@ -125,14 +129,18 @@ def main(argv=None) -> int:
     _discard_corrupt((SCRIPT_DIR / cfg["paths"]["weights"]).resolve(), zip_archive=True,
                      sha256=cfg["source"]["weights_sha256"], tag="yolov5s_test")
 
-    if args.force or not bin_path.is_file():
+    if not args.run_from_bin:
         t0 = time.perf_counter()
-        rc, _ = _stream([py, "-u", str(COMPILE)] + (["--force"] if args.force else [])
+        rc, _ = _stream([py, "-u", str(COMPILE), "--force"]
                         + (["--winograd"] if args.winograd else ["--native"]))
         timings["compile_s"] = round(time.perf_counter() - t0, 3)
         if rc != 0 or not bin_path.is_file():
             print(f"[yolov5s_test] compile failed (rc={rc}); bin missing: {bin_path}")
             return rc or 1
+    elif not bin_path.is_file():
+        print(f"[yolov5s_test] --run-from-bin: bin missing: {bin_path} "
+              f"(run once without --run-from-bin to compile it)")
+        return 1
     else:
         print(f"[yolov5s_test] reusing bin {bin_path}")
         timings["compile_s"] = 0.0

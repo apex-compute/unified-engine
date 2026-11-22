@@ -8722,6 +8722,12 @@ def main():
                          "running, so this run recompiles and dumps fresh ones. Removes "
                          "params.* and programs_e*.* only -- weights_export/ lives in "
                          "the same directory and is left alone.")
+    ap.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                    help="skip weight unpack + compile and replay the dumped bin set "
+                         "(params.bin + programs_e*_<board>.bin) for this engine "
+                         "configuration; exits non-zero if it is missing or stale. "
+                         "Default: always compile from weights_export/ and re-dump "
+                         "params + programs (overwrite).")
     ap.add_argument("--engines", type=_engines_arg, default=1, metavar="N|max",
                      help="Number of accelerator engines to row-shard across. DEFAULT 1 = "
                           "the single-engine path, byte-identical to before; only an "
@@ -8968,13 +8974,28 @@ def main():
                    or args.prefix_shard_primary is not None
                    or args.encoderend or args.prefixend)
     _stem = _programs_stem(_configured_engines(Pi05Libero_UnifiedEngine))
-    bins_exist = _bin_ok and os.path.exists(os.path.join(BIN_DIR, "params.bin")) \
-                          and os.path.exists(os.path.join(BIN_DIR, _stem + ".bin")) \
-                          and os.path.exists(os.path.join(BIN_DIR, _stem + ".json"))
-    if bins_exist and _bins_rendezvous(os.path.join(BIN_DIR, _stem + ".json")) \
-            != _mes_rendezvous_sig():
-        print(f"[main] {_stem} predates the master/worker rendezvous; recompiling")
-        bins_exist = False
+    # Default: always compile (and re-dump below). Only --run-from-bin replays a bin
+    # set, and then it must be present and current -- never fall back to compiling.
+    bins_exist = False
+    if args.run_from_bin:
+        if not _bin_ok:
+            print("[main] ERROR: --run-from-bin cannot be combined with --debug/"
+                  "--sanity-check/--probe-step0/--encoderend/--prefixend or the "
+                  "program-shaping overrides (--vis_*/--ae_*/--prefix_shard_primary)")
+            sys.exit(2)
+        _missing = [p for p in (os.path.join(BIN_DIR, "params.bin"),
+                                os.path.join(BIN_DIR, _stem + ".bin"),
+                                os.path.join(BIN_DIR, _stem + ".json"))
+                    if not os.path.exists(p)]
+        if _missing:
+            print(f"[main] ERROR: --run-from-bin but the bin set is incomplete: "
+                  f"{', '.join(_missing)} (run once without --run-from-bin to compile)")
+            sys.exit(2)
+        if _bins_rendezvous(os.path.join(BIN_DIR, _stem + ".json")) != _mes_rendezvous_sig():
+            print(f"[main] ERROR: --run-from-bin but {_stem} predates the master/worker "
+                  f"rendezvous (run once without --run-from-bin to recompile)")
+            sys.exit(2)
+        bins_exist = True
 
     if bins_exist:
         print(f"[main] loading pre-compiled bins from {BIN_DIR} (no weight unpack, no compile)")
@@ -9045,10 +9066,10 @@ def main():
         if args.sanity_check:
             return
 
-        # Dump bins after the first successful full inference so later runs can skip
-        # weight-unpack + compile entirely. Gated on the bins not already existing (a
-        # bin-backed run has nothing new to dump, and re-dumping would just read back
-        # what it loaded). Everything the dump needs -- _prog_meta, prefix_bias_dram,
+        # Dump bins after every successful compiled full inference (overwriting any
+        # previous set) so a later --run-from-bin run can skip weight-unpack + compile.
+        # Skipped for a --run-from-bin run (nothing new to dump; re-dumping would just
+        # read back what it loaded). Everything the dump needs -- _prog_meta, prefix_bias_dram,
         # _ae_alloc_ckpt -- only exists after a real vision->prefix->denoise pass.
         # Multi-engine runs cannot be dumped (the bin format carries only the primary's
         # programs -- dump_programs_to_file refuses). Skip rather than assert, so a

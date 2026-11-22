@@ -28,12 +28,12 @@ echo "[alveo_u50] hardware lock acquired"
 
 cd "$UE_DIR" || { echo "::error::$UE_DIR not found on $(hostname)"; exit 1; }
 git fetch -q --prune origin || { echo "::error::git fetch failed in $UE_DIR"; exit 1; }
-# Same cleaning as the kintex7 job: keep models/ (weights, HF snapshots).
+# Same cleaning as the kintex7 job: keep models/ (weights, HF snapshots). Every
+# model recompiles its program image itself.
 git reset -q --hard HEAD
 git clean -ffdxq -e models
 git checkout -q --detach "$SHA" || { echo "::error::commit $SHA not in origin"; exit 1; }
 echo "[alveo_u50] unified-engine at $(git log -1 --oneline)"
-./clean_program_bins.sh
 
 # The U50 image is maintained outside the release, so its HW version is not the one
 # user_dma_core.py asserts. Comment the assert out in this checkout only; the next

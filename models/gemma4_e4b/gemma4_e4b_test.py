@@ -24,7 +24,7 @@ _gemma4.set_model_variant("gemma4_e4b", E4B_DIR, "Gemma4 E4B")
 # The options are gemma4_e2b_test.py's. model_auto_test.py forwards a flag only
 # to scripts whose source names it, so the ones it forwards are named here.
 FORWARDED_OPTIONS = ("--dev", "--multi-core", "--max-new-tokens", "--prompt",
-                     "--image", "--audio", "--bin-reuse")
+                     "--image", "--audio", "--bin-reuse", "--run-from-bin")
 
 if __name__ == "__main__":
     _gemma4.main()

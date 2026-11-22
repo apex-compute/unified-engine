@@ -437,23 +437,23 @@ python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
 Run the whole suite (or a subset) with the automated tester:
 
 ```bash
-make model_test run_from_bin   # skip the pre-clean, reuse existing compiled bins
+make model_test                # every model compiles its program fresh
+make model_test run_from_bin   # replay the program images already on disk
 make model_test gemma4_e2b     # one model
 make model_test_help           # all modes
 ```
 
 Notes on the two modes:
 
-- Without the `run_from_bin` word, `model_test` runs `make clean` first,
-  which deletes cached model bins and rebuilds everything from the HF
-  models (slow; needs the HF models available).
-- `run_from_bin` skips the pre-clean so models with a
-  `*_run_from_bin.py` runtime (the LLM/VLM rows above) reuse their bins.
-  gemma3, gpt2 and the vision/speech models have no runtime-only entry
-  yet and still run through their `*_test.py` scripts, which need their
-  model assets on disk. On a deploy host that only has pregenerated
-  bins, run the runtime-only subset by name, e.g.
-  `make model_test gemma4_e2b llama3.2_1b qwen3_4b run_from_bin`.
+- Every model test script compiles its program image by default and
+  writes it to its `<model>_bin/` directory. Cached weights stay cached;
+  the models whose `params.bin` is tied to the compiled layout
+  (mobilenetv2, parakeet, swin, mobilesam) regenerate it too.
+- `--run-from-bin` (on any model script, or `run_from_bin` for
+  `make model_test`) skips compiling and replays the program image on
+  disk; a missing or stale image is an error, never a silent recompile.
+- The harness checks both: a compile run that rebuilt no program image,
+  or a run-from-bin run that rewrote one, fails.
 
 ---
 

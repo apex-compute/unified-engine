@@ -64,15 +64,15 @@ Hardware rules that shape this file -- see verapulse_config.json["hw_notes"]:
 
 Usage:
     python verapulse_test.py --stage vision --snr
-    python verapulse_test.py --engines 8          # compiles, then dumps its bin set
-    python verapulse_test.py --engines 8          # ... and this one loads it
+    python verapulse_test.py --engines 8                  # compiles, then dumps its bin set
+    python verapulse_test.py --engines 8 --run-from-bin   # ... and this one loads it
 
-Bins are automatic. A full run (--stage all, no --stop-after/--bisect-*) loads the set
-matching its engine configuration if one exists and dumps one if it does not. params.bin
+A full run (--stage all, no --stop-after/--bisect-*) always compiles and then dumps (or
+overwrites) the bin set matching its engine configuration; --run-from-bin loads that set
+instead and fails if it is missing. params.bin
 is shared by every configuration -- sharding never writes the params region -- while the
 programs are keyed by the (vision, prefix, denoise) engine triple, because a sharded
 program bakes one rendezvous per engine and cannot be replayed at a different count.
-Use --dump-bins to force a re-dump after a compile-affecting edit.
 """
 
 import argparse
@@ -9357,8 +9357,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                 os.path.join(bin_dir, "weight_tensors.pt")):
             return False
         # Programs compiled with the removed symmetric NOP-margin barrier (no
-        # "rendezvous" field) must be recompiled, not replayed. clean_program_bins.sh
-        # keeps this model's programs, so this is the only thing that retires them.
+        # "rendezvous" field) must be recompiled, not replayed: --run-from-bin
+        # rejects them here.
         try:
             with open(os.path.join(bin_dir, stem + ".json")) as f:
                 prog_sig = json.load(f).get("sig", {})
@@ -9367,8 +9367,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         if prog_sig.get("rendezvous") != mes.RENDEZVOUS_SIG:
             return False
         # Provenance is part of "matching": loading a dummy-weight dump into a real-weight
-        # run would score a model nobody asked for. Report NOT available (so the caller
-        # falls back to compiling) rather than refusing the run.
+        # run would score a model nobody asked for. Report NOT available (main's
+        # --run-from-bin then refuses the run).
         return bool(pm.get("dummy_weights", False)) == bool(
             getattr(self, "_dummy_weights_wanted", False))
 
@@ -9642,8 +9642,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
 class VeraPulse_Run(VeraPulse_UnifiedEngine):
     """Engine pinned to bin-backed execution: REQUIRES a matching bin set and never
-    compiles. main() does not use this -- it builds the normal engine and switches on
-    bins_available(), so a missing set falls back to compiling instead of failing. This
+    compiles. main() does not use this -- it builds the normal engine, compiles by
+    default, and under --run-from-bin checks bins_available() and fails if false. This
     exists for callers that want the guarantee (libero_eval, CI) that no compile can
     happen mid-episode, and for a clear error when the set they expect is absent.
 
@@ -10894,15 +10894,16 @@ def main():
                     help="restore the full gate commentary: per-comparison RMS, the "
                          "known-fault notes, per-layer KV cos, oracle-load lines. Off "
                          "by default -- a green run needs one line per check.")
-    # Bins are automatic (see the _bin_eligible block in main): a full run loads the set
-    # matching its --engines configuration if one exists, and dumps one if it does not.
-    # These two flags only override that choice.
+    # Bins (see the _bin_eligible block in main): a full run compiles and dumps the set
+    # matching its --engines configuration (overwriting it) by default; --run-from-bin
+    # loads that set instead.
     ap.add_argument("--dump-bins", action="store_true",
-                    help="force a re-compile and re-dump even when a matching bin set "
-                         "already exists (use after any compile-affecting edit)")
-    ap.add_argument("--from-bin", action="store_true",
-                    help="require bins: fail if no set matches this --engines "
-                         "configuration, instead of falling back to compiling")
+                    help="re-compile and re-dump (now the default for a full run; kept "
+                         "for compatibility)")
+    ap.add_argument("--from-bin", "--run-from-bin", dest="from_bin", action="store_true",
+                    help="load the dumped bin set instead of compiling: fail if no set "
+                         "matches this --engines configuration (never falls back to "
+                         "compiling)")
     ap.add_argument("--clean", action="store_true",
                     help="delete every bin set (all engine configurations) before "
                          "running, so this run recompiles and dumps fresh ones. Removes "
@@ -11337,9 +11338,9 @@ def main():
     if args.clean:
         clean_bins(BIN_DIR)
 
-    # Bins are AUTOMATIC: --engines selects the set, and a qualifying run loads one if it
-    # exists or dumps one if it does not. --from-bin makes a missing set an error;
-    # --dump-bins forces a re-dump. Only a full non-probing run qualifies -- the
+    # Bins: --engines selects the set. A qualifying run compiles and (re-)dumps it by
+    # default; --run-from-bin (alias --from-bin) loads it instead and makes a missing set
+    # an error. Only a full non-probing run qualifies -- the
     # debug/bisect paths compile extra programs or skip stages, desyncing the allocator.
     _bin_eligible = (args.stage == "all" and args.precompile
                      and not args.stop_after
@@ -11348,7 +11349,7 @@ def main():
                      and args.bisect_prefix is None)
     if args.from_bin and not _bin_eligible:
         raise SystemExit(
-            "--from-bin needs a full non-probing run: --stage all, the precompile phase "
+            "--run-from-bin needs a full non-probing run: --stage all, the precompile phase "
             "on, and no --stop-after/--bisect-*. Those paths compile extra probe "
             "programs or skip stages, which desyncs the program allocator from the "
             "dumped layout.")
@@ -11432,13 +11433,18 @@ def main():
     # Asked HERE because _num_engines cannot resolve the triple until the engine exists
     # and configure_engines has run.
     ue._dummy_weights_wanted = (args.weights == "dummy")
-    _have_bins = _bin_eligible and ue.bins_available(BIN_DIR)
+    # Default compiles (and re-dumps); only --run-from-bin loads, and then a missing or
+    # non-matching set is an error, never a silent compile.
+    _have_bins = args.from_bin and _bin_eligible and ue.bins_available(BIN_DIR)
     if args.from_bin and not _have_bins:
         raise SystemExit(
-            f"--from-bin: no bin set for this engine configuration "
-            f"({_programs_stem(ue._bin_engines())}) in {BIN_DIR}. "
-            f"Run once without --from-bin to compile and dump it.")
-    _use_bins = _have_bins and not args.dump_bins
+            f"--run-from-bin: no matching bin set for this engine configuration "
+            f"({_programs_stem(ue._bin_engines())}) in {BIN_DIR} (missing, stale "
+            f"rendezvous, or dummy/real weights mismatch). "
+            f"Run once without --run-from-bin to compile and dump it.")
+    if args.from_bin and args.dump_bins:
+        raise SystemExit("--run-from-bin and --dump-bins are mutually exclusive")
+    _use_bins = _have_bins
     if _use_bins:
         print(f"[main] bins: loading {_programs_stem(ue._bin_engines())} from {BIN_DIR} "
               f"(no weight unpack, no compile)")

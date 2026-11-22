@@ -6,6 +6,12 @@ executed on the Unified Engine accelerator.
 
 Usage:
     python mobilesam_test.py [--dev xdma0] [--device kintex7] [--cycle 5.15]
+    python mobilesam_test.py --run-from-bin   # reuse mobilesam_bin/params.bin + programs.bin
+
+Every run rebuilds params from mobile_sam.pt and recompiles, then dumps
+mobilesam_bin/params.bin + programs.bin (params carry the tensor layout the programs
+embed, so they are regenerated together). --run-from-bin loads both instead and fails
+if they are missing or stale.
 """
 
 import argparse
@@ -4804,6 +4810,9 @@ def main():
                         help="Step through encoder stage-by-stage, asserting no NaNs at each checkpoint")
     parser.add_argument("--debug-decode", action="store_true",
                         help="Step through decoder stage-by-stage, asserting no NaNs at each checkpoint")
+    parser.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                        help="Skip compile; load params.bin + programs.bin from mobilesam_bin/ "
+                             "(error if missing or stale). Default: rebuild params and recompile.")
     args = parser.parse_args()
 
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
@@ -4864,7 +4873,11 @@ def main():
         return (params_meta.get("artifact_version") == MOBILESAM_ARTIFACT_VERSION
                 and programs_meta.get("artifact_version") == MOBILESAM_ARTIFACT_VERSION)
 
-    bins_exist = _artifacts_current()
+    bins_exist = args.run_from_bin
+    if bins_exist and not _artifacts_current():
+        _original_print(f"ERROR: --run-from-bin: {BIN_DIR} params/programs missing or stale "
+                        f"(artifact_version != {MOBILESAM_ARTIFACT_VERSION}); run without --run-from-bin first")
+        sys.exit(1)
     if bins_exist:
         _original_print("\nLoading from pre-compiled bins …")
         from mobilesam_run_from_bin import MobileSAM_UE_Run
@@ -4989,7 +5002,7 @@ def main():
 
     if args.debug_encode:
         if bins_exist:
-            _original_print("--debug-encode requires a fresh compile (bins found — delete mobilesam_bin/ and re-run)")
+            _original_print("--debug-encode requires a fresh compile (drop --run-from-bin and re-run)")
         else:
             ue.software_reset()
             ue.debug_encode(image_t)
@@ -4997,7 +5010,7 @@ def main():
 
     if args.debug_decode:
         if bins_exist:
-            _original_print("--debug-decode requires a fresh compile (bins found — delete mobilesam_bin/ and re-run)")
+            _original_print("--debug-decode requires a fresh compile (drop --run-from-bin and re-run)")
             return
         px, py = args.point
         _pw = _get_prompt_weights()
