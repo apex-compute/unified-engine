@@ -746,9 +746,9 @@ TESTS = [
     # an 8192-token context would otherwise let a description run for ~20 min
     # on Kintex.
     {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "gemma4_e2b_run_from_bin", "follows": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "gemma4_e4b_run_from_bin", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "gemma4_e4b_run_from_bin", "follows": "gemma4_e4b", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 8},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_x_equals_2},
     {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 8,
@@ -1811,7 +1811,24 @@ def main():
     # date-derived seed covers a new set of adjacent pairs every run at zero extra cost.
     if args.shuffle_seed is not None:
         import random
-        random.Random(args.shuffle_seed).shuffle(tests)
+        # A run-from-bin entry ("follows": <compile entry>) replays the program
+        # image its compile entry just built, so the two move as one unit: the
+        # units are shuffled, and each follower stays right after its entry.
+        selected = {t["name"] for t in tests}
+        units, unit_of = [], {}
+        for t in tests:
+            if t.get("follows") not in selected:
+                unit_of[t["name"]] = [t]
+                units.append(unit_of[t["name"]])
+        for t in tests:
+            if t.get("follows") not in selected:
+                continue
+            if t["follows"] in unit_of:
+                unit_of[t["follows"]].append(t)
+            else:  # follows another follower: no chains, keep it on its own
+                units.append([t])
+        random.Random(args.shuffle_seed).shuffle(units)
+        tests = [t for unit in units for t in unit]
         print(f"[order] shuffled with seed {args.shuffle_seed}: "
               f"{' '.join(t['name'] for t in tests)}")
 
