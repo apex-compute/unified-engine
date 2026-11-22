@@ -8,6 +8,24 @@ on:
     - cron: "15 9 * * *"
       timezone: "America/Los_Angeles"
   workflow_dispatch:
+    # The scheduled night uses these defaults: both boards, every core, the full registry.
+    inputs:
+      board:
+        description: "kintex7 (p620), alveo_u50 (p2 xdma0) or both"
+        required: false
+        type: choice
+        options: [both, kintex7, alveo_u50]
+        default: both
+      engines:
+        description: "Model round engine count: max (every core the board reports) or 1..8"
+        required: false
+        type: string
+        default: "max"
+      models:
+        description: "Registered model names, space-separated; empty runs the full registry"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: write
@@ -38,6 +56,16 @@ jobs:
             };
             const sleep = milliseconds =>
               new Promise(resolve => setTimeout(resolve, milliseconds));
+            // A scheduled night carries no inputs: both boards, every core, full registry.
+            const cfg = context.payload.inputs || {};
+            const board = cfg.board || 'both';
+            const engines = cfg.engines || 'max';
+            const models = (cfg.models || '').trim();
+            const boardText = {
+              both: 'kintex7 (p620) + Alveo U50 (p2 xdma0)',
+              kintex7: 'kintex7 (p620)',
+              alveo_u50: 'Alveo U50 (p2 xdma0)',
+            }[board] || board;
 
             const before = await github.rest.actions.listWorkflowRuns({
               ...common,
@@ -57,9 +85,9 @@ jobs:
               ref: branch,
               inputs: {
                 full_run: 'true',
-                clean_bins: 'false',
-                // Also run p2's Alveo U50 (xdma0) over SSH, alongside the kintex7.
-                alveo_u50: 'true',
+                models,
+                board,
+                engines,
                 // TODO(after model/pi05_libero merges): add `pi05_first: 'true'` to run
                 // the model round before the HW op tests with pi05 hoisted to the front,
                 // for a ~2-minute pi05 verdict. It CANNOT be sent yet: this dispatch
@@ -122,8 +150,8 @@ jobs:
               '',
               `${icon} <${completedRun.html_url}|Full Model HW CI> — ${completedRun.conclusion}`,
               '',
-              `Model scope: all registered models (one round, date-seeded shuffled order)`,
-              `Boards: kintex7 (p620) + Alveo U50 (p2 xdma0)`,
+              `Model scope: ${models || 'all registered models'} (one round, date-seeded shuffled order)`,
+              `Boards: ${boardText}, engines: ${engines}`,
               `Branch: \`${branch}\``,
               `Commit: \`${completedRun.head_sha.slice(0, 12)}\``,
               `<${schedulerUrl}|View nightly scheduler run>`,
