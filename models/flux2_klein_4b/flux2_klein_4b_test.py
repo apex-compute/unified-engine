@@ -57,6 +57,10 @@ DMA limit.
 Usage (repo root):
     python models/flux2_klein_4b/flux2_klein_4b_test.py --prompt "..." [--height 512 --width 512 --max-seq-len 512] [--engines max]
     python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only      # no device needed
+    python models/flux2_klein_4b/flux2_klein_4b_test.py --run-from-bin ...  # reuse programs, no compile
+
+Every run (and --compile-only) recompiles and overwrites programs/<config>.bin; only
+--run-from-bin (alias --no-compile) reuses it. Exported weight images stay cached.
     python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --prompt "..."
 """
 from __future__ import annotations
@@ -1161,8 +1165,11 @@ def main(argv=None) -> int:
     ap.add_argument("--dev", default=dfl["dev"])
     ap.add_argument("--engines", default="max", help="engine count or 'max' (HW_INFO core count)")
     ap.add_argument("--compile-only", action="store_true", help="build programs.bin without a board")
-    ap.add_argument("--no-compile", action="store_true", help="run-from-bin: never compile")
-    ap.add_argument("--force-compile", action="store_true")
+    ap.add_argument("--no-compile", "--run-from-bin", action="store_true", dest="no_compile",
+                    help="run-from-bin: never compile; load programs/<config>.bin (error if missing "
+                         "or stale). Default: always compile and overwrite it.")
+    ap.add_argument("--force-compile", action="store_true",
+                    help="compile even if a matching bin exists (now the default; kept for compatibility)")
     ap.add_argument("--vae", choices=["fpga", "host"], default="fpga")
     ap.add_argument("--phase-timeout", type=float, default=4 * 3600.0, help="wait timeout (s) for the TE / DiT programs")
     ap.add_argument("--text-encoder", choices=["fpga", "host"], default="fpga",
@@ -1209,7 +1216,9 @@ def main(argv=None) -> int:
     ue.phase_timeout = args.phase_timeout
     _log(f"  tensor arena {ue.tensor_usage / 1e6:.0f} MB, params image {ue.params_image_size / 1e9:.2f} GB")
 
-    meta = ensure_programs(ue, cfg, allow_compile=not args.no_compile, force=args.force_compile)
+    # Default: always recompile (force); only --no-compile / --run-from-bin reuses the bin.
+    meta = ensure_programs(ue, cfg, allow_compile=not args.no_compile,
+                           force=args.force_compile or not args.no_compile)
     if args.compile_only:
         _log(f"compile-only done: {program_paths(cfg, geo, ne)[0]}")
         return 0

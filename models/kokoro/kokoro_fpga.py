@@ -41,10 +41,11 @@ Section status:
       iSTFT -> audio (GeneratorFPGA._istft).
 
 Weights are pulled directly from the loaded CPU `model`'s state dict at call
-time, but a compiled image (params.bin/programs.bin/programs.json, see
-FROZEN_IMAGE_FILES / dump_bin_cache / load_bin_cache below) is frozen and
-replayed on subsequent runs, following the pattern in models/parakeet, so the
-weight pull + emission pass only happens once per cache-key.
+time and every run compiles; the compiled image (params.bin/programs.bin/programs.json,
+see FROZEN_IMAGE_FILES / dump_bin_cache / load_bin_cache below) is then frozen to
+disk, following the pattern in models/parakeet. Only run_from_bin=True
+(kokoro_test.py --run-from-bin) replays it, skipping the weight pull + emission pass;
+a missing or stale image is then an error.
 
 ALBERT weight sharing: the checkpoint only has ONE transformer layer's
 weights (`encoder.albert_layer_groups.0.albert_layers.0.*`, num_hidden_groups=1),
@@ -644,7 +645,7 @@ def load_bin_cache(ue, in_dir):
     with open(mpath) as f:
         manifest = json.load(f)
     if manifest.get("key") != _cache_key():
-        report("[fpga] frozen image is stale (compiler or capacity changed), recompiling")
+        report("[fpga] frozen image is stale (compiler or capacity changed)")
         return None
 
     with open(os.path.join(in_dir, "params.bin"), "rb") as f:
@@ -5392,14 +5393,20 @@ def generator_host_istft(gen, y):
 
 def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: float = 1.0,
                      dev: str = "xdma0", debug: bool = False, dump_programs: str = None,
-                     bin_cache: str = None, engines: int = 1):
+                     bin_cache: str = None, engines: int = 1, run_from_bin: bool = False):
     """Entry point called from kokoro_test.py --fpga. Only runs the section(s) currently ported to
     hardware (Section 1: PL-BERT) and reports their SNR against the CPU reference, with a bisect
     down to sub-stage granularity within each layer. Deliberately does NOT fall back to running the
     rest of the model on CPU -- --fpga means "run and validate what's actually on the FPGA today",
     not "run the full pipeline with FPGA sprinkled in". Returns None; callers should not expect
     audio until later sections are ported (see the section checklist at the top of this file).
+
+    bin_cache: directory the compiled image is written to after a successful run (None: not
+    written). run_from_bin=True replays the image in bin_cache instead of compiling and exits
+    with an error if it is missing or stale.
     """
+    if run_from_bin and not bin_cache:
+        raise SystemExit("ERROR: --run-from-bin needs the bin cache (drop --no-bin-cache)")
     set_dma_device(dev)
     _DEBUG_SNR[0] = debug
     _DUMP_PROGRAMS[0] = dump_programs
@@ -5419,6 +5426,9 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
     _TENSOR_END[0] = KOKORO_TENSOR_END
     if engines > 1:
         from multi_engine_shard import MultiEngineScheduler, PrivateArena
+        if run_from_bin:
+            raise SystemExit("ERROR: --run-from-bin with --engines > 1: the frozen image does not "
+                             "carry worker programs yet")
         if bin_cache:
             report("[fpga] --engines > 1: the frozen image does not carry worker programs yet; "
                    "compiling this run (no bin cache)")
@@ -5454,7 +5464,10 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         report(f"[fpga] multi-engine: {engines} engines, generator conv taps row-sharded")
 
     if bin_cache:
-        _manifest = load_bin_cache(ue, bin_cache)
+        _manifest = load_bin_cache(ue, bin_cache) if run_from_bin else None
+        if run_from_bin and _manifest is None:
+            raise SystemExit(f"ERROR: --run-from-bin: no usable frozen image in {bin_cache} "
+                             f"(missing or stale); run without --run-from-bin first")
         if _manifest is not None:
             _BIN_LOADED[0] = True
             # Fast-forward both bump allocators past what the image already occupies, so anything
@@ -5463,7 +5476,7 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
             report(f"[fpga] REPLAY: loaded frozen image from {bin_cache} "
                    f"({len(_manifest['programs'])} programs); no instruction compilation this run")
         else:
-            report(f"[fpga] COMPILE: no usable frozen image in {bin_cache}; compiling and saving one")
+            report(f"[fpga] COMPILE: compiling; the frozen image is saved to {bin_cache} after the run")
 
     input_ids_list = [model.vocab[p] for p in phonemes if p in model.vocab]
     input_ids = torch.LongTensor([0, *input_ids_list, 0])
@@ -5689,7 +5702,7 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         report(f"[fpga] Pipeline complete: sections 1-5d on hardware -- phonemes in, samples out.")
         _report_timings()
         _dump_program_fingerprints()
-        # Freeze the image on the first successful run so later runs skip emission entirely.
+        # Freeze the image after every compiling run so a later --run-from-bin skips emission.
         # Written after the pipeline completes, so a crashed run never leaves a half image behind.
         if _BIN_CACHE[0] and not _BIN_LOADED[0]:
             dump_bin_cache(ue, _BIN_CACHE[0])

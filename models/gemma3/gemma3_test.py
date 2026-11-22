@@ -2972,7 +2972,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "checkpoints": checkpoints,
         }
 
-    def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False, bin_reuse: bool = False) -> None:
+    def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False, bin_reuse: bool = False, run_from_bin: bool = False) -> None:
         """Compile a single prefill program (seq_len-agnostic) and one decoder program into a
         combined instruction image.
 
@@ -2991,7 +2991,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         ``gpr_aligned_seq_len`` then jumps into the cached decoder program.
 
         By default the image is always recompiled from scratch. Pass ``bin_reuse=True``
-        (CLI ``--bin-reuse``) to reuse an existing single-engine bin + meta sidecar.
+        to reuse an existing single-engine bin + meta sidecar; with ``run_from_bin=True``
+        (CLI ``--run-from-bin`` / ``--bin-reuse``) a missing or mismatched cache is an error.
         Multi-engine compilation also emits and uploads persistent worker programs,
         so those runs always rebuild the image and workers together.
 
@@ -3030,6 +3031,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         print(f"Decode kernel: {'matmat_mul_core (two-pass)' if self.matmatmul else 'quantized_matmat_core (streaming)'}")
         print(f"Prefill kernel: {'two-pass (matmat_mul_core)' if self.two_pass_prefill else 'streaming (quantized_matmat_core)'}")
         if bin_reuse and self.multi_core > 1:
+            if run_from_bin:
+                sys.exit("ERROR: --run-from-bin is not supported with --multi-core > 1 "
+                         "(worker programs are rebuilt with the image).")
             print("--bin-reuse: rebuilding multi-core images to prepare worker programs.")
             bin_reuse = False
         if bin_reuse and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
@@ -3041,6 +3045,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 print(f"  delete {instruction_bin_path} (or drop --bin-reuse) to force recompile.")
                 return
             print("Recompiling instruction image for the current lane/AXI geometry.")
+        if run_from_bin:
+            sys.exit(f"ERROR: --run-from-bin: no usable cached image at {instruction_bin_path} (+ .json; "
+                     "missing or built for another lane/AXI geometry); run without it to compile.")
         print("Compiling instruction image from scratch"
               f"{' (--bin-reuse set but no cached bin found)' if bin_reuse else ''}.")
 
@@ -4328,9 +4335,10 @@ def main():
                         help='Use matmat_mul_core for decoder projections. Default: streaming quantized_matmat_core.')
     parser.add_argument('--numeric', action='store_true',
                         help='After prefill and after the first decoded token, compare HW KV cache against host reference and print SNR for K and V.')
-    parser.add_argument('--bin-reuse', dest='bin_reuse', action='store_true',
-                        help='Reuse a cached program image (gemma3_bin/*_program.bin + .json) if it exists. '
-                             'Multi-core runs rebuild their worker programs and primary image together. '
+    parser.add_argument('--run-from-bin', '--bin-reuse', dest='bin_reuse', action='store_true',
+                        help='Skip compiling and load the cached program image (gemma3_bin/*_program.bin + .json); '
+                             'errors out if it is missing or built for another geometry. '
+                             'Not supported with --multi-core > 1. '
                              'Default: always recompile the program image from scratch.')
     args = parser.parse_args()
     if not 1 <= args.multi_core <= MULTI_CORE_MAX_ENGINES:
@@ -4371,13 +4379,13 @@ def main():
 
     print(f"\n--- Compiling ---")
     timer = time.perf_counter()
-    ue.compile_gemma3(bin_reuse=args.bin_reuse)
+    ue.compile_gemma3(bin_reuse=args.bin_reuse, run_from_bin=args.bin_reuse)
     print(f"Compile done in {time.perf_counter() - timer:.2f} seconds")
 
     if args.profile:
         print("\n--- Compiling profile binary ---")
         timer = time.perf_counter()
-        ue.compile_gemma3(profile=True, bin_reuse=args.bin_reuse)
+        ue.compile_gemma3(profile=True, bin_reuse=args.bin_reuse, run_from_bin=args.bin_reuse)
         print(f"Profile compile done in {time.perf_counter() - timer:.2f} seconds")
         profile_result = ue.run_gemma3_profile()
         _summary_path = os.path.join(SCRIPT_DIR, gemma3_run_summary_filename(args, parser))

@@ -23,6 +23,11 @@ Usage:
   python models/kokoro/kokoro_test.py
   python models/kokoro/kokoro_test.py --text "some text" --voice af_heart
   python models/kokoro/kokoro_test.py --cuda        # reference path, no hardware
+  python models/kokoro/kokoro_test.py --run-from-bin   # replay kokoro_bin/ frozen image
+
+The FPGA path compiles every run and then saves the frozen instruction image
+(kokoro_bin/params.bin, programs.bin, programs.json); --run-from-bin replays it instead
+and fails if it is missing or stale.
 """
 import argparse
 import os
@@ -164,16 +169,19 @@ def main():
                               "programs are already prompt-independent.")
     parser.add_argument("--clean", action="store_true",
                          help="Delete the frozen instruction image (kokoro_bin/params.bin, "
-                              "programs.bin, programs.json) before running, so this run "
-                              "recompiles and saves a fresh one. Model weights and voices are kept.")
+                              "programs.bin, programs.json) before running. Model weights and "
+                              "voices are kept.")
     parser.add_argument("--no-bin-cache", action="store_true", dest="no_bin_cache",
-                         help="Ignore kokoro_bin/programs.bin and recompile the instruction "
-                              "streams from scratch. The cache is keyed on the compiler "
+                         help="Do not save the frozen instruction image to kokoro_bin/ after "
+                              "this run (every run compiles anyway).")
+    parser.add_argument("--run-from-bin", action="store_true", dest="run_from_bin",
+                         help="Replay the frozen image in kokoro_bin/ instead of compiling; error "
+                              "if it is missing or stale. The cache is keyed on the compiler "
                               "fingerprint and the capacity caps -- deliberately NOT on the "
                               "sequence length, since one image is meant to serve every prompt.")
     parser.add_argument("--engines", type=int, default=1,
                          help="Accelerator engines to row-shard the generator's conv taps across "
-                              "(1 = single engine). >1 compiles every run for now (no bin cache).")
+                              "(1 = single engine). >1 never saves or replays a bin image for now.")
     parser.add_argument("--no-snr", action="store_false", dest="debug_snr",
                          help="Skip the per-section SNR bisects against the CPU reference. "
                               "They run by default; pass this to opt out.")
@@ -214,14 +222,13 @@ def main():
                 path = os.path.join(BIN_DIR, name)
                 if os.path.exists(path):
                     os.remove(path)
-            print(f"--clean: removed the frozen instruction image from {BIN_DIR}; "
-                  f"this run recompiles and saves a new one")
+            print(f"--clean: removed the frozen instruction image from {BIN_DIR}")
         print("Running FPGA inference (only sections currently ported to hardware) ...")
         audio = run_fpga_forward(model, phonemes, ref_s[len(phonemes) - 1], speed=args.speed,
                                  dev=args.dev, debug=args.debug_snr,
                                  dump_programs=args.dump_programs,
                                  bin_cache=(None if args.no_bin_cache else BIN_DIR),
-                                 engines=args.engines)
+                                 engines=args.engines, run_from_bin=args.run_from_bin)
         if audio is None:
             return  # see kokoro_fpga.py's section checklist
         import soundfile as sf

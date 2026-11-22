@@ -4,8 +4,8 @@ Llama-3.2-3B inference on accelerator: prefill + decode.
 
   - Config from llama3.2_3b_config.json; weights from a single bin (see below).
   - Prefill + decoder are compiled into a unified instruction image
-    (llama3.2_3b_bin/programs.bin + llama3.2_3b_bin/programs.json). If both
-    exist they are reused; otherwise both are (re)written.
+    (llama3.2_3b_bin/programs.bin + llama3.2_3b_bin/programs.json), rewritten every
+    run; --run-from-bin skips the compile and reuses them (error if missing).
   - Run prefill then decode loop.
 
 Architecture differences vs Gemma3:
@@ -1006,14 +1006,15 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = False
         return {"program_size_bytes": decoder_program_size, "total_flops": total_flops}
 
-    def compile_llama(self, layer_size: int | None = None) -> None:
+    def compile_llama(self, layer_size: int | None = None, run_from_bin: bool = False) -> None:
         """Compile prefill + decoder into a single combined instruction image.
 
         Layout in program DRAM:  [prefill][decoder]
 
         Prefill is compiled with a fixed template (UE_VECTOR_SIZE) — all runtime
         loop counts are driven by GPRs primed by the preamble, so the same bin
-        works for any seq_len. If both bin and meta already exist, this is a no-op.
+        works for any seq_len. Always recompiles unless ``run_from_bin`` is set; then
+        the existing bin + meta are reused (missing is an error).
 
         Writes:
           - paths.instruction_bin  : combined raw instruction stream
@@ -1031,9 +1032,11 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
             instruction_meta_path = instruction_meta_path.replace(".json", "_fpgapenalty.json")
             self._instruction_bin_path = instruction_bin_path
             self._instruction_meta_path = instruction_meta_path
-        if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+        if run_from_bin:
+            if not (os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path)):
+                sys.exit(f"ERROR: --run-from-bin: {instruction_bin_path} (+ .json) not found; "
+                         "run without --run-from-bin to compile it.")
             print(f"Reusing existing instruction image at {instruction_bin_path}")
-            print(f"  delete {instruction_bin_path} to force recompile.")
             return
 
         # Compile the prefill template at PREFILL_CONTEXT_SIZE (the max prompt length).
@@ -1359,6 +1362,9 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_3b_bin/full_model_weights.bin")
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
+    parser.add_argument('--run-from-bin', action='store_true',
+                        help='Skip compiling and load the cached program image; error if it is missing. '
+                             'Default: recompile every run.')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly (no logit readback), fully
     # deterministic (separate _fpgapenalty bin). --pure-greedy disables it entirely.
@@ -1443,7 +1449,7 @@ def main():
 
     print("\n--- Compiling ---")
     timer = time.perf_counter()
-    ue.compile_llama()
+    ue.compile_llama(run_from_bin=args.run_from_bin)
     print(f"Compile done in {time.perf_counter() - timer:.2f}s")
 
     print("\n--- Running ---")

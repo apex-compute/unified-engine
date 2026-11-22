@@ -33,6 +33,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RANDOMIZE_DRAM   = os.environ.get("RANDOMIZE_DRAM", "0") == "1"
 RANDOM_DRAM_SEED = int(os.environ.get("RANDOM_DRAM_SEED", "0"))
 DMA_DEV          = os.environ.get("DMA_DEV", "xdma0")
+RUN_FROM_BIN     = False   # --run-from-bin: every model replays its program image on disk
 
 
 def randomize_dram(seed: int = 0, dev: str = "xdma0",
@@ -719,23 +720,29 @@ TESTS = [
     # Robot policy (VLA): no --prompt, no text output -- emits a (10,7) action chunk from
     # its in-repo LIBERO sample frames in test_samples/ (pi05_libero_base/wrist.png --
     # named for the upstream checkpoint, not the model dir). Runs at the default
-    # --engines 1, which is the bin-eligible path: pass 1 compiles + dumps bins, pass 2
-    # loads them. The harness poisons DRAM before every pass, which is exactly the
-    # condition that exposed the action-expert suffix K/V NaN -- so a regression in
-    # tensor_init_action_expert's zero-fill fails here rather than silently.
-    {"name": "pi05", "script": "models/pi05/pi05_test.py", "pass_check": _check_pi05},
+    # --engines 1 by default; the harness gives it every engine the board has.
+    # pi05 reads DRAM it never writes: its --run-from-bin replay at 8 engines on U50
+    # (2026-11-22, 6cc619f) ran right after moonshine and returned an all-NaN action
+    # chunk from the leftovers. Until its setup is fixed the harness zeroes DRAM
+    # before it, and says so loudly.
+    {"name": "pi05", "script": "models/pi05/pi05_test.py", "pass_check": _check_pi05,
+     "clear_dram_zero": True,
+     "warning": "pi05 INITIALIZATION IS INCOMPLETE: it reads DRAM it never writes. "
+                "The harness zero-fills DRAM before it; without that its --run-from-bin "
+                "replay fails on NaN leftovers."},
 
     # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
     # currently not working.
-    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 8},
+    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                    "replay_max_engines": 1, "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 8},
     # Gemma4 E2B FPGA vision. No --device: this script reads AXI width, clock,
     # DRAM size and engine count from HW_INFO (see resolve_engine_config).
-    # The normal entry compiles fresh (--bin-reuse is off by default) with the
-    # default yosemite.jpg; the run-from-bin entry then runs --bin-reuse on
-    # vette.jpg and must hit BOTH cached sections. It keeps the default prompt
-    # deliberately: the LM cache check compares prefill_flops_seq_len, so a
-    # different prompt (7 tokens vs the default's 6) misses the cache and
-    # silently recompiles -- which is what this entry used to do. The image is
+    # The normal entry compiles fresh (every script's default) with the
+    # default yosemite.jpg; the run-from-bin entry ("run_from_bin": the harness
+    # passes --run-from-bin; "follows" keeps it right after its compile entry)
+    # then runs on vette.jpg and must hit BOTH cached sections. It keeps the
+    # default prompt deliberately: the LM cache check compares
+    # prefill_flops_seq_len, so a different prompt (7 tokens vs the default's 6)
+    # misses the cache, and --run-from-bin then fails. The image is
     # free to differ: it is data, not program, and always yields 256 soft
     # tokens, while the vision cache keys only on kernel + engine count.
     # All three gemma4 entries run on every engine the board has, up to 8 (the
@@ -746,16 +753,16 @@ TESTS = [
     # an 8192-token context would otherwise let a description run for ~20 min
     # on Kintex.
     {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "gemma4_e2b_run_from_bin", "follows": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "gemma4_e2b_run_from_bin", "follows": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "run_from_bin": True, "extra_args": ["--image", "test_samples/vette.jpg", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "gemma4_e4b_run_from_bin", "follows": "gemma4_e4b", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 8},
+    {"name": "gemma4_e4b_run_from_bin", "follows": "gemma4_e4b", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "run_from_bin": True, "extra_args": ["--image", "test_samples/vette.jpg", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py",  "replay_max_engines": 1, "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 8},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 8,
+    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",    "replay_max_engines": 1, "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 8,
      "multi_engine_warning": "qwen3_0.6b PREFILL RUNS ON ONE ENGINE: only decode is sharded, so --multi-core N speeds up decode alone (2 engines on kintex7: prefill 1.00x, decode 1.44x)."},
     {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",   "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
     {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_test.py",       "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
-    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 8,
+    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "program_image_max_engines": 1, "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 8,
      "multi_engine_warning": "qwen3.5_2b PREFILL IS SINGLE-ENGINE: only decode counts as multi-engine (2 engines on kintex7: prefill 1.06x, decode ~1.07x, 0.8 tok/s)."},
     # qwen3.5_2b VLM: FPGA vision encoder (--vision-enable defaults to on-FPGA vision)
     # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
@@ -763,7 +770,7 @@ TESTS = [
     # ("multicore currently supports text-only generation"); the text entry above
     # covers the same script on several engines.
     {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "max_engines": 1, "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable", "--vision-on-hardware", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
-    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "no_program_cache": True, "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True, "multi_core_max": 8},
 
     # Qwen2.5-Omni-7B Thinker-only modes. The model requires the 8 GiB Alveo U55
     # eight-engine layout; unlike scripts that expose --engines, --multi-core is
@@ -833,7 +840,7 @@ TESTS = [
     # -> 4-bit LM prefill + decode -> flow-matching action expert -> 6.4 s trajectory, checked
     # against the device-equivalent host reference. Needs the 8-engine / 8 GiB layout; about
     # 80 s on the board per pass and no program bin yet, so every pass compiles.
-    {"name": "alpamayo2_edge", "script": "models/alpamayo2_edge/alpamayo2_edge_test.py", "pass_check": _check_alpamayo2_edge,
+    {"name": "alpamayo2_edge", "script": "models/alpamayo2_edge/alpamayo2_edge_test.py", "no_program_cache": True, "pass_check": _check_alpamayo2_edge,
      "mode": "VLA (8 engines)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
     # kokoro (TTS): --fpga runs the ported sections on hardware with per-section SNR
     # bisects vs the CPU reference (on by default) and writes a wav. Bins cached in
@@ -1040,6 +1047,39 @@ def run_test(test: dict, verbose: bool = False,
                   else _device_capacity(dev or DMA_DEV)[0])
         if _cores and _cores > 1:
             cmd += ["--multi-core", str(min(int(_cores), int(_mc_cap)))]
+    # Program image: every script compiles it by default. A run_from_bin entry (or a
+    # --run-from-bin run) passes --run-from-bin, and the script replays the image on
+    # disk. --run-from-bin never falls back to compiling: where it is impossible the
+    # entry FAILS without running. Per entry:
+    #   "no_program_cache": the script keeps no image at all;
+    #   "program_image_max_engines": N: above N engines it writes no image;
+    #   "replay_max_engines": N: above N engines it writes an image but cannot
+    #       replay it (worker programs are not in the image).
+    # Without --run-from-bin these entries compile as usual; the first two then
+    # skip the image check (no image is written).
+    _run_ne = 1
+    for _flag in ("--multi-core", "--engines"):
+        if _flag in cmd[:-1] and cmd[cmd.index(_flag) + 1].isdigit():
+            _run_ne = max(_run_ne, int(cmd[cmd.index(_flag) + 1]))
+    _image_cap = test.get("program_image_max_engines")
+    _replay_cap = test.get("replay_max_engines")
+    _image_note = None      # set: no image this run, so nothing to check
+    _no_replay = None       # set: --run-from-bin is impossible for this run
+    if test.get("no_program_cache"):
+        _image_note = "the script keeps no program image"
+    elif _image_cap is not None and _run_ne > _image_cap:
+        _image_note = f"no program image at {_run_ne} engines (written up to {_image_cap})"
+    elif _replay_cap is not None and _run_ne > _replay_cap:
+        _no_replay = (f"no replay at {_run_ne} engines (up to {_replay_cap}): "
+                      "worker programs are not in the image")
+    elif not _script_supports_flag(script, "--run-from-bin"):
+        _no_replay = "script has no --run-from-bin"
+    _no_replay = _no_replay or _image_note
+    _want_bin = bool(test.get("run_from_bin") or RUN_FROM_BIN)
+    _from_bin = _want_bin and _no_replay is None
+    _mode_note = _image_note
+    if _from_bin:
+        cmd.append("--run-from-bin")
     unsupported = []
     for flag, value in (("--dev", dev), ("--device", device)):
         if value is None:
@@ -1079,6 +1119,11 @@ def run_test(test: dict, verbose: bool = False,
         print(f"Prompt       : {test['prompt_desc']}")
     if unsupported:
         print(f"Note         : script does not accept {', '.join(unsupported)} — not forwarded")
+    if _want_bin and not _from_bin:
+        print(f"Program image: --run-from-bin NOT SUPPORTED ({_no_replay})")
+    else:
+        print(f"Program image: {'run from bin (--run-from-bin)' if _from_bin else 'compile'}"
+              + (f" ({_mode_note})" if _mode_note else ""))
     if test.get("prompt") and not test.get("prompt_desc"):
         print(f"Prompt       : {test['prompt']}")
     print(f"{'='*60}\n", flush=True)
@@ -1167,6 +1212,14 @@ def run_test(test: dict, verbose: bool = False,
         result.update(passed=True, skipped=True, pass_reason=reason)
         return result
 
+    # After the skips (a skipped entry stays skipped), before any DRAM work.
+    if _want_bin and not _from_bin:
+        reason = f"--run-from-bin not supported: {_no_replay}; model was not run"
+        print(f"ERROR        : {reason}\n", flush=True)
+        result = _parse_output(test, "", 1, 0.0)
+        result["pass_reason"] = reason
+        return result
+
     # Check immediately before poisoning. Model worktrees are sometimes updated
     # while a long suite is running; do not spend time writing all device DRAM when the
     # subprocess entry point is no longer present.
@@ -1177,7 +1230,7 @@ def run_test(test: dict, verbose: bool = False,
 
     # Per-test escape hatch: a test may set clear_dram_zero to start from zero
     # (for a model with a known read-before-write defect that cannot self-zero).
-    # parakeet and locateanything_3b use it; SmolVLM2 zeroes DRAM inside its own script.
+    # pi05, parakeet and locateanything_3b use it; SmolVLM2 zeroes DRAM inside its own script.
     if test.get("clear_dram_zero"):
         print(f"[zero_dram] {test['name']} requested clean DRAM; "
               "zeroing before run ...", flush=True)
@@ -1260,6 +1313,16 @@ def run_test(test: dict, verbose: bool = False,
         for l in _fail_tail(result):
             print("    | " + l)
     result["bins"] = _bin_states(_bins_before, _bin_snapshot(script))
+    # The script's own pass check cannot tell a fresh program from a replayed one,
+    # so the harness checks the image files: a compile run must rewrite one, a
+    # run-from-bin run must rewrite none.
+    # An entry that writes no program image this run (see _image_note) is not checked:
+    # images on disk then belong to another engine count.
+    _problem = None if _image_note else _program_image_problem(result["bins"], _from_bin)
+    if _problem and result["passed"]:
+        result["passed"] = False
+        result["pass_reason"] = _problem
+        print(f"--- {test['name']}: {_problem}")
     result["harness_s"] = time.perf_counter() - _t_harness
     return result
 
@@ -1361,7 +1424,8 @@ def _bin_snapshot(script: str) -> dict:
                 # act_bin/programs_e<N>/<stage>.bin
                 low = os.path.relpath(path, model_dir).lower()
                 low = low.split(os.sep, 1)[1] if os.sep in low else low
-                if not low.endswith(".bin") or not ("param" in low or "weight" in low or "program" in low):
+                if not low.endswith(".bin") or not any(
+                        word in low for word in ("param", "weight", "program", "instruction")):
                     continue
                 try:
                     st = os.stat(path)
@@ -1371,11 +1435,36 @@ def _bin_snapshot(script: str) -> dict:
     return found
 
 
+def _is_program_image(path: str) -> bool:
+    low = path.lower()
+    return "program" in low or "instruction" in low
+
+
+def _program_image_problem(bins: list, from_bin: bool) -> str | None:
+    """Why the program images on disk contradict the run mode, or None.
+
+    A compile run must rewrite at least one program image it finds on disk (other
+    images may belong to another engine count or mode). A run-from-bin run must find
+    one and rewrite none.
+    """
+    programs = [(path, state) for kind, path, _, state in bins if kind == "program"]
+    written = [path for path, state in programs if state != "reuse"]
+    if from_bin:
+        if not programs:
+            return "run-from-bin: no program image on disk to replay"
+        if written:
+            return f"run-from-bin recompiled: {', '.join(written)} rewritten"
+    elif programs and not written:
+        return ("stale program image: no program image was rebuilt this run "
+                f"({', '.join(path for path, _ in programs)} replayed)")
+    return None
+
+
 def _bin_states(before: dict, after: dict) -> list:
     """[(kind, path, size_bytes, state)]; state is newly built / overwrite / reuse."""
     rows = []
     for path, (size, mtime) in sorted(after.items()):
-        kind = "program" if "program" in path.lower() else "weight"
+        kind = "program" if _is_program_image(path) else "weight"
         if path not in before:
             state = "newly built"
         elif before[path] != (size, mtime):
@@ -1571,6 +1660,9 @@ def collect_run_info(args, dev: str) -> dict:
     info["conv_ports"] = os.environ.get("UE_RUN_CONV_MODELS") == "1"
     info["order"] = (f"shuffled, seed {args.shuffle_seed}" if args.shuffle_seed is not None
                      else "registry" + (f", --first {' '.join(args.first)}" if args.first else ""))
+    info["programs"] = ("--run-from-bin: every model replays the program image on disk"
+                        if args.run_from_bin else
+                        "compiled fresh by every model (run_from_bin entries replay it)")
     info["dev"] = dev
     try:
         import struct
@@ -1620,6 +1712,7 @@ def _header_lines(info: dict) -> list:
         f"  conv image  : {'yes (UE_CI_CONV_IMAGE=1)' if info['conv_image'] else 'no: conv-image entries SKIP'}",
         f"  conv ports  : {'run (UE_RUN_CONV_MODELS=1)' if info['conv_ports'] else 'default-off (see user_hw_test.py)'}",
         f"  order       : {info['order']}",
+        f"  programs    : {info['programs']}",
         "",
         "Hardware",
         f"  device      : {info['dev']}",
@@ -1687,7 +1780,8 @@ def triage_failure(prev: dict | None, test: dict, verbose: bool = False,
     1. reset, run `test` alone      -> FAIL: the model's own bin-reload path is broken
     2. reset, run prev then test    -> FAIL: confirmed contamination pair prev->test
                                        PASS: not reproducible (flaky / HW)
-    Bins are already cached, so each step is a run-from-bin inference.
+    Each step runs the entry as configured: a compile entry compiles again, a
+    run_from_bin entry (or a --run-from-bin run) replays the image on disk.
     """
     reset_device(dev or DMA_DEV)
     alone = run_test(test, verbose=verbose, dev=dev, device=device)
@@ -1723,10 +1817,15 @@ def main():
                          "own reset / DRAM poisoning and forwarded to model scripts "
                          f"that accept --dev. Default: {DMA_DEV} (env DMA_DEV)")
     ap.add_argument("--shuffle-seed", type=int, default=None, metavar="SEED",
-                    help="Run the selected tests in a seeded random order (pass 2 of the "
-                         "nightly: all bins already cached, so this exercises run-from-bin "
-                         "under a fresh predecessor for every model). The order is printed "
-                         "and reproducible from SEED. Default (unset): registry order.")
+                    help="Run the selected tests in a seeded random order, so every model "
+                         "gets a different predecessor each night. A run_from_bin entry stays "
+                         "right after the entry it follows. The order is printed and "
+                         "reproducible from SEED. Default (unset): registry order.")
+    ap.add_argument("--run-from-bin", action="store_true",
+                    help="Replay the program image each model's last compile left on disk: "
+                         "--run-from-bin is passed to every script that takes it, which then "
+                         "skips compiling and fails if the image is missing or stale. "
+                         "Default: every model compiles its program image fresh.")
     ap.add_argument("--engines", default="max", metavar="N|max",
                     help="Engine count for the run. 'max' (default): the core count the "
                          "board reports in HW_INFO. N: pin every model to N engines; it is "
@@ -1749,6 +1848,8 @@ def main():
 
     # --dev also selects the device the harness itself resets and poisons.
     DMA_DEV = args.dev
+    global RUN_FROM_BIN
+    RUN_FROM_BIN = args.run_from_bin
 
     if args.list_names:
         print(" ".join(t["name"] for t in TESTS))

@@ -879,9 +879,13 @@ class Qwen25OmniUnifiedEngine(
         return digest.hexdigest()
 
     def configure_runtime_artifacts(
-        self, params_path: str, processor_dir: str
+        self, params_path: str, processor_dir: str, program_tag: str = ""
     ) -> None:
         """Bind program packaging to the exact params, code, and U55 image.
+
+        ``program_tag`` names the request's input stages in the flat layout's file
+        name (programs_flat_<tag>.bin), so the LM, vision, audio and joint requests
+        each keep their own image for --run-from-bin instead of overwriting one.
 
         This is deliberately called only after HW_INFO and every engine's FPGA
         build stamp have been read.  A program captured for a different build,
@@ -984,7 +988,8 @@ class Qwen25OmniUnifiedEngine(
         }
         self._program_bundle = ProgramBundle(
             os.path.dirname(params_path), identity,
-            stem="programs" if self.layout.kind == "windowed" else "programs_flat"
+            stem=("programs" if self.layout.kind == "windowed"
+                  else "programs_flat" + (f"_{program_tag}" if program_tag else ""))
         )
         self._packaged_program_stages.clear()
         self._loaded_program_stages.clear()
@@ -3048,7 +3053,7 @@ def _prepare_unified(ue: Qwen25OmniUnifiedEngine, args, processed, context,
     if from_bin:
         # Reuse the stored programs only if they were built for this configuration
         # (layout, context, which stages, shapes -- the prompt's text does not matter,
-        # its token count does). Anything else: build from scratch, as without the flag.
+        # its token count does). Anything else is an error: never fall back to compiling.
         problem = None
         generation = None
         try:
@@ -3065,10 +3070,9 @@ def _prepare_unified(ue: Qwen25OmniUnifiedEngine, args, processed, context,
             except Exception as exc:  # noqa: BLE001 - e.g. ProgramBundleError: stale identity
                 problem = f"programs.bin does not match this code or layout ({exc})"
         if problem is not None:
-            print(f"  [run_from_bin] not reusing {os.path.basename(bin_path)}: {problem}\n"
-                  "  [run_from_bin] building the programs from scratch", flush=True)
-            from_bin = False
-            manifest = payload = None
+            print(f"ERROR: --run-from-bin: cannot reuse {bin_path}: {problem}. "
+                  "Rerun without --run-from-bin to compile.", file=sys.stderr, flush=True)
+            sys.exit(1)
     print("\n--- Unified prepare: weights, tensors, programs (all stages) ---"
           + ("   [programs from programs.bin, no compile]" if from_bin else ""))
     if not from_bin:
@@ -4032,8 +4036,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--run_from_bin", "--run-from-bin", action="store_true",
         help="flat layout (the U50): do not compile. Load the stage programs from the "
              "existing programs bin (and the compilers' state and the speech weights "
-             "stored beside it), checked against this request; a bin built for a "
-             "different request is refused. Build it by running once without the flag.",
+             "stored beside it), checked against this request; a missing bin or one built "
+             "for a different request is an error (no fallback to compiling). Without the "
+             "flag every run compiles and rewrites the bin. Not available on the windowed layout.",
     )
     parser.add_argument(
         "--max-context", type=int, default=None,
@@ -4297,9 +4302,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     layout = "flat" if dram_interleaved() else "windowed"
     print(f"[layout] {layout}")
     if args.run_from_bin and layout != "flat":
-        print("[run_from_bin] only applies to the flat layout; the windowed layout "
-              "always builds its programs")
-        args.run_from_bin = False
+        print("ERROR: --run-from-bin only applies to the flat layout; the windowed layout "
+              "keeps no reusable programs bin. Rerun without --run-from-bin.",
+              file=sys.stderr, flush=True)
+        sys.exit(1)
 
     cfg = apply_vision_resolution(
         Qwen25OmniUnifiedEngine.load_config(script_dir=SCRIPT_DIR),
@@ -4386,7 +4392,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         raise SystemExit("--speak needs qwen2.5_omni_7b_talker.py, which failed to import")
     if args.speak is not None and not args.speak_host and _talker_fpga_mod is None:
         raise SystemExit("--speak needs qwen2.5_omni_7b_talker_fpga.py")
-    ue.configure_runtime_artifacts(params_path, processor_dir)
+    _inputs = [name for name, on in (("vision", args.image), ("audio", args.audio),
+                                     ("speech", args.speak is not None)) if on]
+    ue.configure_runtime_artifacts(params_path, processor_dir,
+                                   program_tag="_".join(_inputs) or "lm")
     ue.tokenizer = processor.tokenizer
     ue.processor = processor
     ue._prompt_text = prompt

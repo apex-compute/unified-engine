@@ -17,6 +17,12 @@ Usage:
   python mobilenetv2_test.py
   python mobilenetv2_test.py --image path/to/image.jpg
   python mobilenetv2_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python mobilenetv2_test.py --run-from-bin   # reuse mobilenetv2_bin/ params + programs
+
+Every run regenerates params and recompiles the program, then dumps params.bin,
+programs.bin and labels.json to mobilenetv2_bin/ (params carry compile-time layout,
+so they are regenerated together). --run-from-bin skips both and loads them from
+mobilenetv2_bin/; it fails if they are missing.
 
 Fixed layout: mobilenetv2_test.py, mobilenetv2_config.json, mobilenetv2_bin/
 live in the same folder. user_dma_core.py is two folders up (repo root);
@@ -645,7 +651,8 @@ class MobileNetV2_UnifiedEngine(UnifiedEngine):
 
     USE_BIN_CACHE = True
 
-    def __init__(self, script_dir: str = SCRIPT_DIR, weights_bin: str | None = None):
+    def __init__(self, script_dir: str = SCRIPT_DIR, weights_bin: str | None = None,
+                 run_from_bin: bool = False):
         super().__init__(params_dram_base=MBV2_PARAMS_BASE,
                          tensor_dram_base=MBV2_TENSOR_BASE,
                          program_dram_base=MBV2_PROGRAM_BASE)
@@ -660,8 +667,13 @@ class MobileNetV2_UnifiedEngine(UnifiedEngine):
         # can index uniformly.
         self.blocks = self._expand_blocks()
 
-        if self.USE_BIN_CACHE:
+        # params.bin holds compile-time layout: only reuse it with --run-from-bin,
+        # together with programs.bin; otherwise regenerate from the HF weights.
+        if run_from_bin:
             self.params_from_bin = self.load_params()
+            if not self.params_from_bin:
+                raise SystemExit(f"--run-from-bin: missing params.bin/params.json in "
+                                 f"{os.path.join(script_dir, self.BIN_SUBDIR)}; run without --run-from-bin first")
         else:
             self.params_from_bin = False
         if not self.params_from_bin:
@@ -1290,6 +1302,9 @@ def main():
                              "Cached HF weights (hf_model/) are preserved.")
     parser.add_argument("--diff", action="store_true",
                         help="After HW run, read intermediate buffers and compare to CPU reference.")
+    parser.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                        help="Skip weight packing and compile; load params.bin + programs.bin from "
+                             "mobilenetv2_bin/ (error if missing). Default: regenerate and recompile.")
     args = parser.parse_args()
 
     if args.cleanup:
@@ -1327,16 +1342,18 @@ def main():
             _original_print(f"\r  {label} ({elapsed:.0f}s)", end="", flush=True)
 
     t0 = _time.perf_counter()
-    ue = MobileNetV2_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue = MobileNetV2_UnifiedEngine(script_dir=SCRIPT_DIR, run_from_bin=args.run_from_bin)
     ue.software_reset()
     flop_meter = _install_flop_meter(ue)
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
 
-    prog_addr = ue.load_programs() if ue.USE_BIN_CACHE else None
+    prog_addr = ue.load_programs() if args.run_from_bin else None
     if prog_addr is None:
-        if ue.params_from_bin:
-            raise RuntimeError("Cannot compile without weight addresses — delete mobilenetv2_bin/ and re-run")
+        if args.run_from_bin:
+            _original_print("ERROR: --run-from-bin: missing mobilenetv2_bin/programs.bin/programs.json; "
+                            "run without --run-from-bin first")
+            sys.exit(1)
         stop_c = threading.Event()
         timer_c = threading.Thread(target=_progress_timer,
             args=("Compiling", t_weights, stop_c), daemon=True)

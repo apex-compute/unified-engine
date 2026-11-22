@@ -1308,7 +1308,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                   f"audio ISA @ 0x{self._audio_isa_base_addr:X}, context {self._context_size}")
         # Program-image reuse: OFF by default (recompile programs.bin fresh every
         # run). --bin-reuse opts into reusing a matching cached section instead.
+        # run_from_bin (set by main() for --run-from-bin) makes a cache miss fatal.
         self.bin_reuse = bin_reuse
+        self.run_from_bin = False
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
@@ -2023,11 +2025,15 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             if prefill_scheduler is not None:
                 self._stage_prefill_private_state(prefill_scheduler, layer_size)
             print(f"[compile] reusing existing instruction image at {bin_path}")
-            print(f"  delete {bin_path} (or make clean) to force recompile.")
+            print("  run without --run-from-bin / --bin-reuse to recompile.")
             self._lm_compile_reused = True
             if not profile:
                 self._remember_lm_image(_mem_key)
             return
+        if self.run_from_bin:
+            raise SystemExit(f"ERROR: --run-from-bin: no cached LM section matching this run "
+                             f"({prefill_flops_seq_len} prefill rows, kernels, engines, layout) in "
+                             f"{self._program_image_paths(profile)[0]}; run without --run-from-bin to compile it.")
         self._lm_compile_reused = False
         # Every LM build starts at the same program cursors (the first build's):
         # the images are swapped in by DMA, never resident side by side.
@@ -3492,10 +3498,10 @@ def add_engine_args(parser) -> None:
                         help="With --heartbeat: before every sampled FPGA program, run "
                              "andromeda's hw_check.py (must be alive, same version) and "
                              "temp_check.tcl (die temperatures, recorded only).")
-    parser.add_argument("--bin-reuse", action="store_true",
-                        help="Reuse a matching cached program image (programs.bin) if it "
-                             "exists instead of recompiling. Default: OFF (fresh compile "
-                             "every run).")
+    parser.add_argument("--run-from-bin", "--bin-reuse", dest="bin_reuse", action="store_true",
+                        help="Skip compiling and load the matching cached program image "
+                             "(programs.bin / programs_profile.bin); a missing or mismatched "
+                             "section is an error. Default: OFF (fresh compile every run).")
 
 
 def resolve_engine_config(parser, args) -> dict:
@@ -3570,7 +3576,7 @@ def resolve_engine_config(parser, args) -> dict:
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}")
     print(f"Kernels: vision={args.vision_kernel}, prefill={args.prefill_kernel}, "
           f"engines={args.multi_core}, decode={args.decode_kernel}")
-    print(f"Program image: {'reuse cached if present' if args.bin_reuse else 'fresh compile every run'}"
+    print(f"Program image: {'reuse cached' if args.bin_reuse else 'fresh compile every run'}"
           f" (--bin-reuse {'on' if args.bin_reuse else 'off'})")
 
     return dict(
@@ -3827,6 +3833,7 @@ def main():
             num_engines=args.multi_core)
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
+    ue.run_from_bin = args.bin_reuse
     ue.max_new_tokens = args.max_new_tokens
     if args.heartbeat is not None:
         ue.heartbeat_log = args.heartbeat or os.path.join(

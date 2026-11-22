@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 # Local CI runner — mirrors what CI runs: generic HW op tests, then every
-# model compiled from scratch + run from its cached bin, with DRAM randomized
-# (poisoned) before every single pass. Stops immediately on the first failure
-# — a bad run must not be allowed to keep going and corrupt/mask later results.
+# model, each compiling its program image fresh (every model script's default;
+# the run_from_bin entries replay the image their compile entry just wrote),
+# with DRAM randomized (poisoned) before every single pass. Stops immediately on
+# the first failure — a bad run must not be allowed to keep going and
+# corrupt/mask later results.
 #
 # Usage:
 #   ./run_ci.sh                   # full suite (stops on first failure)
-#   ./run_ci.sh --clean-bins      # also wipe cached programs.bin/json first
-#                                  # (model_auto_test.py already wipes per-model
-#                                  # bins before its own compile pass, so this is
-#                                  # mostly redundant — kept for an explicit
-#                                  # "start completely clean" run)
 #   ./run_ci.sh --only gpt2 swin  # restrict the model round to these names
-#   ./run_ci.sh --clean-bins --only gpt2 swin
 #   ./run_ci.sh --pi05-first      # pi05 first, and the model round BEFORE the HW
 #                                  # op tests (used by the nightly full run)
 #   ./run_ci.sh --shuffle         # one round, models in a seeded random order
@@ -20,7 +16,8 @@
 #                                  # every model run even after a failure; used by
 #                                  # the nightly full run
 #   ./run_ci.sh --shuffle-pass    # after the compile round, re-run every model
-#                                  # FROM ITS CACHED BIN in a seeded random order
+#                                  # FROM ITS CACHED BIN (--run-from-bin) in a seeded
+#                                  # random order
 #                                  # (seed = SHUFFLE_SEED env or today's YYYYMMDD),
 #                                  # not stopping on failure, with auto-triage that
 #                                  # classifies each failure as BIN-RELOAD /
@@ -30,12 +27,6 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-
-CLEAN_BINS=0
-if [[ "${1:-}" == "--clean-bins" ]]; then
-    CLEAN_BINS=1
-    shift
-fi
 
 # --pi05-first: hoist pi05 to the front of the model round AND run that round
 # BEFORE user_hw_test.py, so a night run gets its pi05 verdict in ~2 minutes
@@ -73,22 +64,8 @@ FIRST_ARGS=()
 [[ $SHUFFLE -eq 1 ]] && FIRST_ARGS+=(--shuffle-seed "${SHUFFLE_SEED:-$(date +%Y%m%d)}" --continue-on-fail)
 
 STEP_TOTAL=2
-[[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
 [[ $SHUFFLE_PASS -eq 1 ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
 STEP=1
-
-if [[ $CLEAN_BINS -eq 1 ]]; then
-    echo "############################################################"
-    echo "# $STEP/$STEP_TOTAL  clean_program_bins.sh — wipe cached compiled programs"
-    echo "############################################################"
-    ./clean_program_bins.sh
-    if [[ $? -ne 0 ]]; then
-        echo "!!! clean_program_bins.sh failed — stopping."
-        exit 1
-    fi
-    STEP=$((STEP + 1))
-    echo
-fi
 
 run_hw_tests() {
     echo
@@ -106,7 +83,7 @@ run_hw_tests() {
 run_model_tests() {
     echo
     echo "############################################################"
-    echo "# $STEP/$STEP_TOTAL  model_auto_test.py — compile + run-from-bin per model"
+    echo "# $STEP/$STEP_TOTAL  model_auto_test.py — every model compiles its program fresh"
     echo "#       (DRAM randomized before every pass; stops on first model failure)"
     echo "############################################################"
     python model_auto_test.py "${ONLY_ARGS[@]}" "${FIRST_ARGS[@]}"
@@ -126,7 +103,7 @@ run_shuffle_pass() {
     echo "#       (reproduce with: SHUFFLE_SEED=$seed ./run_ci.sh --shuffle-pass)"
     echo "############################################################"
     cp -f model_auto_test_results.txt model_auto_test_results_pass1.txt 2>/dev/null || true
-    python model_auto_test.py "${ONLY_ARGS[@]}" --shuffle-seed "$seed" --continue-on-fail --triage
+    python model_auto_test.py "${ONLY_ARGS[@]}" --run-from-bin --shuffle-seed "$seed" --continue-on-fail --triage
     SHUFFLE_STATUS=$?
     cp -f model_auto_test_results.txt model_auto_test_results_shuffle.txt 2>/dev/null || true
     STEP=$((STEP + 1))
@@ -155,7 +132,7 @@ echo "############################################################"
 echo "# CI SUMMARY"
 echo "############################################################"
 if [[ $SHUFFLE_PASS -eq 1 && -f model_auto_test_results_pass1.txt ]]; then
-    echo "--- pass 1: compile + run-from-bin (registry order) ---"
+    echo "--- pass 1: compile (registry order) ---"
     sed -n '/Summary table/,/^Overall/p' model_auto_test_results_pass1.txt
     echo "--- pass 2: run-from-bin, shuffled (seed ${SHUFFLE_SEED:-$(date +%Y%m%d)}) ---"
     sed -n '/Summary table/,/^Overall/p' model_auto_test_results_shuffle.txt

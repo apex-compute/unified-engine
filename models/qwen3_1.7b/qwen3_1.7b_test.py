@@ -3,9 +3,8 @@
 Qwen3-1.7B inference on accelerator: prefill + decode.
 
   - Config from qwen3_1.7b_bin/qwen3_1.7b_config.json; weights from a single bin (see below).
-  - Prefill: compiled each run. Decoder: if qwen3_1.7b_bin/programs.bin and
-    qwen3_1.7b_bin/programs.json exist, skip decoder compile and load
-    program sizes from meta; otherwise compile and write the bin + meta.
+  - Prefill + decoder: compiled each run into qwen3_1.7b_bin/programs.bin + programs.json.
+    --run-from-bin skips the compile and loads them (error if missing or mismatched).
   - Run prefill then decode loop. For numeric verification use qwen3_1.7b_numeric.py.
 
 Architecture notes vs Gemma3:
@@ -1409,7 +1408,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_halt()
         return total_flops
 
-    def compile_instructions(self, layer_size: int | None = None) -> dict:
+    def compile_instructions(self, layer_size: int | None = None, run_from_bin: bool = False) -> dict:
         """Compile a UNIFIED single-bin instruction image: ONE prefill program
         + ONE decoder program in one capture session. Writes
         ``programs.bin`` + matching ``programs.json`` meta to disk.
@@ -1420,8 +1419,8 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         run_prefill / run_decoder per call. The cached bin therefore works across any
         prompt length ≤ PREFILL_MAX_SEQ_LEN and any decode position < MAX_CONTEXT_SIZE.
 
-        Cache-hit: if bin + meta already exist, returns the meta without
-        recompile.
+        Always recompiles unless ``run_from_bin``: then a matching bin + meta is
+        returned without recompile, and a missing/mismatched one is an error.
 
         Returns the meta dict:
           {
@@ -1455,14 +1454,17 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         # fixed addresses every invocation, so loading the bin off disk is otherwise
         # sufficient. A bin from an older build (missing/different key) is recompiled.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
-        if bin_cached:
+        if run_from_bin:
+            if not bin_cached:
+                sys.exit(f"ERROR: --run-from-bin: {bin_path} (+ .json) not found; "
+                         "run without --run-from-bin to compile it.")
             with open(meta_path, "r") as f:
                 meta = json.load(f)
             if meta.get("lm_head_sig") == lm_head_sig:
                 print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
                 return meta
-            print(f"compile_instructions: cached bin LM-head sig "
-                  f"({meta.get('lm_head_sig')}) != this run ({lm_head_sig}); recompiling.")
+            sys.exit(f"ERROR: --run-from-bin: cached bin LM-head sig "
+                     f"({meta.get('lm_head_sig')}) != this run ({lm_head_sig}); run without --run-from-bin.")
 
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         # Template seq_len: drives static M= args (overridden at runtime by gpr_M_reg),
@@ -1705,6 +1707,9 @@ def main():
                              'special tokens). Default 256.')
     parser.add_argument("--max-new-tokens", dest="max_new_tokens", type=int, default=None, metavar="N",
                         help="Stop decoding after N generated tokens (default: run to the stop token or the context).")
+    parser.add_argument('--run-from-bin', action='store_true',
+                        help='Skip compiling and load the cached program image; error if it is missing '
+                             'or does not match. Default: recompile every run.')
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1760,7 +1765,7 @@ def main():
 
     print(f"\n--- Compiling unified instruction bin (1 prefill + 1 decoder, dynamic PBI) ---")
     timer = time.perf_counter()
-    inst_meta = ue.compile_instructions()
+    inst_meta = ue.compile_instructions(run_from_bin=args.run_from_bin)
     print(f"  compile_instructions done in {time.perf_counter() - timer:.2f}s")
 
     paths_cfg = cfg.get("paths", {})

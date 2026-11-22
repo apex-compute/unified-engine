@@ -3,8 +3,9 @@
 Qwen3-0.6B inference on accelerator: prefill + decode.
 
   - Config from qwen3_0.6b_config.json; weights from a single params artifact.
-  - If qwen3_0.6b_bin/programs.bin and programs.json match the current layout,
-    reuse them; otherwise compile and write a unified prefill + decoder image.
+  - Compile and write a unified prefill + decoder image (qwen3_0.6b_bin/programs.bin +
+    programs.json) every run; --run-from-bin reuses them instead (error unless they
+    match the current layout).
   - Run prefill and then the decode loop.
 
 Architecture notes vs Gemma3:
@@ -1884,7 +1885,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         return {"flops": total_flops, "checkpoints": checkpoints}
 
     def compile_instructions(self, layer_size: int | None = None,
-                             profile: bool = False) -> dict:
+                             profile: bool = False, run_from_bin: bool = False) -> dict:
         """Compile a UNIFIED single-bin instruction image: ONE prefill program
         + ONE decoder program in one capture session. Writes
         ``programs.bin`` + matching ``programs.json`` meta to disk.
@@ -1895,8 +1896,8 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         run_prefill / run_decoder per call. The cached bin therefore works across any
         prompt length ≤ PREFILL_MAX_SEQ_LEN and any decode position < MAX_CONTEXT_SIZE.
 
-        Cache-hit: if bin + meta already exist, returns the meta without
-        recompile.
+        Always recompiles unless ``run_from_bin``: then a matching bin + meta is
+        returned without recompile, and a missing/mismatched one is an error.
 
         Returns the meta dict:
           {
@@ -1933,7 +1934,10 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
         # Worker images are emitted and uploaded together with the primary. A
         # cached primary alone cannot reconstruct them, so multi-core recompiles.
-        if bin_cached and self.controller_decoder is None:
+        if run_from_bin and self.controller_decoder is not None:
+            sys.exit("ERROR: --run-from-bin is not supported with --multi-core > 1 "
+                     "(worker images are compiled with the primary).")
+        if run_from_bin and bin_cached:
             try:
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
@@ -1969,8 +1973,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                     self.EMBEDDING_DISPATCH_TABLE_SIZE, self._program_base)
                 print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
                 return meta
-            print("compile_instructions: cached program signature does not match "
-                  "the current model layout; recompiling.")
+        if run_from_bin:
+            sys.exit(f"ERROR: --run-from-bin: {bin_path} (+ .json) is missing or its signature does "
+                     "not match the current model layout; run without --run-from-bin to compile it.")
 
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         # Template seq_len: drives static M= args (overridden at runtime by gpr_M_reg),
@@ -2398,6 +2403,9 @@ def main():
     parser.add_argument('--profile', action='store_true',
                         help='Generate a checkpointed profile and Markdown report for prefill, '
                              'first-token decode, and maximum-context decode.')
+    parser.add_argument('--run-from-bin', action='store_true',
+                        help='Skip compiling and load the cached program image; error if it is missing '
+                             'or does not match. Default: recompile every run. Single-engine only.')
     pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
     pen_group.add_argument('--greedy-until', type=int, default=512,
                         help='Pure greedy for the first N decoded tokens (math/reasoning lands '
@@ -2497,7 +2505,7 @@ def main():
 
     print(f"\n--- Compiling unified instruction bin (1 prefill + 1 decoder, dynamic PBI) ---")
     timer = time.perf_counter()
-    inst_meta = ue.compile_instructions(profile=args.profile)
+    inst_meta = ue.compile_instructions(profile=args.profile, run_from_bin=args.run_from_bin)
     print(f"  compile_instructions done in {time.perf_counter() - timer:.2f}s")
 
     inst_bin_path, _ = ue.instruction_paths(profile=args.profile)

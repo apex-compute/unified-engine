@@ -521,9 +521,8 @@ class Gemma4VisionMixin:
     def compile_vision_encoder_bin(self, num_patches: int, profile: bool = False) -> None:
         """Capture patch embedding plus the 16-layer vision encoder as one
         FPGA program at the engine's VISION_ISA_BASE. Pure host emission, no FPGA activity.
-        Skips if the cached vision section exists — delete
-        gemma4_e2b_bin/programs*.bin (make clean) after changing the FPGA compile
-        so it recaptures fresh.
+        Always recaptures unless ``bin_reuse`` (--run-from-bin / --bin-reuse) is set
+        and a matching cached vision section exists.
 
         ``profile``: emit a HALT at each major per-layer boundary (proj /
         rope / permute / attention / post_attn) and record the resume address, so
@@ -545,9 +544,12 @@ class Gemma4VisionMixin:
             self._ensure_vision_gate_scheduler()
             bin_path, _ = self._program_image_paths(profile)
             print(f"  [Vision] reusing existing instruction image at {bin_path}", flush=True)
-            print(f"    delete {bin_path} (or make clean) to force recompile.", flush=True)
+            print("    run without --run-from-bin / --bin-reuse to recompile.", flush=True)
             self._vision_compile_reused = True
             return
+        if getattr(self, "run_from_bin", False):
+            raise SystemExit(f"ERROR: --run-from-bin: no cached vision section matching this run in "
+                             f"{self._program_image_paths(profile)[0]}; run without --run-from-bin to compile it.")
         self._vision_compile_reused = False
         print(f"  [Vision] compiling patch embed + {L} vision layers one-shot"
               f" ({self.multi_core} engine(s); projection phases row-sharded)"

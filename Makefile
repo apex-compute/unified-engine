@@ -6,8 +6,11 @@ all: user_dma_core
 user_dma_core: user_dma_core.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# Compiled program images need no cleaning: every model script recompiles its
+# program by default and only replays the one on disk with --run-from-bin.
+# clean_model_bin_dirs.sh still drops whole model caches (weights included).
 clean:
-	./clean_program_bins.sh
+	rm -f user_dma_core
 
 # Every board's lock (pcie_lock.py): who holds each one, or that it is free.
 lock_status:
@@ -111,13 +114,12 @@ _MT_ONLY := $(filter $(_MT_MODELS),$(MAKECMDGOALS))
 ifneq (,$(_MT_ONLY))
   _MT_ARGS += --only $(_MT_ONLY)
 endif
-# model_test cleans first by default; `run_from_bin` skips clean to reuse cached bins.
-_MT_PREREQ := clean
+# Every model compiles its program by default; `run_from_bin` replays the images on disk.
 ifneq (,$(filter run_from_bin,$(MAKECMDGOALS)))
-  _MT_PREREQ :=
+  _MT_ARGS += --run-from-bin
 endif
 
-model_test: $(_MT_PREREQ)
+model_test:
 ifneq (,$(filter nohup,$(MAKECMDGOALS)))
 	@nohup python model_auto_test.py $(_MT_ARGS) > model_test_bg.out 2>&1 & \
 	echo "model_test started in background (PID $$!). Log -> model_test_bg.out, results -> model_auto_test_results.txt"
@@ -137,7 +139,7 @@ model_test_help:
 	@echo "  verbose            : also stream each model's live run log as it prints"
 	@echo "  nohup              : run in background -> model_test_bg.out,"
 	@echo "                       results -> model_auto_test_results.txt"
-	@echo "  run_from_bin       : skip 'make clean'; reuse existing compiled bins"
+	@echo "  run_from_bin       : replay each model's program image on disk (no compile)"
 	@echo ""
 	@echo "Models (run one or more by name; default = all):"
 	@echo "  $(_MT_MODELS)"
@@ -147,7 +149,7 @@ model_test_help:
 	@echo "  make model_test gemma3                       # just one model"
 	@echo "  make model_test gemma3 llama3.2_1b verbose   # two models + live log"
 	@echo "  make model_test qwen3_4b nohup               # one model, in background"
-	@echo "  make model_test gemma3 run_from_bin          # reuse cached bin, no rebuild"
+	@echo "  make model_test gemma3 run_from_bin          # replay the cached program, no compile"
 
 _MT_NEW_MODELS := mobilesam locateanything_3b parakeet mobilenetv2_224 mobilenetv2_ssd_640 swin
 model_test_new:

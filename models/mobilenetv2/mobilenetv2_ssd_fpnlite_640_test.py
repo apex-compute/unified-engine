@@ -18,12 +18,16 @@ conv2d_1x1_dram / conv2d_3x3_stride2_dram / conv2d_3x3_dw_tapwise_dram /
 eltwise_add_dram helpers, with a zero-bias tile to use the depthwise primitive
 as a bare 3x3 depthwise (no BN, no clamp).
 
-Bin caching is OFF — weights and program are rebuilt every run while we iterate.
+Every run regenerates params and recompiles the program, then dumps params.bin and
+programs.bin to mobilenetv2_ssd_fpnlite_bin/ (params carry compile-time layout, so they
+are regenerated together). --run-from-bin skips both and loads them from that dir; it
+fails if they are missing.
 
 Usage:
     python mobilenetv2_ssd_fpnlite_640_hw_test.py
     python mobilenetv2_ssd_fpnlite_640_hw_test.py --image path/to/image.jpg
     python mobilenetv2_ssd_fpnlite_640_hw_test.py --dev xdma0 [--cycle 5.16]
+    python mobilenetv2_ssd_fpnlite_640_hw_test.py --run-from-bin
 """
 
 import builtins
@@ -1474,7 +1478,7 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
     DMA_CHUNK_BYTES = 1 * 1024 * 1024
     DW_W_CHUNK_MAX  = 32
 
-    def __init__(self, script_dir: str = SCRIPT_DIR):
+    def __init__(self, script_dir: str = SCRIPT_DIR, run_from_bin: bool = False):
         super().__init__(params_dram_base=SSD_PARAMS_BASE,
                          tensor_dram_base=SSD_TENSOR_BASE,
                          program_dram_base=SSD_PROGRAM_BASE)
@@ -1507,7 +1511,12 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
         # Flatten IR_SETTING into 17 per-block dicts with TRUE & padded channels.
         self.blocks = self._expand_blocks()
 
-        self.params_from_bin = self.load_params()
+        # params.bin holds compile-time layout: only reuse it with --run-from-bin,
+        # together with programs.bin; otherwise regenerate from the TF checkpoint.
+        self.params_from_bin = self.load_params() if run_from_bin else False
+        if run_from_bin and not self.params_from_bin:
+            raise SystemExit(f"--run-from-bin: missing params.bin/params.json in {self._bin_dir()}; "
+                             f"run without --run-from-bin first")
         if not self.params_from_bin:
             # Build the CPU module ONCE, load TF weights into it, then mine its
             # state_dict for every fold/copy below. This avoids re-implementing TF
@@ -1522,7 +1531,6 @@ class SSDFPNLite_UnifiedEngine(UnifiedEngine):
             ckpt = _ensure_tf_checkpoint()
             _load_tf_weights(self._cpu_model, ckpt, verbose=False)
             self.weight_init()
-            self.dump_params()
 
         self.tensor_init()
 
@@ -2335,6 +2343,9 @@ def main():
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--score-thresh", type=float, default=0.3)
     parser.add_argument("--iou-thresh", type=float, default=0.6)
+    parser.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                        help="Skip weight packing and compile; load params.bin + programs.bin from "
+                             "mobilenetv2_ssd_fpnlite_bin/ (error if missing). Default: regenerate and recompile.")
     args = parser.parse_args()
 
     global _SILENT_MODE
@@ -2361,16 +2372,18 @@ def main():
             _original_print(f"\r  {label} ({elapsed:.0f}s)", end="", flush=True)
 
     t0 = time.perf_counter()
-    ue = SSDFPNLite_UnifiedEngine(script_dir=SCRIPT_DIR)
+    ue = SSDFPNLite_UnifiedEngine(script_dir=SCRIPT_DIR, run_from_bin=args.run_from_bin)
     ue.software_reset()
     flop_meter = _install_flop_meter(ue)
     t_w = time.perf_counter()
     _original_print(f"  Weights: {t_w - t0:.1f}s")
 
-    prog_addr = ue.load_programs()
+    prog_addr = ue.load_programs() if args.run_from_bin else None
     if prog_addr is None:
-        if ue.params_from_bin:
-            raise RuntimeError("Cannot compile without weight addresses — delete mobilenetv2_ssd_fpnlite_bin/ and re-run")
+        if args.run_from_bin:
+            _original_print("ERROR: --run-from-bin: missing mobilenetv2_ssd_fpnlite_bin/programs.bin/programs.json; "
+                            "run without --run-from-bin first")
+            sys.exit(1)
         stop_c = threading.Event()
         timer_c = threading.Thread(target=_progress, args=("Compiling", t_w, stop_c), daemon=True)
         timer_c.start()
@@ -2379,6 +2392,7 @@ def main():
         ue.program_flops = int(flop_meter["flops"] - flops_before)
         stop_c.set(); timer_c.join()
         t_c = time.perf_counter()
+        ue.dump_params()
         ue.dump_programs(prog_addr)
         _original_print(f"\r  Compile: {t_c - t_w:.1f}s (instructions={inst_count:,})")
     else:

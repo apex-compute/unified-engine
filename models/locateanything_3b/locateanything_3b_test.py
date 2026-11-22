@@ -14,6 +14,10 @@ The decoder reuses the qwen2.5_vl_3b engine verbatim (dimensionally identical LM
 
 Run (apex-compute env, board attached):
   python locateanything_3b_test.py --query car
+  python locateanything_3b_test.py --query car --run-from-bin   # reuse programs.bin, no compile
+
+Every run compiles all programs and overwrites their programs.bin entries; only
+--run-from-bin reuses them. Weight caches (params.bin, moonvit_*.pt) are reused either way.
 """
 
 import json
@@ -285,6 +289,27 @@ def programs_bin_store(script_dir, key, prog_bytes, meta=None):
     manifest["programs"] = new_progs
     with open(meta_path, "w") as f:
         json.dump(manifest, f)
+
+
+# --run-from-bin: reuse compiled programs from programs.bin. Default (False): every
+# compile_* call compiles and overwrites its programs.bin entry; nothing is reused.
+RUN_FROM_BIN = False
+
+
+def _program_cache_fail(why):
+    _original_print(f"ERROR: --run-from-bin: {why}. Rerun without --run-from-bin to compile.",
+                    file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def _program_cache_load(script_dir, key):
+    """(prog_bytes, meta) for `key` with --run-from-bin (error if absent), else None."""
+    if not RUN_FROM_BIN:
+        return None
+    cached = programs_bin_load(script_dir, key)
+    if cached is None:
+        _program_cache_fail(f"programs.bin has no program {key!r}")
+    return cached
 
 def store_identity_matrix(ue):
     """Store identity matrix in DRAM once. Returns DRAM address."""
@@ -1797,7 +1822,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             cache_suffix += "_bf16"
         enc_prog_key = f"encoder{cache_suffix}_unified_attention"
 
-        _cached = programs_bin_load(self.script_dir, enc_prog_key)
+        _cached = _program_cache_load(self.script_dir, enc_prog_key)
         if _cached is not None:
             prog_bytes, _ = _cached
             _original_print(f"  Loading cached encoder program ({enc_prog_key}) from programs.bin ...")
@@ -2555,7 +2580,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         template_seq_len = self.PREFILL_MAX_SEQ_LEN
         prefill_key = f"prefill_pbi_s{template_seq_len}"
 
-        _cached = programs_bin_load(self.script_dir, prefill_key)
+        _cached = _program_cache_load(self.script_dir, prefill_key)
         if _cached is not None:
             prog_bytes, meta = _cached
             _original_print(f"  Loading cached PBI prefill program ({prefill_key}) from programs.bin ...")
@@ -3108,8 +3133,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     def compile_decoder(self, layer_size: int | None = None) -> tuple[int, int]:
         """Compile-or-load single PBI decoder program; allocate per-step preamble slot.
 
-        Cache hit: load bin from disk, DMA to program DRAM, restore stashed GPR indices.
-        Cache miss: capture _emit_decoder_program, write to DRAM + bin/meta.
+        --run-from-bin: load bin from disk, DMA to program DRAM, restore stashed GPR indices
+        (missing / signature mismatch is an error).
+        Default: capture _emit_decoder_program, write to DRAM + bin/meta.
 
         Either way, ``self._decoder_preamble_addr`` is allocated as a small program slot
         rewritten each decode step by run_decoder.
@@ -3125,14 +3151,14 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         cache_hit = False
         prog_bytes = None
         meta = {}
-        _cached = programs_bin_load(self.script_dir, "decoder")
+        _cached = _program_cache_load(self.script_dir, "decoder")
         if _cached is not None:
             prog_bytes, meta = _cached
             if "program_size" in meta and isinstance(meta.get("total_flops"), int) \
                     and meta.get("lm_head_sig") == lm_head_sig:
                 cache_hit = True
             else:
-                _original_print(f"  Decoder cache sig ({meta.get('lm_head_sig')!r}) != {lm_head_sig!r} — recompiling.")
+                _program_cache_fail(f"decoder cache sig ({meta.get('lm_head_sig')!r}) != {lm_head_sig!r}")
 
         if cache_hit:
             decoder_program_addr = self.get_program_dram_addr()
@@ -3879,7 +3905,13 @@ def main():
     ap.add_argument("--quant-compare", action="store_true",
                     help="run the CPU reference decoder bf16 vs if4 vs tq4 on the same vision "
                          "output and print a quant-fidelity comparison at the very bottom")
+    ap.add_argument("--run-from-bin", action="store_true", dest="run_from_bin",
+                    help="skip compiling: load every program (MoonViT, connector, prefill, decoder) "
+                         "from locateanything_3b_bin/programs.bin (error if an entry is missing or "
+                         "fails its check). Default: compile all and overwrite their entries.")
     args = ap.parse_args()
+    global RUN_FROM_BIN
+    RUN_FROM_BIN = bool(args.run_from_bin)
 
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C
@@ -3983,11 +4015,14 @@ def main():
             conn_key = f"connector_N{N}"
             cache_hit = False
             prog_bytes = None
-            _cached = programs_bin_load(self.script_dir, conn_key)
+            _cached = _program_cache_load(self.script_dir, conn_key)
             if _cached is not None:
                 prog_bytes, meta = _cached
                 if meta.get("num_tokens") == N and meta.get("conn_in") == Cin:
                     cache_hit = True
+                else:
+                    _program_cache_fail(f"connector program {conn_key!r} was built for "
+                                        f"num_tokens={meta.get('num_tokens')}, conn_in={meta.get('conn_in')}")
 
             if cache_hit:
                 # Compile-time FLOP count stored with the cached program (absent in older bins).
@@ -4712,7 +4747,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     # setup_dram ran first and the program lands at the same addr (deterministic alloc order). ---
     os.makedirs(_BIN_DIR, exist_ok=True)
     moonvit_key = f"moonvit_encoder_N{N}_{prec}_split_hd"
-    _cached = programs_bin_load(os.path.dirname(_BIN_DIR), moonvit_key)
+    _cached = _program_cache_load(os.path.dirname(_BIN_DIR), moonvit_key)
     if _cached is not None:
         prog, _cached_meta = _cached
         # Compile-time FLOP count stored with the cached program (absent in older bins).

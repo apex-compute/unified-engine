@@ -1794,12 +1794,14 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             f"metadata_validated=yes"
         )
 
-    def compile_all(self) -> dict:
-        """Build (or load) the COMPLETE single program bin — encoder + decoder + prefill in ONE
+    def compile_all(self, from_bin: bool = False) -> dict:
+        """Build (or, with from_bin, load) the COMPLETE single program bin — encoder + decoder + prefill in ONE
         programs.bin. Mirrors qwen2.5_vl compile_all. The compile order (encoder, decoder,
         prefill) matches the validated 3-bin order, so every §7 JUMP_ABS bakes against the exact
         program-DRAM address it did before; the bin just bundles the three segments, each recorded with
-        its absolute load address (see fpga_pbi_jump_target_bake). Cache key = layout signature."""
+        its absolute load address (see fpga_pbi_jump_target_bake). Default: always compile and
+        rewrite the bin. from_bin (--run-from-bin): load it; a missing bin or a layout-signature
+        mismatch is an error (no fallback to compiling)."""
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         os.makedirs(bin_dir, exist_ok=True)
         uni_bin, uni_meta, artifact_suffix = self._programs_paths(bin_dir)
@@ -1819,7 +1821,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # ---- cache hit: replay the encoder LN params, DMA each program to its stored abs addr ----
         # Sharded builds load too: the bin carries one segment per worker program and is
         # keyed by the engine triple, so a replay always matches its own configuration.
-        if os.path.exists(uni_bin) and os.path.exists(uni_meta):
+        if from_bin:
+            if not (os.path.exists(uni_bin) and os.path.exists(uni_meta)):
+                _original_print(f"ERROR: --run-from-bin: {uni_bin} / {uni_meta} not found. "
+                                "Rerun without --run-from-bin to compile.", file=sys.stderr, flush=True)
+                sys.exit(1)
             with open(uni_meta) as f:
                 meta = json.load(f)
             if all(meta.get(k) == v for k, v in sig.items()) and "segments" in meta:
@@ -1839,8 +1845,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 print(f"  Loaded unified instruction bin ({len(raw)/1024/1024:.1f} MB, "
                       f"{len(meta['segments'])} segments)")
                 return meta
-            print(f"  programs{artifact_suffix or ''}.bin layout signature "
-                  f"{dict((k, meta.get(k)) for k in sig)} ≠ current {sig} — rebuilding.")
+            _original_print(f"ERROR: --run-from-bin: programs{artifact_suffix or ''}.bin layout signature "
+                            f"{dict((k, meta.get(k)) for k in sig)} ≠ current {sig} (or no segments). "
+                            "Rerun without --run-from-bin to compile.", file=sys.stderr, flush=True)
+            sys.exit(1)
 
         # ---- cache miss: compile all three in ONE session (encoder, decoder, prefill) ----
         self._unified_active = True
@@ -2843,10 +2851,14 @@ def main():
         help="Row-shard the vision encoder's whole layer body -- LayerNorms, q/k/v, "
              "attention, o, residuals, fc1, fc2 -- across N engines (1-8, default 2). "
              "Only the two permutes and the M=64 connector stay on the primary. The "
-             "1024 patch tokens are 16 blocks of 64, so 1/2/4/8 split evenly. N>1 "
-             "always COMPILES and never reads or writes programs.bin, which holds "
-             "only the primary's programs; use --engines 1 to build a bin.",
+             "1024 patch tokens are 16 blocks of 64, so 1/2/4/8 split evenly. The "
+             "programs bin is keyed by the engine configuration (file suffix + signature).",
     )
+    parser.add_argument(
+        "--run-from-bin", action="store_true", dest="run_from_bin",
+        help="skip compiling: load params*.bin/json and programs*.bin/json for this engine "
+             "configuration from smolvlm2_bin/ (error if missing or stale). Default: rebuild "
+             "params from the HF checkpoint, recompile, and rewrite both.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2891,7 +2903,7 @@ def main():
     _original_print(f"prefill_engines={ue._prefill_engines()}"
                     + (" (rows + kv-groups sharded)" if ue._prefill_engines() > 1 else ""))
     # Default is VLM (vision). The instruction bin is ALWAYS the full VLM bin (encoder+decoder+prefill) —
-    # built once; this flag only decides whether the vision encoder actually RUNS this invocation.
+    # rebuilt every run unless --run-from-bin; this flag only decides whether the vision encoder actually RUNS this invocation.
     # --lm-enable (or --image none) selects pure LM-only text mode.
     lm_only = bool(args.lm_enable) or (args.image is not None
                                        and str(args.image).strip().lower() in ("none", ""))
@@ -2904,12 +2916,19 @@ def main():
         clean_bins(os.path.join(script_dir, "smolvlm2_bin"))
     init_hang_prevention(ue)
     _artifact_suffix = ue._artifact_mode_suffix()
-    # Load the snapshot (params.bin) only when the program bin for THIS engine
-    # configuration also exists. NUM_ENGINES no longer gates it.
+    # The snapshot (params.bin) is coupled to the program bin: it restores the DRAM layout
+    # but not the per-layer weight addresses compiling needs. So it is loaded only with
+    # --run-from-bin (and the program bin for THIS engine configuration must exist);
+    # by default params are rebuilt from the HF checkpoint and re-dumped with the programs.
     _bin_dir = os.path.join(script_dir, "smolvlm2_bin")
     _pbin, _pmeta, _ = ue._programs_paths(_bin_dir)
     _have_instr_bin = os.path.exists(_pbin) and os.path.exists(_pmeta)
-    loaded_snapshot = _have_instr_bin and ue.load_snapshot()
+    loaded_snapshot = args.run_from_bin and _have_instr_bin and ue.load_snapshot()
+    if args.run_from_bin and not loaded_snapshot:
+        _original_print(f"ERROR: --run-from-bin: no usable cache for this configuration "
+                        f"({_pbin} / {_pmeta} and params snapshot must exist and match). "
+                        "Rerun without --run-from-bin to compile.", file=sys.stderr, flush=True)
+        sys.exit(1)
     if not loaded_snapshot:
         ue.weight_init()
         ue.tensor_init(max_seq_len=args.max_seq)
@@ -2929,10 +2948,9 @@ def main():
     timer = time.perf_counter()
     bin_dir = os.path.join(script_dir, "smolvlm2_bin")
     S = ((seq_len + 63) // 64) * 64
-    # ONE unified instruction bin (encoder + decoder + prefill). compile_all() builds it on the
-    # first run and loads it (cache key = layout signature) on subsequent runs.
-    _ub, _um, _ = ue._programs_paths(bin_dir)
-    use_bin = os.path.exists(_ub) and os.path.exists(_um)
+    # ONE unified instruction bin (encoder + decoder + prefill). compile_all() builds it on
+    # every run, and loads it (cache key = layout signature) only with --run-from-bin.
+    use_bin = bool(args.run_from_bin)
     import threading, io, contextlib
     _real_out = sys.stdout  # spinner writes here even while stdout is redirected
     stop_compile = threading.Event()
@@ -2946,7 +2964,7 @@ def main():
     # Hard-silence the core's compile/capture chatter (M_chunk/URAM/Capture stopped/…),
     # which leaks past _SILENT_MODE. The live spinner above writes to _real_out, so it survives.
     with contextlib.redirect_stdout(io.StringIO()):
-        uni_meta = ue.compile_all()
+        uni_meta = ue.compile_all(from_bin=use_bin)
         enc_addr = uni_meta["encoder_addr"]
     stop_compile.set()
     _SILENT_MODE = False

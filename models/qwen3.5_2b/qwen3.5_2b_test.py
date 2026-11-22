@@ -27,6 +27,11 @@ Usage:
     python3 qwen3.5_2b_test.py --vision-enable                    # VLM, FPGA vision encoder (default)
     python3 qwen3.5_2b_test.py --vision-enable --no-fpga-vision   # VLM, optional HF host fallback
     python3 qwen3.5_2b_test.py --image my.jpg --prompt "What is in this image?"
+    python3 qwen3.5_2b_test.py --run-from-bin                     # reuse qwen3.5_2b_bin/programs.bin
+
+Every run recompiles the program image and rewrites qwen3.5_2b_bin/programs.{bin,json};
+--run-from-bin skips compiling and loads that image instead (error if missing/stale).
+The quantized weights cache (params.bin) is reused either way.
 
 Generation uses persistent Gated-DeltaNet, convolution, and attention-cache
 state. Prefill replays the compiled decoder once per prompt token; each decode
@@ -1617,12 +1622,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             bin_path = bin_path.replace(".bin", "_profile.bin")
             meta_path = meta_path.replace(".json", "_profile.json")
 
-        if not profile and self.multi_core == 1 and os.path.exists(bin_path) and os.path.exists(meta_path):
-            with open(meta_path) as f:
-                meta = json.load(f)
-            if meta.get("cache_key") == self._decoder_cache_key():
-                return bin_path, meta["program_sizes"], meta["total_flops"]
-
+        # Always compile: program reuse is main()'s --run-from-bin path (programs.bin).
         print("  compile_decoder: emitting single-binary decoder (Option B) ...",
               flush=True)
         t0 = time.time()
@@ -5174,9 +5174,16 @@ def main():
                     help="Run the vision encoder through Hugging Face on the HOST instead "
                          "of the FPGA. FPGA vision is the default with --vision-enable / "
                          "--image.")
+    ap.add_argument("--run-from-bin", action="store_true", dest="run_from_bin",
+                    help="Skip compiling: load qwen3.5_2b_bin/programs.{bin,json} written by an "
+                         "earlier run (error if missing or stale). Default: always recompile "
+                         "and rewrite programs.bin.")
     args = ap.parse_args()
     if args.profile and (args.image or args.vision_enable):
         ap.error("--profile currently benchmarks the LM path; omit --image/--vision-enable")
+    if args.run_from_bin and (args.profile or args.multi_core > 1):
+        ap.error("--run-from-bin has no cached program for --profile / --multi-core > 1 "
+                 "(those paths always compile); omit --run-from-bin")
 
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
@@ -5336,22 +5343,32 @@ def main():
     # holds [encoder?][decoder] — vision encoder (if built via a --vision-on-hardware
     # run) + LM decoder, both baked for program base 0xD0000000.  There is no
     # separate persisted decoder bin: the transient compile output is folded into
-    # programs.bin and removed.  FIRST run BUILDS + writes the bin; EVERY later run
-    # (test.py or run_from_bin) LOADS it — no recompilation.
+    # programs.bin and removed.  By default EVERY run BUILDS + rewrites the bin;
+    # only --run-from-bin (or qwen3.5_2b_run_from_bin.py) LOADS it — no recompilation.
     uni_bin       = os.path.join(bin_dir, UNIFIED_BIN_NAME)
     uni_meta_path = os.path.join(bin_dir, UNIFIED_META_NAME)
     _raw = _meta = None
-    if os.path.exists(uni_bin) and os.path.exists(uni_meta_path):
+    if args.run_from_bin and os.path.exists(uni_bin) and os.path.exists(uni_meta_path):
         with open(uni_bin, "rb") as f:
             _raw = f.read()
         with open(uni_meta_path) as f:
             _meta = json.load(f)
     want_vision = bool(use_fpga_vision)
-    # Build when there is no bin yet, or when an on-FPGA VLM run finds a cached
-    # bin that has no encoder section (e.g. an earlier LM-only build).
+    # Build unless --run-from-bin; with --run-from-bin the cached bin must exist,
+    # match this code/context, and carry an encoder section for an on-FPGA VLM run.
     ue.max_context = MAX_CONTEXT
     need_build = ((_meta is None) or (_meta.get("cache_key") != ue._decoder_cache_key())
                   or (want_vision and _meta.get("encoder_size", 0) == 0))
+    if args.run_from_bin and need_build:
+        if _meta is None:
+            _why = f"{uni_bin} / {uni_meta_path} not found"
+        elif _meta.get("cache_key") != ue._decoder_cache_key():
+            _why = f"{uni_bin} is stale (cache_key mismatch for this code / context)"
+        else:
+            _why = f"{uni_bin} has no vision-encoder section (needed for on-FPGA vision)"
+        print(f"ERROR: --run-from-bin: {_why}. Rerun without --run-from-bin to compile.",
+              file=sys.stderr, flush=True)
+        sys.exit(1)
 
     precomputed_vision_tokens = None
     vis_encoder_bytes = None
@@ -5414,8 +5431,8 @@ def main():
         ue.prepare_inference(weights, max_context=MAX_CONTEXT)
 
     # LM decoder: BUILD (compile → write the unified bin → drop the transient
-    # transient .decoder_compile.bin) on the first run, else LOAD the decoder section from the
-    # unified bin.  Either way the decoder ends up resident in DRAM, so generate()
+    # transient .decoder_compile.bin) by default, else (--run-from-bin) LOAD the decoder
+    # section from the unified bin.  Either way the decoder ends up resident in DRAM, so generate()
     # is told it is preloaded and skips compilation.
     if need_build:
         with _quiet():

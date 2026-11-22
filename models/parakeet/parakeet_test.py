@@ -10,6 +10,12 @@ Usage:
   python parakeet_test.py
   python parakeet_test.py --audio test.wav
   python parakeet_test.py --dev xdma0 [--device kintex7] [--cycle 5.15]
+  python parakeet_test.py --run-from-bin   # reuse parakeet_bin/params.bin + programs.bin
+
+Every run rebuilds params (weights + Toeplitz + tiled BN/biases, whose addresses the
+programs embed) and recompiles, then dumps parakeet_bin/params.bin + programs.bin.
+--run-from-bin loads both instead (the checkpoint/tokenizer download stays cached) and
+fails if they are missing or were built for a different L_pad.
 """
 
 import json
@@ -1882,6 +1888,9 @@ def main():
     parser.add_argument("--audio", type=str, default=None, help="Path to audio file (.wav, .flac, etc.)")
     parser.add_argument("--dev", type=str, default="xdma0", help="XDMA device")
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
+    parser.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
+                        help="Skip weight staging and compile; load params.bin + programs.bin from parakeet_bin/ "
+                             "(error if missing or built for another L_pad). Default: rebuild and recompile.")
     args = parser.parse_args()
 
     global _SILENT_MODE
@@ -1928,8 +1937,12 @@ def main():
     L = H2
     L_pad = pad_to_multiple(L, cfg["hardware"]["block_size"])
 
-    # --- Load weights + Toeplitz (from bin if available, else from checkpoint) ---
-    params_loaded = engine.load_params(L_pad)
+    # --- Load weights + Toeplitz (from bin with --run-from-bin, else from checkpoint) ---
+    params_loaded = engine.load_params(L_pad) if args.run_from_bin else False
+    if args.run_from_bin and not params_loaded:
+        _original_print("ERROR: --run-from-bin: parakeet_bin/params.bin + programs.bin missing or built for "
+                        f"another L_pad (need {L_pad}); run without --run-from-bin first")
+        sys.exit(1)
     if not params_loaded:
         _original_print("  Loading weights...", end=" ", flush=True)
         engine.weight_init()
@@ -2014,7 +2027,11 @@ def main():
     import time as _time
     import sentencepiece as spm
 
-    loaded = engine.load_programs(L_pad)
+    loaded = engine.load_programs(L_pad) if args.run_from_bin else None
+    if args.run_from_bin and not loaded:
+        _original_print(f"ERROR: --run-from-bin: parakeet_bin/programs.bin missing or built for another L_pad "
+                        f"(need {L_pad}); run without --run-from-bin first")
+        sys.exit(1)
     if loaded:
         im2col_s0 = loaded["im2col_s0"]
         prog_s0 = loaded["prog_s0"]
