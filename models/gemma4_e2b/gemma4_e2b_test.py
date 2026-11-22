@@ -201,6 +201,24 @@ DEFAULT_AUDIO = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samp
 MIN_CONTEXT_SIZE = 1024
 MAX_CONTEXT_SIZE = int(os.environ.get("UE_MAX_CONTEXT_SIZE", "8192"), 0)
 
+# THE WIDE SINGLE-ENGINE MAP. The single-engine model map keeps weights in
+# [0x80000000, 0xE1000000) -- 1552 MiB -- and every tensor, the KV cache
+# included, in the 480 MiB above them. E2B fits; E4B (2742 MB of weights, a
+# 448 MB cache at 8192 tokens) does not. One engine leaves the low 2 GB empty,
+# so a model whose weights exceed the region gets this map instead, chosen by
+# the engine from the config: weights from 0x20000000, the LM image in the
+# worker ISA slot no engine uses, the audio weights and image below the
+# weights, and a context its cache fits. Each address still follows its
+# UE_* environment override when one is set.
+SINGLE_ENGINE_PARAMS_BYTES = 0xE1000000 - 0x80000000
+WIDE_SINGLE_ENGINE = {
+    "params_base": 0x20000000,
+    "lm_isa_base": 0xFF400000,
+    "audio_weight_base": 0x0C000000,
+    "audio_isa_base": 0x18000000,
+    "max_context_size": 2048,
+}
+
 
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
@@ -245,6 +263,55 @@ _FIT_FILLER_SENTENCES = (
     "Finish only once every part of the request has been addressed, and not "
     "before that point.",
 )
+
+
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
 
 
 def _filler_words(count: int) -> str:
@@ -1105,14 +1172,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     # window, and under the tiled map inside engine 1's. Audio is not exercised
     # by the image/text paths, so the collision has been latent -- it is a real
     # bug either way, and the tiled map is not going to add a second one.
-    AUDIO_WEIGHT_LEGACY_BASE = int(os.environ.get("UE_AUDIO_WEIGHT_BASE", "0x6C000000"), 0)
+    AUDIO_WEIGHT_LEGACY_BASE = 0x6C000000         # the instance's _audio_weight_base, unless the wide map moves it
     AUDIO_WEIGHT_REGION_BYTES = 0x0C000000        # 192 MB
 
     def _audio_weight_region(self) -> tuple[int, int]:
         """(base, end) of the audio weight region for the active map."""
         if not self._tiled_map:
-            return (self.AUDIO_WEIGHT_LEGACY_BASE,
-                    self.AUDIO_WEIGHT_LEGACY_BASE + self.AUDIO_WEIGHT_REGION_BYTES)
+            base = getattr(self, "_audio_weight_base", self.AUDIO_WEIGHT_LEGACY_BASE)
+            return (base, base + self.AUDIO_WEIGHT_REGION_BYTES)
         cached = getattr(self, "_audio_weight_extent", None)
         if cached is None:
             base = self.mc_arena.alloc_shared(
@@ -1219,6 +1286,26 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
         self.multi_core = multi_core
+        # One engine, weights past the single-engine region: the wide map (above).
+        self._wide_single_engine = (
+            multi_core == 1
+            and self._private_weight_bytes(script_dir, 1) > SINGLE_ENGINE_PARAMS_BYTES)
+        _wide = WIDE_SINGLE_ENGINE if self._wide_single_engine else {}
+
+        def _address(variable: str, key: str, default: int) -> int:
+            stated = os.environ.get(variable)
+            return int(stated, 0) if stated else _wide.get(key, default)
+        self._params_base_addr = _address("UE_PARAMS_BASE", "params_base", 0x80000000)
+        self._lm_isa_base_addr = _address("UE_LM_ISA_BASE", "lm_isa_base", 0xFF620000)
+        self._audio_weight_base = _address("UE_AUDIO_WEIGHT_BASE", "audio_weight_base", 0x6C000000)
+        self._audio_isa_base_addr = _address("UE_AUDIO_ISA_BASE", "audio_isa_base", 0x78000000)
+        self._context_size = (MAX_CONTEXT_SIZE if os.environ.get("UE_MAX_CONTEXT_SIZE")
+                              else min(MAX_CONTEXT_SIZE, _wide.get("max_context_size", MAX_CONTEXT_SIZE)))
+        if self._wide_single_engine:
+            print(f"[map] wide single-engine map ({MODEL_TITLE}: weights exceed the "
+                  f"{SINGLE_ENGINE_PARAMS_BYTES >> 20} MiB region): params @ 0x{self._params_base_addr:X}, "
+                  f"LM ISA @ 0x{self._lm_isa_base_addr:X}, audio weights @ 0x{self._audio_weight_base:X}, "
+                  f"audio ISA @ 0x{self._audio_isa_base_addr:X}, context {self._context_size}")
         # Program-image reuse: OFF by default (recompile programs.bin fresh every
         # run). --bin-reuse opts into reusing a matching cached section instead.
         self.bin_reuse = bin_reuse
@@ -1242,7 +1329,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                                    else TILED_WINDOW_BYTES)
         self._tile_tensor_bytes = (KINTEX_PRIVATE_TENSOR_BYTES if self._kintex_tiled_map
                                    else TILED_TENSOR_BYTES)
-        self._tile_isa_bytes = (KINTEX_ISA_BYTES if self._kintex_tiled_map
+        # Below TILED_MAP_MIN_ENGINES the packed map uses the slice sizes proven at
+        # 2 engines on kintex7: each worker carries a larger share of the program.
+        self._tile_isa_bytes = (KINTEX_ISA_BYTES if (self._kintex_tiled_map
+                                                     or multi_core < TILED_MAP_MIN_ENGINES)
                                 else TILED_ISA_BYTES)
         # The floor per map, raised to what this model's slices need (E4B).
         self._tile_private_reserve_bytes = max(
@@ -1266,8 +1356,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # tensor slices -- the windows sit back to back from 0, and everything
         # shared (weights, the tensor extent, KV cache) goes to ONE contiguous
         # region above them that runs to the end of the device.
-        _packed = (dram_interleaved()
-                   and (self._kintex_tiled_map or multi_core >= TILED_MAP_MIN_ENGINES))
+        # Every multi-engine count, not only kintex7 x2 and >= 8 engines: the
+        # 512 MiB model map below cannot hold 2..7 engines on the U50 -- at 2 the
+        # prefill attention scratch overflows its 16 MiB tensor slice (E2B), the
+        # LM tensor region overflows the 2 GB map (E4B), and the decode shards need
+        # ~608 MiB per engine against a 496 MiB arena.
+        _packed = dram_interleaved() and self._use_multicore_dram_layout
         if _packed:
             _window = (self._tile_private_reserve_bytes + self._tile_isa_bytes
                        + self._tile_tensor_bytes)
@@ -1356,11 +1450,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Window 0 belongs to core 0, which keeps its own tensor-arena buffers;
         # its window stays reserved so engine index == window index everywhere.
         self.DRAM_END = 0x100000000 + _rebase
-        _params_base  = int(os.environ.get("UE_PARAMS_BASE", "0x80000000"), 0) + _rebase
+        _params_base  = self._params_base_addr + _rebase
         _tensor_base  = 0xE1000000 + _rebase
         self.VISION_ISA_BASE             = 0xFF000000 + _rebase
         self.VISION_WORKER_ISA_BASE      = 0xFF400000 + _rebase
-        self.LM_ISA_BASE                 = int(os.environ.get("UE_LM_ISA_BASE", "0xFF620000"), 0) + _rebase
+        self.LM_ISA_BASE                 = self._lm_isa_base_addr + _rebase
         # Per-engine private windows, laid out by the library. Uniform at EVERY
         # engine count -- vision and prefill are sequential and share one arena,
         # so engine i always owns the same window in both, and the window is a
@@ -1470,10 +1564,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # q_size / k_size: bytes of one token's Q / K row (all heads).
         self.q_size = self.head_dim * self.num_q_heads * self.bytes_per_element
         self.k_size = self.head_dim * self.num_kv_heads * self.bytes_per_element
-        self.MAX_CONTEXT_SIZE = MAX_CONTEXT_SIZE
+        self.MAX_CONTEXT_SIZE = self._context_size
         # Keep fallback config lookups (for example sliding_window) consistent
         # when the source macro is changed without editing the JSON file.
-        model["max_context_size"] = MAX_CONTEXT_SIZE
+        model["max_context_size"] = self.MAX_CONTEXT_SIZE
         if (self.MAX_CONTEXT_SIZE < MIN_CONTEXT_SIZE
                 or self.MAX_CONTEXT_SIZE > MAX_CONTEXT_SIZE
                 or self.MAX_CONTEXT_SIZE % 64):
@@ -1627,6 +1721,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         ``profile`` forwards to the encoder's per-phase FPGA-latency breakdown."""
         if prompt is None:
             prompt = "Describe this image in detail."
+        self._report_prompt = prompt        # the prompt that ran (TEST_RESULT "input")
         if vision_host:
             image_features, token_ids, mm_types = self._run_vision_encoder_host(
                 image_path, prompt)
@@ -1642,6 +1737,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     def set_prefill_seq_audio(self, audio_path: str,
                               prompt: str | None = None) -> None:
         """Run the FPGA audio encoder and stage its soft tokens for LM prefill."""
+        self._report_prompt = prompt or "Describe what you hear."   # TEST_RESULT "input"
         features, token_ids, mm_types = self._run_audio_encoder_fpga(
             audio_path, prompt or "Describe what you hear.")
         self.prefill_seq = tuple(token_ids)
@@ -2408,7 +2504,55 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         dec_model = (self._model_flops_decode(gen_n, self.seq_len) if gen_n else None)
         enc_hw_s = sum(v for v in (vis_us, aud_us) if v) / 1e6
         enc_wall_s = sum(v for v in (_g("_vis_e2e_s"), _g("_audio_e2e_s")) if v)
+        # ---- shared report keys (model_auto_test.py) --------------------------------
+        # One row per stage that ran on the FPGA: the HW latency counter and the FLOPs the
+        # programs issued (vision: the encoder section's total_flops x frames; prefill /
+        # decode: the counts handed to program_execute). The audio program records no issued
+        # count, so its row uses the model-dimension count behind audio_gflops_model and is
+        # marked "flops_basis": "model".
+        vis_flops = _g("_vis_last_total_flops")
+        aud_model = self._model_flops_audio() if aud_us else None
+        pf_flops = _g("_prefill_total_flops")
+        dec_flops = _g("_decode_total_flops")
+        stage_rows = []
+        if vis_us:
+            stage_rows.append(("vision", vis_us / 1e6,
+                               vis_flops * (_g("_vis_frames") or 1) / 1e9 if vis_flops else None,
+                               "issued"))
+        if aud_us:
+            stage_rows.append(("audio", aud_us / 1e6,
+                               aud_model / 1e9 if aud_model else None, "model"))
+        if pf_us:
+            stage_rows.append(("prefill", pf_us / 1e6,
+                               pf_flops / 1e9 if pf_flops else None, "issued"))
+        if dec_us:
+            stage_rows.append(("decode", dec_us / 1e6,
+                               dec_flops / 1e9 if dec_flops else None, "issued"))
+        prompt_text = _g("_fitted_prompt") or _g("_report_prompt")
+        if prompt_text is None:
+            try:    # LM default: the config's token ids, shown as the text they encode
+                prompt_text = self.tokenizer.decode(list(self.prefill_seq), skip_special_tokens=True)
+            except Exception:
+                prompt_text = None
+        report_input = {"prompt": prompt_text}
+        if _g("_report_image") and (vis_us or _g("_vis_device") == "host"):
+            report_input["image"] = _g("_report_image")
+        if _g("_report_audio") and aud_us:
+            report_input["audio"] = _g("_report_audio")
+        shared = _shared_report(
+            report_input if len(report_input) > 1 else prompt_text,
+            self.multi_core, [row[:3] for row in stage_rows],
+            prefill_tokens=pf_seq, decoded_tokens=gen_n,
+            # HW rate of the first decode step / wall-clock average over the loop
+            # (same values as decode_first_token_tok_s / decode_avg_tok_s below).
+            decode_first_tok_s=_g("_decode_peak_toks") or None,
+            decode_avg_tok_s=_g("_decode_avg_toks") or None,
+            peak_gflops=peak or None)
+        for stage_row, row in zip(shared["stages"], stage_rows):
+            stage_row["flops_basis"] = row[3]
+        # Keys this dict already carried keep their exact values (the dict below wins).
         return {
+            **shared,
             "model": MODEL_NAME,
             "multi_core": self.multi_core,
             "clock_mhz": round(freq_mhz, 3),
@@ -3758,6 +3902,12 @@ def main():
     else:
         print(f"[Mode] LM -- default prompt")
         ue.set_prefill_seq()
+    # What went in, for the TEST_RESULT "input" key (the encoders' setters record the
+    # prompt they actually used; this covers the plain-LM prompt and the media paths).
+    if args.prompt and not args.image and not args.audio:
+        ue._report_prompt = args.prompt
+    ue._report_image = os.path.abspath(args.image) if args.image else None
+    ue._report_audio = os.path.abspath(args.audio) if args.audio else None
 
     # --profile: build the instrumented bin and print a per-phase decode
     # breakdown instead of the normal generation run.

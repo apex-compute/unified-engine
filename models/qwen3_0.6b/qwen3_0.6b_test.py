@@ -79,6 +79,95 @@ _PROGRAM_DRAM_BASE = 0xE0000000
 _RUNTIME_PREAMBLE_BYTES = 128
 _EMBEDDING_DISPATCH_STRIDE_BYTES = 64
 
+def _attention_flops(batch: int, aligned: int, head_dim: int, pre_scaled: bool) -> int:
+    """FLOPs unified_attention_core returns for one call: optional Q pre-scale, Q.K^T with
+    softmax and full-matrix bias, then scores.V  (matmat_mul_core: 2*M*K*N, +5*M*N softmax,
+    +M*N bias)."""
+    flops = 0 if pre_scaled else batch * head_dim
+    flops += 2 * batch * head_dim * aligned + 6 * batch * aligned
+    flops += 2 * batch * aligned * head_dim
+    return flops
+
+
+def _prefill_flops(ue, inst_meta: dict, actual_seq_len: int, pre_scaled: bool) -> int:
+    """FLOPs the prefill program runs for ``actual_seq_len`` rows.
+
+    The meta holds the count at the compile-time template length. Everything except
+    attention is linear in the rows; attention is batch x context, and at run time its
+    context is the 64-aligned ACTUAL length, so it is taken out of the template count and
+    put back at the real size. Scaling the whole template linearly counted attention at the
+    template's context width and gave prefill rates above the hardware peak."""
+    template = int(inst_meta["prefill_template_seq_len"])
+    calls = int(ue.LAYER_SIZE) * int(ue.num_kv_heads)
+    def attention(rows):
+        q_rows = rows * int(ue.group_size)
+        return calls * _attention_flops(q_rows, ((q_rows + 63) // 64) * 64,
+                                        int(ue.actual_head_dim), pre_scaled)
+    linear = int(inst_meta["prefill_template_flops"]) - attention(template)
+    return linear * actual_seq_len // max(template, 1) + attention(actual_seq_len)
+
+
+def _decode_flops(ue, inst_meta: dict, first_context: int, steps: int, pre_scaled: bool) -> list:
+    """Per-step FLOPs of the decode program for ``steps`` tokens, the first one attending
+    over ``first_context`` positions. The meta count has attention at the compiled context
+    (DECODER_ALIGNED_SEQ_LEN); each step really runs it over the 64-aligned live context."""
+    calls = int(ue.LAYER_SIZE) * int(ue.num_kv_heads)
+    def attention(aligned):
+        return calls * _attention_flops(int(ue.group_size), aligned,
+                                        int(ue.actual_head_dim), pre_scaled)
+    fixed = int(inst_meta["decoder_total_flops"]) - attention(int(ue.DECODER_ALIGNED_SEQ_LEN))
+    return [fixed + attention(((first_context + i + 63) // 64) * 64) for i in range(steps)]
+
+
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
+
+
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
     if isinstance(val, str):
@@ -1535,7 +1624,8 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
 
         # Execute from the preamble — it jumps into the cached prefill, which halts.
-        self.program_execute(preamble_addr, timeout=120.0, flops=gflops)
+        # Device latency counter of the prefill program, kept for the TEST_RESULT line.
+        self._report_prefill_hw_us, _ = self.program_execute(preamble_addr, timeout=120.0, flops=gflops)
 
     def _emit_decoder_program(self, layer_size: int, profile: bool = False) -> dict:
         """Emit ONE decode-position-agnostic decoder program.
@@ -2062,6 +2152,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
 
         preamble_aligned_ctx = None
         decoder_hw_latency_us = 0.0
+        # Per-step device latency + streamed text, kept for the TEST_RESULT line.
+        self._report_decode_lats_us = []
+        self._report_decoded_chars = []
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
             # self.seq_len at entry is the count of K/V already in cache; the
@@ -2104,6 +2197,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             if self.controller_decoder is not None:
                 self.controller_decoder.wait()
             decoder_hw_latency_us += float(step_latency_us)
+            self._report_decode_lats_us.append(float(step_latency_us))
             # Read the HW argmax register — the LM-head matmul already added the penalty bias
             # on chip, so this is the penalized (or pure-greedy) token. No host logit readback.
             token_id = (self.controller_decoder.global_argmax("lm_head", self.LOGITS_DRAM)
@@ -2118,6 +2212,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
+            self._report_decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
             if max_new_tokens > 0 and decoded_new_tokens >= max_new_tokens:
                 if _use_status:
@@ -2481,12 +2576,9 @@ def main():
     decoder_total_flops  = inst_meta["decoder_total_flops"]
 
     actual_seq_len = len(prefill_seq) - 1
-    # Rescale prefill FLOPs from the compile-time template to the actual seq_len.
-    # The meta records FLOPs for ``prefill_template_seq_len`` rows; runtime ops execute
-    # ``actual_seq_len`` rows (via gpr_seq_len-driven PBI loops), so linear scaling gives
-    # the real work count for the GFLOPS report.
-    template_seq_len = int(inst_meta["prefill_template_seq_len"])
-    gflops_prefill = inst_meta["prefill_template_flops"] * actual_seq_len // max(template_seq_len, 1)
+    # FLOPs for the rows that really run (see _prefill_flops / _decode_flops).
+    gflops_prefill = _prefill_flops(ue, inst_meta, actual_seq_len, pre_scaled=True)
+    decoder_total_flops = _decode_flops(ue, inst_meta, actual_seq_len + 1, 1, pre_scaled=True)[0]
     print(f"\n--- Starting prefill (actual {actual_seq_len} tokens, dynamic seq_len) ---")
     print(f"Prompt tokens ({len(prefill_seq)}): {prefill_seq}")
     print(f"Prompt text: {ue.tokenizer.decode(prefill_seq, skip_special_tokens=False)!r}")
@@ -2510,6 +2602,37 @@ def main():
               f"{ue.last_decoder_hw_latency_us / 1000 / decoded_tokens:.2f} ms/token, "
               f"{decoded_tokens * 1e6 / ue.last_decoder_hw_latency_us:.2f} tokens/s.")
     print("Qwen3-0.6B test ends.")
+
+    # One-line structured result for model_auto_test.py. HW seconds are the device latency
+    # counter read by program_execute(); FLOPs are the compile-time counts from the program
+    # meta (the ones the "Report FLOPS" lines use): prefill rescaled to the real seq_len,
+    # decode = per-token count x decode steps.
+    _dec_lats_us = getattr(ue, "_report_decode_lats_us", [])
+    _dec_hw_us = sum(_dec_lats_us)
+    _pf_hw_us = getattr(ue, "_report_prefill_hw_us", None)
+    _original_print("TEST_RESULT: " + json.dumps({
+        "decoded_text": "".join(getattr(ue, "_report_decoded_chars", [])),
+        "generated_token_ids": [int(t) for t in ue._generated_tokens[len(prefill_seq):]],
+        "system_prompt": system_prompt,
+        "multi_core": args.multi_core,
+        "prefill_speed_tok_s": round(actual_seq_len / latency_prefill, 2) if latency_prefill > 0 else None,
+        "decode_speed_tok_s": round(decoded_tokens / latency_decoder, 2) if latency_decoder > 0 else None,
+        "prefill_size_kb": round(inst_meta["prefill_program_size"] / 1024, 1) if "prefill_program_size" in inst_meta else None,
+        "decoder_size_kb": round(inst_meta["decoder_program_size"] / 1024, 1) if "decoder_program_size" in inst_meta else None,
+        "prefill_hw_ms": _pf_hw_us / 1e3 if _pf_hw_us is not None else None,
+        "decode_first_hw_ms": _dec_lats_us[0] / 1e3 if _dec_lats_us else None,
+        "decode_avg_hw_ms": _dec_hw_us / len(_dec_lats_us) / 1e3 if _dec_lats_us else None,
+        # decode_first_tok_s: HW-latency rate of the first decode step;
+        # decode_avg_tok_s: wall-clock average over the loop (the "speed:" printed above).
+        **_shared_report(
+            user_prompt, args.multi_core,
+            [("prefill", _pf_hw_us / 1e6 if _pf_hw_us is not None else None, gflops_prefill / 1e9),
+             ("decode", _dec_hw_us / 1e6,
+              sum(_decode_flops(ue, inst_meta, actual_seq_len + 1, len(_dec_lats_us), pre_scaled=True)) / 1e9)],
+            prefill_tokens=actual_seq_len, decoded_tokens=len(_dec_lats_us),
+            decode_first_tok_s=(1e6 / _dec_lats_us[0]) if (_dec_lats_us and _dec_lats_us[0]) else None,
+            decode_avg_tok_s=(decoded_tokens / latency_decoder) if (_dec_lats_us and latency_decoder > 0) else None),
+    }, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()

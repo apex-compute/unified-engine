@@ -45,7 +45,8 @@ builtins.print = quiet_print
 import user_dma_core
 from user_dma_core import UnifiedEngine, UE_VECTOR_SIZE, set_dma_device
 from multi_engine_shard import (MultiEngineScheduler, PrivateArena,
-                                model_multicore_layout, require_multicore_dram)
+                                model_multicore_layout, require_multicore_dram,
+                                sequential_windows)
 
 # The sibling mixin file is named for the model (qwen2.5_vl_3b_vision.py), and
 # "2.5" makes that an invalid module name, so it is loaded by path rather than
@@ -101,6 +102,60 @@ MAX_ENGINES = 12
 #   reserved. Boards that place windows by controller (U55C) prefer 6 GiB.
 MULTI_CORE_PREFERRED_MODEL_BASE = 0x180000000
 MULTI_CORE_MODEL_SPAN = 2 << 30
+# Decode copies every LM projection's column shard into the engine's own window:
+# ~1.8 GiB of LM weights / N engines, plus the LM head. A 512 MiB window (496 MiB
+# of weight arena) holds that only from ~4 engines up; at 2 engines it runs out at
+# layer 25 of 36. So when the device has room for it, each window is a whole GiB.
+MULTI_CORE_LARGE_WINDOW = 1 << 30
+
+
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
 
 
 def _board_multicore_map(num_engines: int):
@@ -110,9 +165,20 @@ def _board_multicore_map(num_engines: int):
     do not fall back to a core-index stride when the board policy rejects a map.
     """
     require_multicore_dram(num_engines, "Qwen2.5-VL-3B")
-    return model_multicore_layout(
+    # The board policy first: it validates the board and the 512 MiB map.
+    windows, model_base = model_multicore_layout(
         num_engines, model_bytes=MULTI_CORE_MODEL_SPAN,
         preferred_model_base=MULTI_CORE_PREFERRED_MODEL_BASE)
+    # Then grow every window to 1 GiB when N of them plus the 2 GiB model map
+    # still fit the device (kintex7 2 x 1 GiB + 2 GiB = 4 GiB; U50 up to 6
+    # engines). Same sequential layout, the model map right after the windows;
+    # on interleaved DRAM where a window sits does not change its bandwidth.
+    dram_bytes = user_dma_core.AVAILABLE_DRAM_SIZE_GB << 30
+    big = MULTI_CORE_LARGE_WINDOW
+    if (windows == sequential_windows(num_engines)
+            and num_engines * big + MULTI_CORE_MODEL_SPAN <= dram_bytes):
+        windows, model_base = sequential_windows(num_engines, big), num_engines * big
+    return windows, model_base
 
 
 class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine):
@@ -918,7 +984,25 @@ def main():
             "decode_gflops": ue._decode_gflops,
             "prefill_gflops": getattr(ue, "_prefill_gflops", None),
             "vision_gflops": getattr(ue, "_vis_gflops", None),
-        }))
+            # Shared report keys (model_auto_test.py). Every number is one the run already
+            # measured: HW seconds from the device latency counter, GFLOP from the compiled
+            # programs' FLOP counts (the same pair behind the [Vision] / [LM] GFLOPS lines).
+            # decode_first_tok_s is the HW rate of the first decode step, decode_avg_tok_s
+            # the wall-clock average ("speed:" in the Decoder done line).
+            **_shared_report(
+                getattr(ue, "_report_input", None) or (args.prompt or ue._prompt_text),
+                ue.multi_core,
+                ([("vision", getattr(ue, "_vis_latency_us", 0.0) / 1e6,
+                   getattr(ue, "_vis_total_flops", 0) / 1e9)]
+                 if image_embeddings is not None else [])
+                + [("prefill", ue._latency_prefill_us / 1e6, ue._prefill_flops / 1e9),
+                   ("decode", ue._decode_total_us / 1e6, ue._decode_step_flops / 1e9)],
+                prefill_tokens=len(context), decoded_tokens=ue._decode_n,
+                decode_first_tok_s=(1e6 / ue._decode_step_us[0]
+                                    if (ue._decode_step_us and ue._decode_step_us[0]) else None),
+                decode_avg_tok_s=(ue._decode_n / ue._decode_wall_s
+                                  if ue._decode_wall_s else None)),
+        }, ensure_ascii=False))
         return text
 
     profiles = []          # (title, note, samples) collected across stages
@@ -1017,6 +1101,7 @@ def main():
     ue._rope_offset = int(delta.flatten()[0])
     print(f"  mRoPE: positions {tuple(positions.shape)}, decode offset {ue._rope_offset}")
 
+    ue._report_input = {"prompt": prompt, "image": os.path.abspath(args.image)}   # TEST_RESULT "input"
     _run_lm(image_embeddings=embeddings, prefill_tokens=tokens, positions=positions)
     _write_summary()
 

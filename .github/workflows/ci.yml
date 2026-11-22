@@ -37,6 +37,11 @@ on:
         required: false
         type: boolean
         default: false
+      alveo_u50:
+        description: "Also run the suite on p2's Alveo U50 (xdma0, 8 engines) over SSH, in parallel with this runner's kintex7 (the nightly sets it)"
+        required: false
+        type: boolean
+        default: false
   push:
     # model/pi05_libero and model/verapulse are here so the two VLA bring-up
     # branches get HW CI on every push; the model subset each runs is
@@ -63,9 +68,10 @@ jobs:
     # still runs normally.
     if: ${{ !startsWith(github.head_ref, 'sync_pcie_only_') }}
     runs-on: self-hosted
-    # Leave the two-hour nightly scheduler five minutes to collect and report
-    # this job's terminal result if the hardware suite reaches its time limit.
-    timeout-minutes: 230
+    # Leave the nightly scheduler (310 min) ten minutes to collect and report this
+    # job's terminal result if the hardware suite reaches its time limit. The kintex7
+    # suite takes ~2 h; the Alveo U50 leg runs alongside it.
+    timeout-minutes: 300
     steps:
       - name: Checkout
         # Do NOT let checkout run `git clean -ffdx`: its default wipe deletes the
@@ -85,6 +91,27 @@ jobs:
           git clean -ffdx -e models
           ./clean_program_bins.sh
 
+      - name: Start the Alveo U50 leg on p2
+        # The same suite on p2's U50 (xdma0), run by github@p2 over SSH from this
+        # runner (one runner on p620, so a second job would wait ~2 h for this one).
+        # It runs in the background while this runner tests the kintex7 below; the
+        # "Collect" step waits for it. See .github/scripts/alveo_u50_remote.sh.
+        # Never fails itself: a failure is written to alveo_u50/rc for Collect.
+        if: ${{ inputs.alveo_u50 == true }}
+        env:
+          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
+        run: |
+          mkdir -p alveo_u50
+          if ! ssh -o BatchMode=yes -o ConnectTimeout=15 "$P2_SSH" true; then
+            echo "::error::cannot ssh to $P2_SSH as $(whoami)@$(hostname); the Alveo U50 leg is not run"
+            echo 255 > alveo_u50/rc
+            exit 0
+          fi
+          nohup bash -c 'ssh -o BatchMode=yes -o ServerAliveInterval=60 "$0" "bash -s -- $1" \
+                           < .github/scripts/alveo_u50_remote.sh > alveo_u50/run.log 2>&1
+                         echo $? > alveo_u50/rc' "$P2_SSH" "$GITHUB_SHA" > /dev/null 2>&1 &
+          echo "Alveo U50 leg started on $P2_SSH for $GITHUB_SHA (pid $!)"
+
       - name: Run CI suite
         id: ci
         run: |
@@ -101,10 +128,10 @@ jobs:
           BRANCH="${{ github.head_ref || github.ref_name }}"
 
           if [[ "${{ inputs.full_run }}" == "true" ]]; then
-            # No --only: the whole model_auto_test.py registry. Then a second pass
-            # re-runs every model from its cached bin in a date-seeded shuffled
-            # order (auto-triaged) to catch cross-model NaN / contamination.
-            ARGS+=(--shuffle-pass)
+            # No --only: the whole model_auto_test.py registry, one round, in a
+            # date-seeded shuffled order so each night covers different
+            # (previous -> model) pairs for cross-model NaN / contamination.
+            ARGS+=(--shuffle)
           elif [[ "$BRANCH" == "model/verapulse" ]]; then
             # verapulse bring-up branch: run ONLY verapulse. Same reasoning as pi05
             # below -- the Gemma4 cases add ~15 min of shared-board time and cannot
@@ -133,6 +160,23 @@ jobs:
           fi
           ./run_ci.sh "${ARGS[@]}"
 
+      - name: Collect the Alveo U50 leg
+        if: ${{ always() && inputs.alveo_u50 == true }}
+        env:
+          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
+        run: |
+          while [ ! -f alveo_u50/rc ]; do sleep 30; done
+          RC=$(cat alveo_u50/rc)
+          if [ "$RC" != 255 ]; then
+            scp -q -o BatchMode=yes "$P2_SSH:ue_ci_alveo_u50/*" alveo_u50/ || echo "::warning::no result files copied from $P2_SSH"
+          fi
+          echo "--- tail of the Alveo U50 leg (full log: alveo_u50/run.log in the artifact)"
+          tail -n 60 alveo_u50/run.log 2>/dev/null || true
+          if [ "$RC" != 0 ]; then
+            echo "::error::Alveo U50 leg failed (exit $RC)"
+            exit 1
+          fi
+
       - name: Upload result artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -143,7 +187,67 @@ jobs:
             model_auto_test_results_pass1.txt
             model_auto_test_results_shuffle.txt
             user_hw_test_summary.md
+            alveo_u50/
           if-no-files-found: warn
+
+      - name: Publish results to the job summary
+        # Shows model_auto_test_results.txt on the run page itself (the Summary
+        # tab), not only in the artifact or a PR comment. A full run shows both
+        # passes; user_hw_test_summary.md goes in a collapsed block below.
+        if: always()
+        run: |
+          MAX=400000   # bytes per file: GitHub caps a step summary at 1 MiB
+          show() {     # show TITLE FILE
+            [ -f "$2" ] || return 0
+            echo "### $1"
+            echo
+            echo '```text'
+            head -c "$MAX" "$2"
+            [ "$(wc -c < "$2")" -gt "$MAX" ] && echo "... truncated: the full file is in the model-hw-ci-results artifact"
+            echo '```'
+            echo
+          }
+          {
+            echo "## Unified Engine HW CI: model_auto_test.py"
+            echo
+            if [ -f model_auto_test_results_pass1.txt ]; then
+              show "Pass 1: compile + run" model_auto_test_results_pass1.txt
+              show "Pass 2: run from bin, shuffled" model_auto_test_results_shuffle.txt
+            elif [ -f model_auto_test_results.txt ]; then
+              show "model_auto_test_results.txt" model_auto_test_results.txt
+            else
+              echo "_model_auto_test_results.txt was not produced; see the job log._"
+              echo
+            fi
+            if [ -f user_hw_test_summary.md ]; then
+              echo "<details><summary>user_hw_test.py summary</summary>"
+              echo
+              head -c "$MAX" user_hw_test_summary.md
+              echo
+              echo "</details>"
+            fi
+            if [ -d alveo_u50 ]; then
+              echo
+              echo "## Alveo U50 (p2 xdma0): model_auto_test.py"
+              echo
+              if [ -f alveo_u50/model_auto_test_results_pass1.txt ]; then
+                show "Pass 1: compile + run" alveo_u50/model_auto_test_results_pass1.txt
+                show "Pass 2: run from bin, shuffled" alveo_u50/model_auto_test_results_shuffle.txt
+              elif [ -f alveo_u50/model_auto_test_results.txt ]; then
+                show "model_auto_test_results.txt" alveo_u50/model_auto_test_results.txt
+              else
+                echo "_No results from the Alveo U50 leg; see alveo_u50/run.log in the artifact._"
+                echo
+              fi
+              if [ -f alveo_u50/user_hw_test_summary.md ]; then
+                echo "<details><summary>user_hw_test.py summary (Alveo U50)</summary>"
+                echo
+                head -c "$MAX" alveo_u50/user_hw_test_summary.md
+                echo
+                echo "</details>"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment CI results on PR
         if: always()

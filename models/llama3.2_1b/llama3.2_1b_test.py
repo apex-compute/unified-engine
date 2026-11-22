@@ -81,6 +81,55 @@ def quiet_print(*args, **kwargs):
 builtins.print = quiet_print
 # ---------------------------------------------
 
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
+
+
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
     if isinstance(val, str):
@@ -2004,6 +2053,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "decode_first_hw_ms": hw_decode_first_ms,
             "decode_avg_hw_ms": hw_decode_avg_ms,
             "decode_avg_cpu_ms": cpu_decode_avg_ms,
+            # Shared report keys (model_auto_test.py). "input" is filled in by main().
+            # decode_first_tok_s is the HW-latency rate of the first decode step,
+            # decode_avg_tok_s the wall-clock average over the loop (as printed above).
+            **_shared_report(
+                None, self.multi_core,
+                [("prefill", hw_lat_prefill_us / 1e6, flops_prefill / 1e9),
+                 ("decode", hw_decode_total_us / 1e6,
+                  decoder_flops_per_token * len(hw_decode_lats_us) / 1e9)],
+                prefill_tokens=prefill_seq_len, decoded_tokens=tokens_decoded,
+                decode_first_tok_s=peak_tokens_per_s if hw_decode_lats_us else None,
+                decode_avg_tok_s=avg_tokens_per_s if tokens_decoded else None),
         }
 
     def write_run_summary(self, out_path: str, args, run_result: dict, cores: int = 1,
@@ -2542,6 +2602,7 @@ def main():
     if len(prefill_seq) < 2 or len(prefill_seq) > max_prefill + 1:
         print(f"WARNING: prompt length {len(prefill_seq)} out of range [2, {max_prefill + 1}], falling back to default.")
         prefill_seq = tuple(cfg["default_prefill_tokens"])
+        args.prompt = None  # the default tokens ran, not the prompt (reported as "input")
 
     ue.prefill_seq = prefill_seq
     ue.max_new_tokens = max(0, args.max_new_tokens)
@@ -2625,6 +2686,8 @@ def main():
 
     print("\n--- Running ---")
     run_result = ue.run_llama()
+    run_result["input"] = (args.prompt if args.prompt is not None
+                           else ue.tokenizer.decode(list(ue.prefill_seq)))
     print("Llama-3.2-1B test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 

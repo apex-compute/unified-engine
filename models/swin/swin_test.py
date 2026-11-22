@@ -513,6 +513,149 @@ def multihead_permute(ue: UnifiedEngine,
 # ---------------------------------------------------------------------------
 # Config / helpers
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# TEST_RESULT accounting (model_auto_test.py reads these keys)
+# ---------------------------------------------------------------------------
+
+def _shared_report(input_desc, engines, stages, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak
+    (128 FLOP per clock cycle per engine) times ``engines``.
+    The decoder keys are only emitted when ``decoded_tokens`` is given.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        _hz = getattr(_udc, "CORE_CLOCK_FREQ_HZ", None)
+        per_engine = _hz * 128 / 1e9 if _hz else None  # GFLOP/s per engine
+        peak_gflops = per_engine * engines if (per_engine and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop, 6),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    report = {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop, 6),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+    }
+    if decoded_tokens is not None:
+        report.update({"decoded_tokens": decoded_tokens,
+                       "decode_first_tok_s": _num(decode_first_tok_s, 3),
+                       "decode_avg_tok_s": _num(decode_avg_tok_s, 3)})
+    return report
+
+
+# user_dma_core ops that return their theoretical FLOP count when captured.
+_FLOP_RETURNING_OPS = (
+    "matmat_mul_core", "matmat_mul_core_legacy", "matmat_mul_core_dynamic", "matmat_mul_dynamic_core",
+    "matmat_mul_two_cores", "matmat_mul_multi_cores",
+    "quantized_matmat_core", "quantized_matmat_core_legacy", "quantized_matmat_core_dynamic",
+    "unified_attention_core", "unified_attention_core_legacy", "unified_attention_core_dynamic",
+    "layer_norm_core_dram", "layer_norm_core_dram_legacy", "layer_norm_core_dram_dynamic",
+    "rms_norm_core_dram", "rms_norm_core_dram_legacy", "rms_norm_core_dram_dynamic",
+    "eltwise_core_dram", "eltwise_core_dram_legacy", "eltwise_core_dram_dynamic",
+    "conv1d_core", "conv2d_core", "maxpool2d_core", "activation_core",
+)
+# SRAM-level ops that return nothing: counted at one FLOP per element (the same rate
+# eltwise_core_dram reports), read from their ``element_size`` argument (4th positional).
+_FLOP_PER_ELEMENT_OPS = ("eltwise_add_core", "eltwise_mul_core", "eltwise_sub_core",
+                         "broadcast_mul", "broadcast_add")
+
+
+def _install_flop_meter(ue) -> dict:
+    """Sum the theoretical FLOPs of everything captured on ``ue`` (TEST_RESULT accounting only).
+
+    Wraps the op methods on this one engine instance; the instruction stream is untouched.
+    Only the outermost wrapped call counts, so an op built from other ops is not counted
+    twice, and nothing is counted outside start_capture()/stop_capture().  A count made
+    inside loop_start()/loop_end() is multiplied by the loop's ``loop_cnt``; a loop whose
+    trip count exists only in a register at run time is recorded in ``runtime_loops`` and
+    counted once (a lower bound).  ``start_queue_for_bf16_matvec_operation`` (returns
+    nothing) is counted as 2*K*N.  Ops outside these lists -- DMA copies, permutes,
+    transposes, softmax/exp -- add nothing, exactly as in the other models' counts.
+    Read ``meter["flops"]`` before and after compiling a program to get that program's FLOPs.
+    """
+    meter = getattr(ue, "_flop_meter", None)
+    if meter is not None:
+        return meter
+    meter = {"flops": 0, "depth": 0, "loops": [], "runtime_loops": 0}
+
+    def _counted(orig, count_of):
+        def counted(*args, **kwargs):
+            meter["depth"] += 1
+            try:
+                ret = orig(*args, **kwargs)
+            finally:
+                meter["depth"] -= 1
+            if meter["depth"] == 0 and getattr(ue, "is_capture_on", False):
+                n = count_of(ret, args, kwargs)
+                if isinstance(n, (int, float)) and not isinstance(n, bool):
+                    for trips in meter["loops"]:
+                        n *= trips
+                    meter["flops"] += n
+            return ret
+        return counted
+
+    def _element_size(ret, args, kwargs):
+        return kwargs["element_size"] if "element_size" in kwargs else (args[3] if len(args) > 3 else None)
+
+    def _matvec(ret, args, kwargs):
+        return 2 * kwargs["K"] * kwargs["N"] if ("K" in kwargs and "N" in kwargs) else None
+
+    for name in _FLOP_RETURNING_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, _counted(getattr(ue, name), lambda ret, args, kwargs: ret))
+    for name in _FLOP_PER_ELEMENT_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, _counted(getattr(ue, name), _element_size))
+    if hasattr(ue, "start_queue_for_bf16_matvec_operation"):
+        ue.start_queue_for_bf16_matvec_operation = _counted(ue.start_queue_for_bf16_matvec_operation, _matvec)
+
+    orig_loop_start, orig_loop_end = ue.loop_start, ue.loop_end
+
+    def loop_start(*args, **kwargs):
+        ret = orig_loop_start(*args, **kwargs)
+        trips = kwargs.get("loop_cnt", args[0] if args else 0)
+        if not (isinstance(trips, int) and trips > 0):
+            trips = 1
+            if meter["depth"] == 0:
+                meter["runtime_loops"] += 1
+        meter["loops"].append(trips)
+        return ret
+
+    def loop_end(*args, **kwargs):
+        ret = orig_loop_end(*args, **kwargs)
+        if meter["loops"]:
+            meter["loops"].pop()
+        return ret
+
+    ue.loop_start, ue.loop_end = loop_start, loop_end
+    ue._flop_meter = meter
+    return meter
+
+
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
     if isinstance(val, str):
@@ -1068,7 +1211,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
         with open(bin_path, "wb") as f:
             f.write(buf)
         with open(meta_path, "w") as f:
-            json.dump({"artifact_version": self.ARTIFACT_VERSION, "size": size}, f)
+            # "flops": the program's counted theoretical FLOPs, so a run from bin can report them.
+            json.dump({"artifact_version": self.ARTIFACT_VERSION, "size": size,
+                       "flops": getattr(self, "program_flops", None)}, f)
         _original_print(f"  Program dumped: {size / 1024**2:.1f} MB → {bin_path}")
 
     def load_programs(self) -> int | None:
@@ -1085,6 +1230,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             return None
         with open(bin_path, "rb") as f:
             data = f.read()
+        self.program_flops = meta.get("flops")  # None for a bin dumped before the count existed
         addr = self.get_program_dram_addr()
         self.dma_write(DMA_DEVICE_H2C, addr, data, len(data))
         self.allocate_program_dram(len(data))
@@ -1324,6 +1470,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
                 # --- 6. Flash attention batched (PBI hardware loop) ---
                 dram_zero_fill(self, st['attn_output'], total_batches * wa_pad * hd_pad)
+                _fm = getattr(self, "_flop_meter", None)  # TEST_RESULT accounting only
+                _fm_before = _fm["flops"] if _fm is not None else 0
                 nn_lib.flash_attention_batched_pbi(self,
                     num_batches=total_batches,
                     head_dim=hd_pad,
@@ -1344,6 +1492,10 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     _silent=True,
                     gpr_M_reg=gpr_mm,
                 )
+                if _fm is not None:
+                    # The attention body is captured once as a subroutine and called once per
+                    # window-head batch, so its FLOPs run total_batches times.
+                    _fm["flops"] += (_fm["flops"] - _fm_before) * (total_batches - 1)
 
                 # --- 7+8. Inverse permute AND unpad (fused) ---
                 # Transpose per-head attention blocks (num_heads, wa_pad, hd_pad) back to
@@ -1618,6 +1770,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(self.IMAGE_DRAM, image_chw.contiguous().flatten())
         self.start_execute_from_dram(program_addr)
         self.wait_queue(timeout)
+        self.last_inference_hw_us = self.report_latency_in_us()  # device latency counter of this program
         return self.get_arg_max_index()
 
 
@@ -1667,6 +1820,7 @@ def main():
     import time as _time
     t0 = _time.perf_counter()
     ue = Swin_UnifiedEngine(script_dir=SCRIPT_DIR)
+    flop_meter = _install_flop_meter(ue)
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
 
@@ -1686,7 +1840,9 @@ def main():
         timer_c = threading.Thread(target=_progress_timer,
             args=("Compiling (this will take some time, swin has a lot of batched operations)", t_weights, stop_c), daemon=True)
         timer_c.start()
+        flops_before = flop_meter["flops"]
         prog_addr = ue.compile_full_fused()
+        ue.program_flops = int(flop_meter["flops"] - flops_before)
         stop_c.set()
         timer_c.join()
         ue.dump_programs(prog_addr)
@@ -1715,7 +1871,24 @@ def main():
     _original_print(f"  Prediction: {label!r} (class {predicted_idx})")
 
     import json as _json
-    _original_print(f"TEST_RESULT: {_json.dumps({'decoded_text': label})}")
+    # One fused program = one stage. hw_s is the device latency counter read after the run,
+    # gflop the theoretical FLOPs counted while that program was compiled (or stored in
+    # programs.json by the run that compiled it).
+    try:
+        with Image.open(image_path) as _im:
+            _w0, _h0 = _im.size
+        _orig = f"{_w0}x{_h0}"
+    except Exception:
+        _orig = "unknown size"
+    _flops = getattr(ue, "program_flops", None)
+    result = {"decoded_text": label}
+    result.update(_shared_report(
+        {"image": image_path, "size": f"{_orig}, resized to 384x384"}, 1,
+        [("full_fused", ue.last_inference_hw_us / 1e6, _flops / 1e9 if _flops is not None else None)]))
+    result["output"] = f"top-1: {label} (class {predicted_idx})"
+    result["predicted_class"] = int(predicted_idx)
+    result["wall_exec_s"] = round(t_exec - t_exec_start, 3)
+    _original_print(f"TEST_RESULT: {_json.dumps(result)}")
 
 
 if __name__ == "__main__":

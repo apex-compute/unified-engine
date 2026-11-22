@@ -286,6 +286,56 @@ def bf16_smart_permute_core(ue, dims, permute_indices, input_dram_addr, output_d
 # ---------------------------------------------------------------------------
 # Config loader
 # ---------------------------------------------------------------------------
+def _shared_report(input_desc, engines, stages, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak
+    (128 FLOP per clock cycle per engine) times ``engines``.
+    The decoder keys are only emitted when ``decoded_tokens`` is given.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        _hz = getattr(_udc, "CORE_CLOCK_FREQ_HZ", None)
+        per_engine = _hz * 128 / 1e9 if _hz else None  # GFLOP/s per engine
+        peak_gflops = per_engine * engines if (per_engine and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop, 6),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    report = {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop, 6),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+    }
+    if decoded_tokens is not None:
+        report.update({"decoded_tokens": decoded_tokens,
+                       "decode_first_tok_s": _num(decode_first_tok_s, 3),
+                       "decode_avg_tok_s": _num(decode_avg_tok_s, 3)})
+    return report
+
+
 def load_config(config_path=None):
     """Load parakeet_config.json."""
     if config_path is None:
@@ -1699,12 +1749,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         last_token = self.blank_id
         total_steps = 0
         hw_us = 0.0  # the engine's latency counter over every decoder program launch
+        first_step_us = None  # HW latency of the first joint step (TEST_RESULT decode_first_tok_s)
         while t < L:
             symbols = 0
             while symbols < self.max_symbols_per_step:
                 # Set registers: TOKEN_REG = embedding offset, ENC_T_REG = encoder position offset
                 self.isa_add_set_core(self.TOKEN_REG, ue_35bit_addr_shifter(last_token * H * bpe))
                 self.isa_add_set_core(self.ENC_T_REG, ue_35bit_addr_shifter(t * D * bpe))
+                step_start_us = hw_us
                 # Predictor: state save + embedding lookup (register-addressed) + LSTM
                 hw_us += self.program_execute(pred_prog)[0]
                 # Joint token: enc_out[t] copy (register-addressed) + pred_out copy + projections + argmax
@@ -1718,9 +1770,13 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 if token_id == self.blank_id:
                     # Restore LSTM state from on-device save buffers
                     hw_us += self.program_execute(restore_prog)[0]
+                    if first_step_us is None:
+                        first_step_us = hw_us - step_start_us
                     t += max(dur, 1)
                     break
                 else:
+                    if first_step_us is None:
+                        first_step_us = hw_us - step_start_us
                     tokens.append(token_id)
                     last_token = token_id
                     symbols += 1
@@ -1731,6 +1787,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 t += 1
         _original_print(f"  Decode: {total_steps} joint steps, {len(tokens)} tokens emitted")
         self.dec_hw_us, self.dec_steps, self.dec_tokens = hw_us, total_steps, len(tokens)
+        self.dec_first_step_us = first_step_us
         return tokens
 
 def write_run_summary(engine, args, *, audio_path, audio_dur, T_mel, L, L_pad, mel_flops, sub_hw_us, enc_hw_us,
@@ -2098,10 +2155,33 @@ def main():
                                                             t_dec_done - t_enc_done), text=hw_text)
     _original_print(f"\nWrote summary: {summary}")
 
+    # Shared TEST_RESULT keys (model_auto_test.py _REPORT_REQUIRED / _REPORT_DECODER). Same numbers as the
+    # summary above: hw_s is the engine's latency counter summed over the stage's program launches, gflop the
+    # programs' counted FLOPs (programs.json "flops" + the per-utterance mel matmul); a stage whose count is
+    # not in the cached manifest stays null.
+    pf = getattr(engine, "program_flops", {}) or {}
+    mel_flops = 2 * engine.n_mels * K_padded * T_mel_padded
+    dec_steps = getattr(engine, "dec_steps", 0)
+    dec_hw_us = getattr(engine, "dec_hw_us", 0.0)
+    first_us = getattr(engine, "dec_first_step_us", None)
+    result = {"decoded_text": hw_text}
+    result.update(_shared_report(
+        {"audio": audio_path, "length": f"{audio_dur:.2f} s, {T_mel} mel frames, {L} encoder frames"},
+        1,
+        [("mel+subsampling", sub_hw_us / 1e6,
+          (mel_flops + pf["subsampling"]) / 1e9 if "subsampling" in pf else None),
+         (f"encoder_{engine.num_layers}L", enc_hw_us / 1e6, pf["encoder"] / 1e9 if "encoder" in pf else None),
+         (f"decoder_{dec_steps}_steps", dec_hw_us / 1e6,
+          pf["decoder_step"] * dec_steps / 1e9 if "decoder_step" in pf else None)],
+        decoded_tokens=len(hw_tokens),
+        decode_first_tok_s=(1e6 / first_us) if first_us else None,
+        decode_avg_tok_s=(len(hw_tokens) * 1e6 / dec_hw_us) if (hw_tokens and dec_hw_us) else None))
+    result["output"] = f"transcript ({len(hw_tokens)} tokens): {hw_text}"
+    result["prefill_tokens"] = 0          # the transducer starts from blank: no prompt is prefilled
+    result["decode_joint_steps"] = dec_steps
+    result["wall_s"] = round(total, 3)
     import json as _json
-    _original_print("TEST_RESULT:" + _json.dumps({
-        "decoded_text": hw_text,
-    }))
+    _original_print("TEST_RESULT:" + _json.dumps(result))
 
 if __name__ == "__main__":
     main()

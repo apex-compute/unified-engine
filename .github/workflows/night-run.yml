@@ -2,7 +2,10 @@ name: Unified Engine Night Run
 
 on:
   schedule:
-    - cron: "52 2 * * *"
+    # 09:15 Pacific: after andromeda's PCIe Night Run (02:52, usually done by 08:00-09:00),
+    # which also uses p2's U50 for its own hardware tests. The p2 hardware lock covers a
+    # late andromeda night.
+    - cron: "15 9 * * *"
       timezone: "America/Los_Angeles"
   workflow_dispatch:
 
@@ -14,7 +17,7 @@ jobs:
   run-model-ci:
     name: Run and collect full model CI
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 310
     outputs:
       slack-message: ${{ steps.run.outputs.slack-message }}
     steps:
@@ -55,6 +58,8 @@ jobs:
               inputs: {
                 full_run: 'true',
                 clean_bins: 'false',
+                // Also run p2's Alveo U50 (xdma0) over SSH, alongside the kintex7.
+                alveo_u50: 'true',
                 // TODO(after model/pi05_libero merges): add `pi05_first: 'true'` to run
                 // the model round before the HW op tests with pi05 hoisted to the front,
                 // for a ~2-minute pi05 verdict. It CANNOT be sent yet: this dispatch
@@ -117,14 +122,54 @@ jobs:
               '',
               `${icon} <${completedRun.html_url}|Full Model HW CI> — ${completedRun.conclusion}`,
               '',
-              `Model scope: all registered models (compile pass + shuffled run-from-bin pass)`,
+              `Model scope: all registered models (one round, date-seeded shuffled order)`,
+              `Boards: kintex7 (p620) + Alveo U50 (p2 xdma0)`,
               `Branch: \`${branch}\``,
               `Commit: \`${completedRun.head_sha.slice(0, 12)}\``,
               `<${schedulerUrl}|View nightly scheduler run>`,
             ].join('\n');
 
             core.setOutput('slack-message', message);
-            await core.summary.addRaw(message).write();
+            core.summary.addRaw(message).addEOL();
+
+            // The model report of the dispatched run, so the nightly's own page shows
+            // it too (ci.yml also puts it on its run page).
+            try {
+              const fs = require('fs');
+              const { execSync } = require('child_process');
+              const arts = await github.rest.actions.listWorkflowRunArtifacts({
+                ...common, run_id: completedRun.id, per_page: 100,
+              });
+              const art = arts.data.artifacts.find(a => a.name === 'model-hw-ci-results');
+              if (!art) throw new Error('no model-hw-ci-results artifact');
+              const zip = await github.rest.actions.downloadArtifact({
+                ...common, artifact_id: art.id, archive_format: 'zip',
+              });
+              const dir = `${process.env.RUNNER_TEMP}/model-hw-ci-results`;
+              fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(`${dir}.zip`, Buffer.from(zip.data));
+              execSync(`unzip -o -q "${dir}.zip" -d "${dir}"`);
+              const MAX = 200000;   // a step summary is capped at 1 MiB; two boards share it
+              for (const [board, sub] of [['kintex7 (p620)', ''], ['Alveo U50 (p2 xdma0)', 'alveo_u50/']]) {
+                const files = fs.existsSync(`${dir}/${sub}model_auto_test_results_pass1.txt`)
+                  ? [['Pass 1: compile + run', 'model_auto_test_results_pass1.txt'],
+                     ['Pass 2: run from bin, shuffled', 'model_auto_test_results_shuffle.txt']]
+                  : [['model_auto_test_results.txt', 'model_auto_test_results.txt']];
+                core.summary.addHeading(`model_auto_test.py: ${board}`, 2);
+                let shown = 0;
+                for (const [title, name] of files) {
+                  if (!fs.existsSync(`${dir}/${sub}${name}`)) continue;
+                  let text = fs.readFileSync(`${dir}/${sub}${name}`, 'utf8');
+                  if (text.length > MAX) text = text.slice(0, MAX) + '\n... truncated: see the artifact';
+                  core.summary.addHeading(title, 3).addCodeBlock(text, 'text');
+                  shown++;
+                }
+                if (!shown) core.summary.addRaw(`\n_No ${board} report in the artifact; see the Full Model HW CI run._\n`);
+              }
+            } catch (error) {
+              core.summary.addRaw(`\n_Model report not attached (${error.message}); see the Full Model HW CI run._\n`);
+            }
+            await core.summary.write();
 
             if (completedRun.conclusion !== 'success') {
               core.setFailed(

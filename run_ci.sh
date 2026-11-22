@@ -15,6 +15,10 @@
 #   ./run_ci.sh --clean-bins --only gpt2 swin
 #   ./run_ci.sh --pi05-first      # pi05 first, and the model round BEFORE the HW
 #                                  # op tests (used by the nightly full run)
+#   ./run_ci.sh --shuffle         # one round, models in a seeded random order
+#                                  # (seed = SHUFFLE_SEED env or today's YYYYMMDD),
+#                                  # every model run even after a failure; used by
+#                                  # the nightly full run
 #   ./run_ci.sh --shuffle-pass    # after the compile round, re-run every model
 #                                  # FROM ITS CACHED BIN in a seeded random order
 #                                  # (seed = SHUFFLE_SEED env or today's YYYYMMDD),
@@ -49,6 +53,15 @@ if [[ "${1:-}" == "--shuffle-pass" ]]; then
     shift
 fi
 
+# --shuffle: the single model round runs in a seeded random order, so each night
+# covers different (previous -> model) pairs without a second round, and runs every
+# model even after one fails (the exit status still reports the failure).
+SHUFFLE=0
+if [[ "${1:-}" == "--shuffle" ]]; then
+    SHUFFLE=1
+    shift
+fi
+
 ONLY_ARGS=()
 if [[ "${1:-}" == "--only" ]]; then
     shift
@@ -57,6 +70,7 @@ fi
 
 FIRST_ARGS=()
 [[ $PI05_FIRST -eq 1 ]] && FIRST_ARGS=(--first pi05)
+[[ $SHUFFLE -eq 1 ]] && FIRST_ARGS+=(--shuffle-seed "${SHUFFLE_SEED:-$(date +%Y%m%d)}" --continue-on-fail)
 
 STEP_TOTAL=2
 [[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=$((STEP_TOTAL + 1))

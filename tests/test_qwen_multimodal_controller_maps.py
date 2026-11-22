@@ -57,28 +57,30 @@ class MultimodalControllerMaps(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             return cls(multi_core=active, **kwargs)
 
-    def assert_vl_consecutive(self, engine, active):
-        """Sequential 512 MiB windows, the 2 GiB model map directly above them."""
+    def assert_vl_consecutive(self, engine, active, window=512 << 20):
+        """Sequential windows, the 2 GiB model map directly above them."""
         self.assertEqual(engine._board_windows,
-                         [(i << 29, 512 << 20) for i in range(active)])
-        self.assertEqual(engine.PARAMS_BASE, active << 29)
+                         [(i * window, window) for i in range(active)])
+        self.assertEqual(engine.PARAMS_BASE, active * window)
         self.assertEqual(engine.DRAM_END, engine.PARAMS_BASE + (2 << 30))
         self.assertEqual(engine.mc_arena.windows, engine._board_windows)
-        self.assertEqual(engine.mc_arena.weight_bytes(), 496 << 20)
+        self.assertEqual(engine.mc_arena.weight_bytes(), window - (16 << 20))
         for index in range(1, active):
             self.assertGreaterEqual(engine.mc_arena.isa_base(index), engine.WORKER_ISA_BASE)
             self.assertLessEqual(engine.mc_arena.isa_limit(index), engine.DRAM_END)
 
     def test_vl_u50_model_map_follows_the_sequential_windows(self):
-        for active in (2, 4, 8):
+        # 1 GiB windows while N x 1 GiB + the 2 GiB map fit 8 GiB, else 512 MiB.
+        for active, window in ((2, 1 << 30), (4, 1 << 30), (8, 512 << 20)):
             with self.subTest(active=active):
-                self.assert_vl_consecutive(self.engine(VL, active=active), active)
+                self.assert_vl_consecutive(self.engine(VL, active=active), active, window)
 
     def test_vl_kintex7_two_engines_fit_4_gib(self):
-        # 2 x 512 MiB windows + the 2 GiB model map = 3 GiB of the 4 GiB DDR3.
+        # 2 x 1 GiB windows + the 2 GiB model map = the whole 4 GiB DDR3: at 512 MiB
+        # the decode shards (~1.8 GiB / 2) overflow the 496 MiB weight arena.
         engine = self.engine(VL, cores=2, gib=4, active=2)
-        self.assert_vl_consecutive(engine, 2)
-        self.assertEqual(engine.DRAM_END, 3 << 30)
+        self.assert_vl_consecutive(engine, 2, 1 << 30)
+        self.assertEqual(engine.DRAM_END, 4 << 30)
 
     def test_vl_u55c_windows_avoid_shared_model_for_8_and_16_gib_images(self):
         for gib in (8, 16):

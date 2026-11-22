@@ -1951,6 +1951,7 @@ def main():
     # ------------------------------------------------------------ decode (greedy on device logits)
     head = ref.w["vlm.lm_head.weight"]
     tok, index, out, agree, dec_us = int(ids[-1]), P, [], 0, 0.0
+    dec_step_us = []                # device latency of every decode step (decode + KV append), for TEST_RESULT
     teacher = golden["generated_ids"].tolist() if (args.teacher and golden is not None) else None
     assert not args.teacher or teacher is not None, "--teacher needs a golden.safetensors with generated_ids"
     slots = torch.arange(CAP)
@@ -1959,7 +1960,8 @@ def main():
         ue.dma_to_accelerator_memory(ue.buf["X_A"], emb_table[tok].to(torch.bfloat16).cpu().contiguous())
         ue.lm_write_rope("ROPE_CUR", *ref.rope_cos_sin(torch.full((3, 1), index + delta)))
         ue.lm_write_mask("MASK_DEC", 1, (slots < index) | (slots == ue.CUR))
-        dec_us += ue._exec("decode") + ue._exec(f"append_{index}")
+        dec_step_us.append(ue._exec("decode") + ue._exec(f"append_{index}"))
+        dec_us += dec_step_us[-1]
         with torch.no_grad():
             h = ref.lm_forward(emb_table[tok][None], torch.full((3, 1), index + delta), cache)
         if out and out[-1] == ref.anchor:
@@ -2057,9 +2059,34 @@ def main():
         ue.profile("expert")
     if args.profile_vision and "vision" in ue.hw_us:
         ue.profile_vision()
-    # one machine-readable line for model_auto_test.py
-    print("TEST_RESULT:" + json.dumps({"passed": bool(ok), "traj_max_err_m": round(err, 4), "tokens": len(out),
-                                       "engines": engines, "hw_s": round(sum(hw_ms.values()) / 1e3, 1)}))
+    # one machine-readable line for model_auto_test.py. Stages = the [util] table above: hw_s is the
+    # device latency counter summed over the stage's launches, gflop the matmul FLOPs (incl. attention;
+    # norms, RoPE and elementwise ops are not counted) of the programs executed in it.
+    peak_gflops = user_dma_core.CORE_CLOCK_FREQ_HZ * 128 / 1e9 * engines if user_dma_core.CORE_CLOCK_FREQ_HZ else peak
+    counts = {"decode": f" ({len(dec_step_us)} steps)", "expert": f" ({args.steps} steps)"}
+    stages = [{"name": stage + counts.get(stage, ""), "hw_s": us_ / 1e6, "gflop": fl_ / 1e9,
+               "gflops": (fl_ / us_ / 1e3) if us_ else None,
+               "pct_peak": (100 * fl_ / us_ / 1e3 / peak_gflops) if us_ else None}
+              for stage, (fl_, us_, _rate, _frac) in ue.util.items()]
+    avg_gflops = (fl / us / 1e3) if us else None
+    noise = "NVIDIA golden x_steps[0]" if (golden is not None and "x_steps" in golden) else f"seed {args.seed}"
+    result = {"passed": bool(ok), "traj_max_err_m": round(err, 4), "tokens": len(out),
+              "engines": engines, "hw_s": round(sum(hw_ms.values()) / 1e3, 1),
+              "input": (f"sample {sample if sample is not None else 'built-in synthetic'}: {len(grids)} camera images "
+                        f"(patch grids {'/'.join(f'{h}x{w}' for h, w in grids)}, {sum(sizes)} patches), "
+                        f"{L} prompt tokens, ego history {tuple(hist_xyz.shape)}, expert noise {noise}"),
+              "output": (f"trajectory xyz {tuple(xyz_dev.shape)}, max |err| {err:.3f} m vs device-equivalent reference; "
+                         f"{len(out)} tokens decoded ({agree}/{len(out)} agree with the reference pick), "
+                         f"{args.steps} flow steps"),
+              "peak_gflops": peak_gflops, "stages": stages,
+              "total_hw_s": us / 1e6, "total_gflop": fl / 1e9, "avg_gflops": avg_gflops,
+              "avg_pct_peak": (100 * avg_gflops / peak_gflops) if avg_gflops is not None else None,
+              # P prompt rows are prefilled; the last prompt token is the first decode step. Rates are
+              # decode steps per second of DEVICE time (the host loop also runs the reference model).
+              "prefill_tokens": int(P), "decoded_tokens": len(out),
+              "decode_first_tok_s": (1e6 / dec_step_us[0]) if dec_step_us and dec_step_us[0] else None,
+              "decode_avg_tok_s": (len(dec_step_us) * 1e6 / dec_us) if dec_us else None}
+    print("TEST_RESULT:" + json.dumps(result))
     print("PASS" if ok else f"FAIL (gates: vision/projector snr >= {args.min_snr} dB, no NaN, trajectory max err <= {args.max_traj_err} m)")
     sys.exit(0 if ok else 1)
 

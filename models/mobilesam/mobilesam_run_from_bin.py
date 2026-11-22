@@ -155,6 +155,7 @@ class MobileSAM_UE_Run(UnifiedEngine):
         _timer.start()
         self.start_execute_from_dram(prog)
         self.wait_queue(120.0)
+        self.last_encoder_hw_us = self.report_latency_in_us()  # device latency counter (TEST_RESULT accounting)
         _stop_timer = True
         _timer.join()
         sys.stdout.write(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s\n")

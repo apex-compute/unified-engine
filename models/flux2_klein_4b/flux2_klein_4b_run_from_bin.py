@@ -75,6 +75,10 @@ class Session:
         for k in ("params_te_bin", "params_dit_bin", "vae_weights", "embed_tokens_bin"):
             if not os.path.exists(self.paths[k]):
                 raise FileNotFoundError(f"{self.paths[k]} missing: run flux2_klein_4b_weights.py first")
+        stale = T.W.vae_weights_stale(self.paths["vae_weights"])
+        if stale:
+            raise RuntimeError(f"{self.paths['vae_weights']}: {stale}; re-export it with "
+                               "flux2_klein_4b_weights.py --only vae --force")
         user_dma_core.set_dma_device(dev)
         user_dma_core.configure_clock_from_hardware()
         self.ne = T.resolve_engines(engines, False)
