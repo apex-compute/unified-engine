@@ -91,6 +91,7 @@ def emit_lstm(engine, plan, *, projection_fn=None, step_fn=None):
         raise ValueError('LSTM sequence must contain at least one timestep')
     addresses = {name: region[0] for name, region in plan.regions.items()}
 
+    lstm.strassen_zero(engine, plan)
     for layer_index, layer in enumerate(plan.layers):
         source = plan.input_address if layer_index == 0 else addresses['layer0_output']
         destination = addresses['layer0_output'] if layer_index == 0 else plan.output_address
@@ -100,10 +101,7 @@ def emit_lstm(engine, plan, *, projection_fn=None, step_fn=None):
         for name in states:
             for offset in range(0, width, 64):
                 lstm._copy(engine, plan.zero_address, addresses[name] + offset * 2, 64)
-        engine.matmat_mul_core(
-            M=plan.sequence, K=width, N=4 * width, A_DRAM_ADDR=source,
-            B_DRAM_ADDR=layer.input_weights, OUTPUT_DRAM_ADDR=addresses['input_gates'],
-            C_DRAM_ADDR=layer.input_bias, bias_mode='broadcast_N')
+        lstm.input_projection(engine, plan, layer, source, addresses['input_gates'])
 
         projection_fn(engine, plan, layer, addresses['hidden'], addresses['input_gates'])
         step_fn(engine, plan, addresses['input_gates'], addresses['cell'], destination)

@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import user_dma_core as udc
+from nn_lib import (strassen_levels, strassen_matmul_core_dram, strassen_online_sum_count,
+                    strassen_online_sums_core, strassen_online_tree, strassen_scratch_elements)
+from storage_format import StorageFormat, TensorFormats
 
 TANH_ARGUMENT_LIMIT = 4.0
 TANH_CHUNK_ELEMENTS = 4096
@@ -19,6 +22,10 @@ _TANH_NUMERATOR = (1 / 135135, 378 / 135135, 17325 / 135135, 1.0)
 _TANH_DENOMINATOR = (28 / 135135, 3150 / 135135, 62370 / 135135, 1.0)
 _TANH_NUMERATOR_BF16 = tuple(float(torch.tensor(value, dtype=torch.bfloat16)) for value in _TANH_NUMERATOR)
 _TANH_DENOMINATOR_BF16 = tuple(float(torch.tensor(value, dtype=torch.bfloat16)) for value in _TANH_DENOMINATOR)
+# Input projection [T, D] x W_ih^T by nn_lib's Strassen matmul (online leaves). Measured on the
+# board for 408 x 1536 -> 6144 BF16, one engine: level 1 0.89x, level 2 0.83x of the plain time.
+STRASSEN_LEVEL = 2
+STRASSEN_MIN_ROWS = 128
 
 
 def tanh_scratch_bytes(count: int) -> int:
@@ -55,6 +62,8 @@ class LSTMLayer:
     input_bias: int
     recurrent_bias: int
     recurrent_scales: int | None = None
+    # Strassen input projection; input_weights is then the first of its column slabs.
+    strassen: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +102,38 @@ def scratch_bytes(input_shape: tuple[int, int], *, compensated_cell: bool = Fals
     return (5 * sequence + 8 + int(compensated_cell and preserve_cell_residual)) * padded * 2 + tanh_scratch_bytes(padded)
 
 
+def _aligned(value):
+    return (int(value) + 127) // 128 * 128
+
+
+def strassen_level(input_shape: tuple[int, int]) -> int:
+    """Strassen level of the input projection of an LSTM on (T, D); 0 = plain matmul."""
+    sequence, width = map(int, input_shape)
+    padded = (width + 63) // 64 * 64
+    if sequence < STRASSEN_MIN_ROWS or padded >= 8192:
+        return 0
+    return strassen_levels(padded, 4 * padded, STRASSEN_LEVEL)
+
+
+def _strassen_layout(input_shape):
+    """(level, cell rows, cell columns, rows on Strassen, bytes per sum buffer, [(x, p) bytes per depth])."""
+    level = strassen_level(input_shape)
+    sequence, width = map(int, input_shape)
+    padded = (width + 63) // 64 * 64
+    rows = sequence - sequence % (1 << level)
+    n, k = 4 * padded >> level, padded >> level
+    depths = [(_aligned(2 * x), _aligned(2 * p)) for x, p in strassen_scratch_elements(rows, padded, 4 * padded, level)]
+    return level, n, k, rows, _aligned(n * k * 2), depths
+
+
+def strassen_bytes(input_shape: tuple[int, int]) -> int:
+    """Workspace of the Strassen input projection (sum buffers, then scratch); 0 when unused."""
+    level, _n, _k, _rows, sum_bytes, depths = _strassen_layout(input_shape)
+    if not level:
+        return 0
+    return strassen_online_sum_count(level) * sum_bytes + sum(x + p for x, p in depths)
+
+
 def quantize_recurrent_if8(weight):
     """Driver-compatible IF8 INT8 blocks, with negative BF16 scale tags.
 
@@ -118,7 +159,8 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
                  identity_address: int, zero_address: int, skip: bool = True,
                  recurrent_precision: str = "bf16", compensated_cell: bool = False,
                  preserve_cell_residual: bool = True, compensated_tanh: bool = False,
-                 fused_projection: bool = False, paired_sigmoid: bool = False) -> LSTMPlan:
+                 fused_projection: bool = False, paired_sigmoid: bool = False,
+                 strassen_address: int | None = None) -> LSTMPlan:
     """Pack PyTorch i/f/g/o parameters with optional IF8 recurrent matrices.
 
     Inputs/outputs are time-major [T, pad64(D)], with zero padding lanes. The
@@ -131,6 +173,9 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
     the matvec epilogue before the first gate BF16 writeback. The corrected
     1536-wide BF16 decoder can instead retain sigmoid high/low parts through
     the cell and hidden products, after a BF16 logit writeback.
+    strassen_address: strassen_bytes(input_shape) of workspace for a Strassen input
+    projection; None (or a shape strassen_level rejects) keeps the plain matmul.
+    The emitted program zeroes its scratch (strassen_zero) and makes its sums.
     """
     workspace_bytes = scratch_bytes(input_shape, compensated_cell=compensated_cell,
                                     preserve_cell_residual=preserve_cell_residual)
@@ -164,6 +209,9 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
         "identity": (identity_address, 64 * 64 * 2),
         "zero": (zero_address, 64 * 2),
     }
+    level = strassen_level(input_shape) if strassen_address is not None else 0
+    if level:
+        regions_to_check["strassen"] = (strassen_address, strassen_bytes(input_shape))
     ordered = sorted((int(address), int(address) + size, name)
                      for name, (address, size) in regions_to_check.items())
     for index, (start, end, name) in enumerate(ordered):
@@ -175,7 +223,7 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
     layers = []
     for index in range(2):
         addresses = []
-        recurrent_scales = None
+        recurrent_scales = cells = slabs = input_bias = None
         for prefix in ("weight_ih", "weight_hh"):
             weight = getattr(lstm_module, f"{prefix}_l{index}").detach().cpu()
             if weight.shape != (4 * width, width) or not torch.isfinite(weight).all():
@@ -183,7 +231,15 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
             packed = torch.zeros((4, padded, padded), dtype=torch.bfloat16)
             packed[:, :width, :width] = weight.reshape(4, width, width)
             matrix = packed.reshape(4 * padded, padded)
-            if prefix == "weight_hh" and recurrent_precision == "if8":
+            if prefix == "weight_ih" and level:
+                # Stored as 2^level input-column slabs W[:, slab j]: every Strassen cell is a
+                # contiguous row range of a slab, and leftover rows take one product per slab.
+                _level, n, k, _rows, _sum_bytes, _depths = _strassen_layout(input_shape)
+                slabs = [image.allocate(matrix[:, j * k:(j + 1) * k].contiguous(), alignment=128)
+                         for j in range(1 << level)]
+                cells = {(i, j): slabs[j] + i * n * k * 2 for i in range(1 << level) for j in range(1 << level)}
+                addresses.append(slabs[0])
+            elif prefix == "weight_hh" and recurrent_precision == "if8":
                 codes, scales = quantize_recurrent_if8(matrix)
                 addresses.append(image.allocate(codes, alignment=128))
                 recurrent_scales = image.allocate(scales, alignment=128)
@@ -206,7 +262,25 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
             if not torch.isfinite(packed).all():
                 raise ValueError("LSTM bias cannot be represented as finite BF16")
             addresses.append(image.allocate(packed.flatten(), alignment=128))
-        layers.append(LSTMLayer(*addresses, recurrent_scales=recurrent_scales))
+            if prefix == "bias_ih":
+                input_bias = packed.flatten()
+        strassen = None
+        if level:
+            _level, n, k, rows, sum_bytes, depths = _strassen_layout(input_shape)
+            if 2 * _aligned(4 * padded * 2) > sum_bytes:
+                raise ValueError("Strassen sum buffer cannot hold the leftover-row accumulators")
+            sums = [strassen_address + index * sum_bytes for index in range(strassen_online_sum_count(level))]
+            cursor = strassen_address + len(sums) * sum_bytes
+            scratch = []
+            for x_bytes, p_bytes in depths:
+                scratch.append((cursor, cursor + x_bytes))
+                cursor += x_bytes + p_bytes
+            tree = strassen_online_tree(cells, sums, level, input_bias.float(),
+                                        lambda value: image.allocate(value.contiguous(), alignment=128))
+            strassen = {"level": level, "rows": rows, "n": n, "k": k, "cells": cells, "slabs": slabs,
+                        "sums": sums, "tree": tree, "scratch": scratch,
+                        "zero": (scratch[0][0], (cursor - scratch[0][0]) // 2)}
+        layers.append(LSTMLayer(*addresses, recurrent_scales=recurrent_scales, strassen=strassen))
 
     cursor = scratch_address
     regions = {}
@@ -235,6 +309,49 @@ def _copy(engine, source: int, output: int, count: int) -> None:
         take = min(count - offset, udc.URAM_NEAR_FULL_ELEMENTS)
         engine.accelerator_memory_to_sram(source + offset * 2, 0, take)
         engine.sram_to_accelerator_memory(0, output + offset * 2, take)
+
+
+def strassen_zero(engine, plan: LSTMPlan) -> None:
+    """Zero the Strassen scratch once per LSTM operation: other operations share the
+    workspace and fresh DRAM can hold NaN. Needs the compile's URAM-sized zero buffer."""
+    strassen = plan.layers[0].strassen
+    if strassen is None:
+        return
+    start, count = strassen["zero"]
+    chunk = udc.URAM_NEAR_FULL_ELEMENTS
+    engine.accelerator_memory_to_sram(plan.zero_address, 0, chunk)
+    for offset in range(0, count, chunk):
+        engine.sram_to_accelerator_memory(0, start + offset * 2, min(chunk, count - offset))
+
+
+def input_projection(engine, plan: LSTMPlan, layer: LSTMLayer, source: int, output: int) -> None:
+    """Gate rows [T, 4D] = source [T, D] x W_ih^T + b, every timestep at once."""
+    width, strassen = plan.padded_width, layer.strassen
+    if strassen is None:
+        engine.matmat_mul_core(M=plan.sequence, K=width, N=4 * width, A_DRAM_ADDR=source,
+                               B_DRAM_ADDR=layer.input_weights, OUTPUT_DRAM_ADDR=output,
+                               C_DRAM_ADDR=layer.input_bias, bias_mode="broadcast_N")
+        return
+    level, rows, k, N = strassen["level"], strassen["rows"], strassen["k"], 4 * width
+    strassen_online_sums_core(engine, strassen["cells"], strassen["n"], k, strassen["sums"], level)
+    # share_ops=False: BigCodec bins only allow closed (literal) jumps; shared ops jump through registers.
+    strassen_matmul_core_dram(engine, rows, width, N, source, strassen["tree"], output, strassen["scratch"], share_ops=False)
+    # Leftover rows (T mod 2^level): one product per input-column slab, summed in FP16 through
+    # two row buffers in the first sum buffer, which is free until the next layer's sums.
+    F, B = StorageFormat.FP16, StorageFormat.BF16
+    buffers = (strassen["sums"][0], strassen["sums"][0] + _aligned(N * 2))
+    for row in range(rows, plan.sequence):
+        previous = None
+        for j, slab in enumerate(strassen["slabs"]):
+            last = j == len(strassen["slabs"]) - 1
+            destination = output + row * N * 2 if last else buffers[j % 2]
+            bias = (dict(C_DRAM_ADDR=layer.input_bias, bias_mode="broadcast_N") if previous is None
+                    else dict(C_DRAM_ADDR=previous, bias_mode="full_matrix"))
+            engine.matmat_mul_core(M=1, K=k, N=N, A_DRAM_ADDR=source + (row * width + j * k) * 2,
+                                   B_DRAM_ADDR=slab, OUTPUT_DRAM_ADDR=destination,
+                                   formats=TensorFormats(output=B if last else F, bias=B if previous is None else F),
+                                   **bias)
+            previous = destination
 
 
 def sigmoid_identity(engine, source: int, output: int, count: int,
@@ -547,6 +664,7 @@ def _emit_lstm_unrolled(engine, plan: LSTMPlan) -> None:
         engine.eltwise_core_dram(M=count // 64, N=64, dram_a=left,
                                  dram_b=right, dram_out=output, mode=mode)
 
+    strassen_zero(engine, plan)
     for layer_index, layer in enumerate(plan.layers):
         source = plan.input_address if layer_index == 0 else address["layer0_output"]
         destination = address["layer0_output"] if layer_index == 0 else plan.output_address
@@ -554,10 +672,7 @@ def _emit_lstm_unrolled(engine, plan: LSTMPlan) -> None:
         for name in (("hidden", "cell", "cell_low") if plan.compensated_cell and plan.preserve_cell_residual else ("hidden", "cell")):
             for offset in range(0, width, 64):
                 _copy(engine, plan.zero_address, address[name] + offset * 2, 64)
-        engine.matmat_mul_core(M=plan.sequence, K=width, N=4 * width,
-                               A_DRAM_ADDR=source, B_DRAM_ADDR=layer.input_weights,
-                               OUTPUT_DRAM_ADDR=address["input_gates"],
-                               C_DRAM_ADDR=layer.input_bias, bias_mode="broadcast_N")
+        input_projection(engine, plan, layer, source, address["input_gates"])
         for timestep in range(plan.sequence):
             sram_fusion = (width <= TANH_CHUNK_ELEMENTS
                 and (plan.recurrent_precision == "if8" or width * 64 <= udc.URAM_NEAR_FULL_ELEMENTS))

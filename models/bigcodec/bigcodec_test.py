@@ -21,7 +21,7 @@ Hardware needs the RK AXI-256 CONV/MAXPOOL queue-CONFIG image.
 
 Usage:
   python models/bigcodec/bigcodec_test.py --dev xdma0 [--input test_samples/apex.wav]
-                                          [--run-from-bin] [--no-ref]
+                                          [--run-from-bin] [--no-ref] [--no-strassen]
 """
 
 from __future__ import annotations
@@ -122,6 +122,9 @@ def main(argv=None) -> int:
                     help="skip compiling and run the existing bin (error if missing)")
     ap.add_argument("--no-ref", action="store_true",
                     help="skip the CPU round trip and the waveform/token comparison")
+    ap.add_argument("--no-strassen", action="store_true",
+                    help="compile the LSTM input projections on the plain matmul (A/B timing); "
+                         "has no effect with --run-from-bin")
     args = ap.parse_args(argv)
 
     py = sys.executable
@@ -142,6 +145,8 @@ def main(argv=None) -> int:
         cmd = [py, "-u", str(COMPILE), "--input", str(clip), "--checkpoint", str(CHECKPOINT),
                "--output", str(BIN)] + COMPILE_FLAGS
         cmd.append("--force")
+        if args.no_strassen:
+            cmd.append("--no-strassen")
         rc, _, _ = _stream(cmd)
         timings["compile_s"] = round(time.perf_counter() - t0, 3)
         if rc != 0 or not BIN.is_file():
