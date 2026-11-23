@@ -38,6 +38,7 @@ import torch
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))  # repo root, for user_dma_core
 
+
 from kokoro_cpu_reference import KokoroModel  # same folder; see the module docstring
 BIN_DIR = os.path.join(SCRIPT_DIR, "kokoro_bin")
 HF_REPO = "hexgrad/Kokoro-82M"
@@ -260,6 +261,20 @@ def main():
         result["from_bin"] = rep["from_bin"]
         result["flop_count_fallbacks"] = rep["flop_count_fallbacks"]
         result["debug_snr"] = bool(args.debug_snr)
+        # Weights in DRAM: kokoro_fpga uploads every constant once into its params region
+        # (_upload_const, 2 bytes per element, bump-allocated from KOKORO_PARAMS_BASE; a replay
+        # restores the same map), plus the per-engine weight replicas when multi-engine.
+        try:
+            import math
+            import kokoro_fpga as _kf
+            _w_regions = [(_kf.KOKORO_PARAMS_BASE,
+                           max(a + 2 * math.prod(k[1]) for k, a in _kf._UP_CACHE.items()))]
+            _replicas = _kf._CONTROLLER_REPLICAS[0]
+            if _replicas is not None:
+                _w_regions += [(base, cur) for (base, _), cur in zip(_replicas.windows, _replicas._cursor)]
+        except Exception:
+            _w_regions = []
+        result["dram_weight_regions"] = [[int(_a), int(_b)] for _a, _b in (_w_regions)]
         print("TEST_RESULT:" + json.dumps(result))
         return
 

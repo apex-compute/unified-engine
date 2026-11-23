@@ -1327,6 +1327,23 @@ def run_test(test: dict, verbose: bool = False,
     return result
 
 
+def _dram_weight_bytes(regions) -> int:
+    """Bytes covered by a list of [base, end) DRAM ranges, overlaps counted once; 0 if none."""
+    try:
+        spans = sorted((int(b), int(e)) for b, e in (regions or []) if int(e) > int(b))
+    except (TypeError, ValueError):
+        return 0
+    total, cur_b, cur_e = 0, None, None
+    for b, e in spans:
+        if cur_e is None or b > cur_e:
+            if cur_e is not None:
+                total += cur_e - cur_b
+            cur_b, cur_e = b, e
+        else:
+            cur_e = max(cur_e, e)
+    return total + (cur_e - cur_b if cur_e is not None else 0)
+
+
 def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> dict:
     result = {
         "name": test["name"],
@@ -1615,6 +1632,14 @@ def _test_lines(r: dict, test: dict) -> list:
         lines.append("    weight  none on disk: the script loads its weights from the checkpoint every run")
     if "program" not in kinds:
         lines.append("    program none on disk: the script compiles its programs every run")
+    # The weights actually placed in DRAM (the weight bin above is the file on disk):
+    # the union of the [base, end) ranges the script reports in TEST_RESULT
+    # "dram_weight_regions" (shared copies count once, per-engine copies each count).
+    dram = _dram_weight_bytes(report.get("dram_weight_regions"))
+    if dram:
+        lines.append(f"    dram    weights {dram / 1e6:.1f} MB loaded in DRAM")
+    else:
+        lines.append("    dram    weights not reported by the script")
 
     lines += _performance_lines(r)
     missing = [k for k in _REPORT_REQUIRED if report.get(k) in (None, "", [])]

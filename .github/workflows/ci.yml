@@ -197,7 +197,10 @@ jobs:
           RUN_ARGS: ${{ steps.cfg.outputs.args }}
         run: |
           read -r -a ARGS <<< "$RUN_ARGS"
-          ./run_ci.sh "${ARGS[@]}"
+          # run_ci.log: the conv model verdicts (user_hw_test.py prints them, its
+          # summary file has no pass/fail column) for the model table in the summary.
+          set -o pipefail
+          ./run_ci.sh "${ARGS[@]}" 2>&1 | tee run_ci.log
 
       - name: Collect the Alveo U50 leg
         if: ${{ always() && steps.cfg.outputs.alveo_u50 == 'true' }}
@@ -226,6 +229,7 @@ jobs:
             model_auto_test_results_pass1.txt
             model_auto_test_results_shuffle.txt
             user_hw_test_summary.md
+            run_ci.log
             alveo_u50/
           if-no-files-found: warn
 
@@ -247,6 +251,8 @@ jobs:
             echo
           }
           {
+            # First: one row per model with a single verdict over both boards.
+            python3 .github/scripts/model_table.py . || echo "_Model summary table not produced; see the job log._"
             echo "## Unified Engine HW CI: model_auto_test.py"
             echo
             if [ -f model_auto_test_results_pass1.txt ]; then
@@ -300,8 +306,12 @@ jobs:
             // The whole job, so an Alveo U50 failure (or an alveo_u50-only run,
             // where the kintex7 step is skipped) is reflected too.
             const ciOutcome = `${{ job.status }}`;
-            const MAX_MODEL_CHARS = 40000;
-            const MAX_HW_CHARS = 15000;
+            // Short on purpose: the full files are in the artifact and the job summary.
+            // model_auto_test.py: the run header + the first test, then the last tests
+            //   and "Overall". user_hw_test.py: the table header and a row, then the
+            //   verdict (Dynamic vs Legacy, Status, RNG State, Hardware Info).
+            const MAX_MODEL_CHARS = 6000;
+            const MAX_HW_CHARS = 2500;
 
             function readResult(name) {
               try {
@@ -317,7 +327,7 @@ jobs:
             // The head carries that header, the tail carries the verdict
             // (Status/RNG State for the HW summary, "Overall: N/M passed" for
             // the model run). Only the intermediate rows are expendable.
-            function clipMiddle(text, maxChars) {
+            function clipMiddle(text, maxChars, headFrac = 0.55) {
               if (text.length <= maxChars) return text;
               const lines = text.split('\n');
 
@@ -330,10 +340,10 @@ jobs:
                 && /^\|[\s|:-]+\|$/.test(lines[1]);
               const tableHead = hasTable ? lines.slice(0, 2) : [];
 
-              // Assumes maxChars >> NOTE_RESERVE; both callers pass >= 15000.
-              const NOTE_RESERVE = 400;  // elision note + re-emitted table header
+              // The re-emitted table header is counted in the reserve.
+              const NOTE_RESERVE = 200 + tableHead.reduce((n, l) => n + l.length + 1, 0);
               const budget = Math.max(maxChars - NOTE_RESERVE, 0);
-              const headBudget = Math.floor(budget * 0.55);
+              const headBudget = Math.floor(budget * headFrac);
 
               const head = [];
               let used = 0;
@@ -342,6 +352,10 @@ jobs:
                 head.push(line);
                 used += line.length + 1;
               }
+
+              // A head that is only the table header would render as an empty table
+              // above the note; the bridge re-emits that header for the tail anyway.
+              if (hasTable && head.length <= 2) head.length = 0;
 
               const tail = [];
               used = 0;
@@ -369,9 +383,9 @@ jobs:
             // An alveo_u50-only run has no kintex7 results; report the U50 leg's.
             const dir = `${{ steps.cfg.outputs.kintex7 }}` === 'false' ? 'alveo_u50/' : '';
             const modelResults = clipMiddle(
-              readResult(`${dir}model_auto_test_results.txt`), MAX_MODEL_CHARS);
+              readResult(`${dir}model_auto_test_results.txt`), MAX_MODEL_CHARS, 0.3);
             const hwResults = clipMiddle(
-              readResult(`${dir}user_hw_test_summary.md`), MAX_HW_CHARS);
+              readResult(`${dir}user_hw_test_summary.md`), MAX_HW_CHARS, 0.4);
 
             const status = ciOutcome === 'success'
               ? '✅ PASSED'

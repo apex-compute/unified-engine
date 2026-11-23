@@ -1344,6 +1344,11 @@ def main():
     t0 = _time.perf_counter()
     ue = MobileNetV2_UnifiedEngine(script_dir=SCRIPT_DIR, run_from_bin=args.run_from_bin)
     ue.software_reset()
+    try:
+        # Weights end: the compile allocates a small zero constant in the params region afterwards.
+        _weight_regions = [(ue._params_dram_base, ue._next_params_dram_addr)]
+    except Exception:
+        _weight_regions = None
     flop_meter = _install_flop_meter(ue)
     t_weights = _time.perf_counter()
     _original_print(f"  Weights: {t_weights - t0:.3f}s")
@@ -1410,6 +1415,7 @@ def main():
     result["output"] = f"top-1: {label} (class {predicted_idx})"
     result["predicted_class"] = int(predicted_idx)
     result["wall_exec_s"] = round(ue.last_inference_seconds, 6)
+    result["dram_weight_regions"] = [[int(_a), int(_b)] for _a, _b in (_weight_regions)] if _weight_regions else [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]]
     _original_print("TEST_RESULT:" + _json.dumps(result))
 
     if args.diff:

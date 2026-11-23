@@ -982,6 +982,20 @@ def main():
         # perfect run.
         print(f"\n--- Decode run ---")
         _, text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+        # Weights in DRAM: the LM weights lm_weight_init loaded from the params base, the
+        # vision weights (without the identity placed after them) when phase A loaded them --
+        # same window, overwritten by the LM, so the union counts that DRAM once -- plus each
+        # engine's private decode shard copies when --multi-core > 1.
+        try:
+            _w_regions = [(ue._params_dram_base, ue._lm_weight_end)]
+            if getattr(ue, "_vis_weight_start", None) is not None:
+                _w_regions.append((ue._vis_weight_start, ue._vis_identity_dram))
+            if ue.mc_arena is not None:
+                _w_regions += [(_a["base"], _a["base"] + _a["size"])
+                               for _a in ue.mc_arena.weight_allocations()]
+            _dram_weight_regions = [[int(_a), int(_b)] for _a, _b in (_w_regions)]
+        except Exception:
+            _dram_weight_regions = None
         # Structured result for harness checks that prefer it to scraping stdout.
         print("TEST_RESULT: " + json.dumps({
             "model": "qwen2.5_vl_3b",
@@ -993,6 +1007,7 @@ def main():
             "decode_gflops": ue._decode_gflops,
             "prefill_gflops": getattr(ue, "_prefill_gflops", None),
             "vision_gflops": getattr(ue, "_vis_gflops", None),
+            "dram_weight_regions": _dram_weight_regions,
             # Shared report keys (model_auto_test.py). Every number is one the run already
             # measured: HW seconds from the device latency counter, GFLOP from the compiled
             # programs' FLOP counts (the same pair behind the [Vision] / [LM] GFLOPS lines).

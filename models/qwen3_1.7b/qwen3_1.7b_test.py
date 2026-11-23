@@ -49,6 +49,18 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, INSTRUCTION_SIZE_BYTES, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 
+
+def _weight_dram_no_rope(ue):
+    """Weight DRAM: the params region without the host RoPE tables (not weights)."""
+    try:
+        r0 = min(ue.DRAM_ADDR_ROPE_LOCAL, ue.DRAM_ADDR_ROPE_GLOBAL)
+        r1 = max(ue.DRAM_ADDR_ROPE_LOCAL + ue.weight_defs["ROPE_LOCAL_SIZE"],
+                 ue.DRAM_ADDR_ROPE_GLOBAL + ue.weight_defs["ROPE_GLOBAL_SIZE"])
+        return [[int(_a), int(_b)] for _a, _b in ([(ue._params_dram_base, r0),
+                                          (r1, ue._next_params_dram_addr)])]
+    except Exception:
+        return [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]]
+
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
 
@@ -1824,6 +1836,7 @@ def main():
         "prefill_hw_ms": _pf_hw_us / 1e3 if _pf_hw_us is not None else None,
         "decode_first_hw_ms": _dec_lats_us[0] / 1e3 if _dec_lats_us else None,
         "decode_avg_hw_ms": _dec_hw_us / len(_dec_lats_us) / 1e3 if _dec_lats_us else None,
+        "dram_weight_regions": _weight_dram_no_rope(ue),
         # decode_first_tok_s: HW-latency rate of the first decode step;
         # decode_avg_tok_s: wall-clock average over the loop (the "speed:" printed above).
         **_shared_report(

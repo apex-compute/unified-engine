@@ -4293,6 +4293,14 @@ def main():
     _dec_lats_us = list(getattr(ue, "_report_decode_lats_us", []))
     _stages.append(("decode", sum(_dec_lats_us) / 1e6,
                     gpt * len(_dec_lats_us) / 1e9 if isinstance(gpt, (int, float)) else None))
+    # Weights in DRAM: the params region (LM + connector + MoonViT weights) without the RoPE
+    # table that _load_rope_host places between the LM and the connector weights.
+    try:
+        _rope_end = ue.DRAM_ADDR_ROPE + ue.weight_defs["ROPE_SIZE"]
+        _dram_weight_regions = [[int(_a), int(_b)] for _a, _b in ([(ue._params_dram_base, ue.DRAM_ADDR_ROPE),
+                                                        (_rope_end, ue.get_params_dram_addr())])]
+    except Exception:
+        _dram_weight_regions = None
     _original_print("TEST_RESULT:" + json.dumps({
         # the decode loop's own "Stop token N reached." status line is not model output
         "decoded_text":        re.sub(r"\n?Stop token \d+ reached\.\s*$", "", answer.strip()).strip(),
@@ -4306,6 +4314,7 @@ def main():
         "prefill_hw_ms":       _pf["hw_us"] / 1e3 if "hw_us" in _pf else None,
         "decode_first_hw_ms":  _dec_lats_us[0] / 1e3 if _dec_lats_us else None,
         "decode_avg_hw_ms":    sum(_dec_lats_us) / len(_dec_lats_us) / 1e3 if _dec_lats_us else None,
+        "dram_weight_regions":   _dram_weight_regions,
         # decode_first_tok_s: HW-latency rate of the first decode step;
         # decode_avg_tok_s: the wall-clock tok/s printed above.
         **_shared_report(

@@ -1627,6 +1627,14 @@ def main():
     result["wall_s"] = round(st["wall_s"], 3)
     result["decode_wall_s"] = round(st["dec_wall_s"], 3)
     result["from_bin"] = bool(ue.from_bin)
+    # Weights in DRAM: the model map's params region plus, when sharded, each engine's private
+    # copies of the decode projections ([weight_base, weight_base + arena usage) per engine).
+    try:
+        _shard_regions = [(ue.arena.region(e).weight_base, ue.arena.region(e).weight_base + used)
+                          for e, used in enumerate(ue.arena.usage())] if ue.arena is not None else []
+    except Exception:
+        _shard_regions = []
+    result["dram_weight_regions"] = [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]] + [[int(_a), int(_b)] for _a, _b in (_shard_regions)]
     report("TEST_RESULT:" + json.dumps(result))
 
 

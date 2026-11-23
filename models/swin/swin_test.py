@@ -1905,6 +1905,7 @@ def main():
     result["output"] = f"top-1: {label} (class {predicted_idx})"
     result["predicted_class"] = int(predicted_idx)
     result["wall_exec_s"] = round(t_exec - t_exec_start, 3)
+    result["dram_weight_regions"] = [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]]
     _original_print(f"TEST_RESULT: {_json.dumps(result)}")
 
 

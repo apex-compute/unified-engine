@@ -4997,6 +4997,7 @@ def main():
         result["output"] = output
         result["decoder_runs"] = len(dec_log)
         result["from_bin"] = bool(bins_exist)
+        result["dram_weight_regions"] = [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]]
         result.update(extra or {})
         return "TEST_RESULT:" + json.dumps(result)
 

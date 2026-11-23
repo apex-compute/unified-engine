@@ -4491,6 +4491,16 @@ def main():
     run_result["input"] = (args.prompt if (args.prompt is not None
                                            and tuple(ue.prefill_seq) != _default_tokens)
                            else ue.tokenizer.decode(list(ue.prefill_seq)))
+    # Weight DRAM: the params image, plus every engine's private shard copies (multi-core).
+    try:
+        _weight_regions = [(ue._params_dram_base, ue._next_params_dram_addr)]
+        _arena = getattr(ue.shard_group, "arena", None)
+        if _arena is not None:
+            _weight_regions += [(_a["base"], _a["base"] + _a["size"])
+                                for _a in _arena.weight_allocations()]
+        run_result["dram_weight_regions"] = [[int(_a), int(_b)] for _a, _b in (_weight_regions)]
+    except Exception:
+        run_result["dram_weight_regions"] = None
     print("Gemma3 test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 

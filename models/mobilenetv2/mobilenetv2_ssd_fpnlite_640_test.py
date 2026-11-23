@@ -2456,6 +2456,7 @@ def main():
     else:
         result["output"] = f"no detections at score >= {args.score_thresh}"
     result["wall_exec_s"] = round(ue.last_inference_seconds, 6)
+    result["dram_weight_regions"] = [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]]
     _original_print("TEST_RESULT:" + _json.dumps(result))
 
 

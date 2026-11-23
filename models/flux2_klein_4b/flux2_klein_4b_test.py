@@ -1072,6 +1072,27 @@ def _paths(cfg: dict) -> dict:
             if k.endswith(("_bin", "_meta", "vae_weights"))}
 
 
+def _dram_weight_regions(ue: "Flux2KleinEngine", paths: dict):
+    """TEST_RESULT "dram_weight_regions": DRAM the weights of this run occupy, or None.
+
+    The TE image, the DiT image and the VAE constant image time-share the params arena from
+    params_base (each phase overwrites the previous one), so the arena counts the largest of
+    them, not their sum. The token embedding table is resident on its own above the tensors
+    (nothing overwrites it) whenever the TE ran on the board, so it adds to that."""
+    try:
+        pb, t = int(ue.params_base), ue.timings
+        regions = [(pb, pb + os.path.getsize(paths["params_dit_bin"]))]
+        if "te_device_s" in t:                                  # TE phase ran on the board
+            regions.append((pb, pb + os.path.getsize(paths["params_te_bin"])))
+            eb = int(ue.embed_base)
+            regions.append((eb, eb + os.path.getsize(paths["embed_tokens_bin"])))
+        if "vae_device_s" in t:                                 # VAE weights (not its constant matrices)
+            regions.append((int(ue.vae.const_weights_base), int(ue.vae.const_base) + int(ue.vae.const_size)))
+        return [[int(_a), int(_b)] for _a, _b in (regions)]
+    except Exception:
+        return None
+
+
 def load_embed_tokens(cfg: dict, paths: dict) -> torch.Tensor:
     te = cfg["text_encoder"]
     with open(paths["embed_tokens_bin"], "rb") as f:
@@ -1320,6 +1341,7 @@ def main(argv=None) -> int:
     result.update({"peak_gflops": peak, "stages": stages, "total_hw_s": total_hw_s, "total_gflop": total_gflop,
                    "avg_gflops": avg_gflops,
                    "avg_pct_peak": 100.0 * avg_gflops / peak if (avg_gflops is not None and peak) else None})
+    result["dram_weight_regions"] = _dram_weight_regions(ue, paths)
     print("TEST_RESULT: " + json.dumps(result))
     return 0
 

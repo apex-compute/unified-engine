@@ -332,6 +332,7 @@ class Flux2VaeOneShot:
         if "IDENT64" not in self.consts:
             self.consts["IDENT64"] = self._calloc(64 * 64 * 2)
         fixed_end = self._const
+        self.const_weights_base = fixed_end      # the weights start here (TEST_RESULT dram_weight_regions)
         # ---- dry walk: const image size and the scratch maxima
         self._scratch_max, self._scratch_addr = {}, {}
         self._cur = self.arena_end = 0

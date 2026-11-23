@@ -168,7 +168,8 @@ class Session:
                   "te_s": ue.timings["te_s"], "dit_s": ue.timings["dit_s"], "vae_s": ue.timings["vae_s"],
                   "total_s": total, "setup_s": setup_s,
                   "reload": {"programs": programs_loaded, "weights": True, "weight_bytes": weight_bytes,
-                             "embed": embed_sent, "embed_bytes": embed_bytes}}
+                             "embed": embed_sent, "embed_bytes": embed_bytes},
+                  "dram_weight_regions": T._dram_weight_regions(ue, self.paths)}
         result.update(phase_stats(ue.timings, self.ne, total))
         for name, ph in result["phases"].items():
             _log(f"  {name.upper()}: {ph['flops'] / 1e12:.2f} TFLOP in {ph['device_s']:.1f}s on the device = "

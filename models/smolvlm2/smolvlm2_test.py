@@ -3081,6 +3081,18 @@ def main():
         _row["engines"] = _n_eng
         _row["pct_peak"] = (round(100.0 * _row["gflops"] / (_peak_one * _n_eng), 2)
                             if (_row["gflops"] is not None and _peak_one) else None)
+    # Weights in DRAM: the params region up to the first non-weight table tensor_init places
+    # after them (ROPE_COS_DRAM; also restored by load_snapshot), plus the per-engine copies of
+    # the decode gate/up weights when --decode-engines > 1.
+    try:
+        _w_regions = [(ue._params_dram_base, ue.ROPE_COS_DRAM)]
+        _w_arena = getattr(ue, "_decode_weight_arena", None)
+        if _w_arena is not None:
+            _w_regions += [(_w_arena.region(e).weight_base, _w_arena.region(e).weight_base + used)
+                           for e, used in enumerate(_w_arena.usage())]
+        _dram_weight_regions = [[int(_a), int(_b)] for _a, _b in (_w_regions)]
+    except Exception:
+        _dram_weight_regions = None
     _original_print("TEST_RESULT: " + json.dumps({
         "decoded_text": ue.tokenizer.decode(_text_ids),
         "generated_token_ids": [int(t) for t in hw_tokens],
@@ -3096,6 +3108,7 @@ def main():
         "prefill_hw_ms": _pf_hw_us / 1e3 if _pf_hw_us is not None else None,
         "decode_first_hw_ms": _dec_lats_us[0] / 1e3 if _dec_lats_us else None,
         "decode_avg_hw_ms": _dec_hw_us / len(_dec_lats_us) / 1e3 if _dec_lats_us else None,
+        "dram_weight_regions": _dram_weight_regions,
         # decode_first_tok_s: HW-latency rate of the first decode step;
         # decode_avg_tok_s: wall-clock average over the loop (the "decode ... tok/s" above).
         **_shared,

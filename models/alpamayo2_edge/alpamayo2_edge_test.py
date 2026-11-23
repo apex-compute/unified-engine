@@ -2091,6 +2091,9 @@ def main():
               "prefill_tokens": int(P), "decoded_tokens": len(out),
               "decode_first_tok_s": (1e6 / dec_step_us[0]) if dec_step_us and dec_step_us[0] else None,
               "decode_avg_tok_s": (len(dec_step_us) * 1e6 / dec_us) if dec_us else None}
+    # weights live once, in the primary's params region (all engines read that copy); the workers'
+    # params windows only hold kernel constants
+    result["dram_weight_regions"] = [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]]
     print("TEST_RESULT:" + json.dumps(result))
     print("PASS" if ok else f"FAIL (gates: vision/projector snr >= {args.min_snr} dB, no NaN, trajectory max err <= {args.max_traj_err} m)")
     sys.exit(0 if ok else 1)

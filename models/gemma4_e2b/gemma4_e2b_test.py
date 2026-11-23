@@ -2482,6 +2482,43 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         except Exception:
             return None
 
+    def _weight_dram_regions(self):
+        """DRAM ranges [base, end) holding weights in this run (TEST_RESULT "dram_weight_regions").
+
+        The LM weights the params allocator placed (up to the _lm_weight_dram_bytes
+        snapshot, without the vision identity allocated last), every engine's private
+        projection shards, and the vision weights when the encoder loaded them. Audio
+        weights are not counted: their end address is not recorded. None on any error."""
+        try:
+            regions = []
+            arena = getattr(self, "mc_arena", None)
+            identity = getattr(self, "_vis_identity_dram", None)
+            if self._tiled_map:
+                # No params window: allocate_params_dram carved each section from the
+                # shared pool, in order, until the snapshot was taken.
+                staged = 0
+                for item in arena.shared_allocations():
+                    if staged >= self._lm_weight_dram_bytes:
+                        break
+                    if not (item["what"] == "params"
+                            or self._dram_addresses.get(item["what"]) == item["base"]):
+                        continue
+                    staged += item["size"]
+                    if item["base"] != identity:
+                        regions.append((item["base"], item["base"] + item["size"]))
+            else:
+                regions.append((self._params_dram_base,
+                                identity if identity is not None
+                                else self._params_dram_base + self._lm_weight_dram_bytes))
+            if arena is not None:
+                regions += [(item["base"], item["base"] + item["size"])
+                            for item in arena.weight_allocations()]
+            if getattr(self, "_vis_weight_end", None) is not None:
+                regions.append((self._vis_weight_start, self._vis_weight_end))
+            return [[int(_a), int(_b)] for _a, _b in (regions)]
+        except Exception:
+            return None
+
     def run_result(self) -> dict:
         """The run's headline numbers as one flat dict (the TEST_RESULT line).
 
@@ -2593,6 +2630,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "decode_gflops_model": dec_model / (dec_us * 1e3) if dec_model and dec_us else None,
             "final_seq_len": self.seq_len,
             "decoded_text": _g("_decoded_text"),
+            "dram_weight_regions": self._weight_dram_regions(),
         }
 
     def write_run_summary(self, out_path: str, args) -> str:

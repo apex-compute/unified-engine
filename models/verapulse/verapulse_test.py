@@ -11632,6 +11632,31 @@ def main():
             "forward_wall_s": _fwd_rows[-1] if _fwd_rows else None,
         }
         result.update(ue.stage_report())
+        try:
+            # DRAM bytes holding weights: [params base, weight_init end) -- the AE time table the
+            # compile phase allocates after it is not a weight -- minus the non-weight constants
+            # weight_init interleaves (vision zeros / 1/H vectors, identity, rope tables), plus the
+            # per-engine vision controller replicas (extra copies of q/k/v/o/fc1/fc2, >= 8 GiB boards).
+            _p0 = int(ue._params_dram_base)
+            _p1 = _p0 + int(ue._params_ofs_after_weight_init)
+            _H = int(ue._cfg["vision"]["hidden_size"])
+            _rope = int(ue.PREFILL_MAX_SEQ_LEN) * 2 * int(ue.HEAD_DIM) * 2
+            _holes = 0
+            for _attr, _nb in (("vis_zeros_addr", _H * 2), ("vis_inv_n_addr", _H * 2),
+                               ("identity_addr", UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2),
+                               ("ROPE_PACKED_DRAM", _rope),
+                               ("ROPE_PACKED_GQA_DRAM", _rope * int(ue.GROUP_SIZE))):
+                _a = getattr(ue, _attr, None)
+                if isinstance(_a, int) and _p0 <= _a and _a + _nb <= _p1:
+                    _holes += _nb
+            _wregions = [(_p0, _p1)]
+            _reps = getattr(ue, "_vision_replicas", None)
+            for _src, _size, _addrs in (_reps.records if _reps is not None else []):
+                _wregions += [(int(_a), int(_a) + int(_size)) for _a in set(_addrs)]
+            _wb = [[int(_a), int(_b)] for _a, _b in (_wregions)]
+            result["dram_weight_regions"] = None if _wb is None else _wb - _holes
+        except Exception:
+            result["dram_weight_regions"] = None
         _original_print("TEST_RESULT: " + json.dumps(result))
         return
 

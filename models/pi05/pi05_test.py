@@ -9218,6 +9218,29 @@ def main():
                          f"max {float(actions.max()):.4f}, finite={finite}"),
               "actions_finite": finite}
     result.update(getattr(ue, "_stage_report", None) or {})
+    try:
+        # DRAM bytes holding weights: [params base, weight_init end) -- the identity matrix, attention
+        # bias and rope/time tables allocated after it in the params region are not weights -- plus
+        # every extra per-engine vision weight set (controller windows / params headroom / tensor DRAM).
+        _p0 = int(ue._params_dram_base)
+        _wofs = getattr(ue, "_params_ofs_after_weight_init", None)
+        if _wofs is None:       # --run-from-bin: the compile run recorded it in the manifest sig
+            _wofs = ue.sig["params_ofs_after_weight_init"]
+        _wregions = [(_p0, _p0 + int(_wofs))]
+        _vblobs = getattr(ue, "_vis_packed_layer_blobs", None) or []
+        for _wset in (getattr(ue, "_vis_weight_sets", None) or []):
+            for _la, _lb in zip(_wset, _vblobs):
+                for _k in ue._VIS_COPY_KEYS:
+                    _nb = len(_lb[_k]) // 34
+                    _wregions.append((int(_la[f"{_k}_scale"]), int(_la[f"{_k}_scale"]) + _nb * 2))
+                    _wregions.append((int(_la[f"{_k}_data"]), int(_la[f"{_k}_data"]) + _nb * 32))
+        # --run-from-bin: the replayed controller-window / tensor-DRAM copies, (dst, src, bytes)
+        for _dst, _src, _n in (((getattr(ue, "_manifest", None) or {}).get("vis_weight_copies") or {})
+                               .get("blobs") or []):
+            _wregions.append((int(_dst), int(_dst) + int(_n)))
+        result["dram_weight_regions"] = [[int(_a), int(_b)] for _a, _b in (_wregions)]
+    except Exception:
+        result["dram_weight_regions"] = None
     print("TEST_RESULT: " + json.dumps(result))
 
 

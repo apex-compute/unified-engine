@@ -2696,6 +2696,16 @@ def main():
     run_result = ue.run_llama()
     run_result["input"] = (args.prompt if args.prompt is not None
                            else ue.tokenizer.decode(list(ue.prefill_seq)))
+    # Weight DRAM: the params image, plus every engine's private decode shard copies (multi-core).
+    try:
+        _weight_regions = [(ue._params_dram_base, ue._next_params_dram_addr)]
+        _arena = getattr(getattr(ue._decode_sharder, "scheduler", None), "arena", None)
+        if _arena is not None:
+            _weight_regions += [(_a["base"], _a["base"] + _a["size"])
+                                for _a in _arena.weight_allocations()]
+        run_result["dram_weight_regions"] = [[int(_a), int(_b)] for _a, _b in (_weight_regions)]
+    except Exception:
+        run_result["dram_weight_regions"] = None
     print("Llama-3.2-1B test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result)}")
 
