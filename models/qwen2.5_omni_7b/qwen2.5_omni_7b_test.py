@@ -183,9 +183,9 @@ except Exception:                                    # pragma: no cover
 # the mel frames) no longer fit the shared activation pool.
 T2W_FPGA_MAX_CODES = 300
 T2W_CONV_ROUTER = False   # --conv-router: BigVGAN conv1ds via UnifiedEngine.conv2d_auto
-# Strassen matmuls (nn_lib section 10, online leaves) where the measured level rule says
-# they pay: the Token2Wav DiT block matmuls. --no-strassen turns them off (A/B timing).
-STRASSEN = True
+# Strassen matmuls (nn_lib section 10, online leaves) on the Token2Wav DiT block matmuls.
+# Off by default: on vs off back to back the DiT measured 64.1 vs 64.4 s (0.5%). --strassen.
+STRASSEN = False
 
 REQUIRED_ENGINES = _layout_mod.REQUIRED_ENGINES
 REQUIRED_DRAM_GIB = _layout_mod.REQUIRED_DRAM_GIB
@@ -4082,8 +4082,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="FPGA Token2Wav: BigVGAN conv1ds via UnifiedEngine.conv2d_auto (Winograd / CONV2D walker)",
     )
     parser.add_argument(
+        "--strassen", action="store_true",
+        help="Strassen on the Token2Wav DiT block matmuls (off by default: ~0.5%% measured)",
+    )
+    parser.add_argument(
         "--no-strassen", action="store_true",
-        help="plain matmuls everywhere (default: Strassen where it pays, see STRASSEN)",
+        help="plain matmuls everywhere (the default; kept for older command lines)",
     )
     parser.add_argument(
         "--token2wav-host", action="store_true",
@@ -4276,7 +4280,7 @@ def main() -> None:
     args = parser.parse_args()
     global T2W_CONV_ROUTER, STRASSEN
     T2W_CONV_ROUTER = args.conv_router
-    STRASSEN = not args.no_strassen
+    STRASSEN = args.strassen and not args.no_strassen
     if STRASSEN:
         # Token2Wav program space per engine: 16.6 MiB measured plain + 132 Strassen
         # calls (22 blocks x 6 matmuls) x ~0.23 MiB each (Alpamayo's measured cost per

@@ -108,8 +108,8 @@ Strassen on vs off, same session (board, U50):
 
 | Model | Engines | Gain | Default |
 |---|---|---|---|
-| Qwen2.5-Omni 7B `--speak`, Token2Wav DiT | 8 | 71.2 -> 64.0 s (10.1%) | on |
-| pi05 prefix MLP | 8 | 13.5 -> 12.9 s total (4.4%) | on |
+| Qwen2.5-Omni 7B `--speak`, Token2Wav DiT | 8 | 64.4 -> 64.1 s (0.5%) | off (`--strassen`) |
+| pi05 prefix MLP | 8 | 13.39 -> 12.82 s total (4.2%), prefix 10.59 -> 10.02 s | on |
 | Gemma 4 E4B / E2B prefill, 500-row prompt | 8 | 4.1% / 2.0% (decode 0.5% slower) | on |
 | Qwen2.5-VL 3B prefill | 8 | 3.30 -> 3.19 s (3.3%) | on |
 | FLUX.2 klein 4B DiT, 512 x 512 | 8 | 90.7 -> 88.4 s (2.5%) | on |
