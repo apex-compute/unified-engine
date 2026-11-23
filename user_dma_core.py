@@ -297,6 +297,23 @@ def ue_assert_stride_fields_fit(stride_bytes_per_chunk: int, stride_jump_bytes: 
         f"{stride_jump_bytes & UE_STRIDE_JUMP_MAX_BYTES} and silently corrupt the transfer"
         + (f"; {hint}" if hint else "")
     )
+    # The write FSM's sub-beat stride merge path is not built in current
+    # boards. Chunk and jump must be whole AXI beats; the high-level memcpy
+    # helpers already assert this, and descriptor builders must too.
+    if UE_AXI_DATA_WIDTH_BITS is not None:
+        beat = ue_axi_beat_bytes()
+        if stride_bytes_per_chunk:
+            assert stride_bytes_per_chunk % beat == 0, (
+                f"{what}: stride_bytes_per_chunk={stride_bytes_per_chunk} is not a "
+                f"multiple of the {beat}-byte AXI beat; sub-beat strides are not "
+                "supported" + (f"; {hint}" if hint else "")
+            )
+        if stride_jump_bytes:
+            assert stride_jump_bytes % beat == 0, (
+                f"{what}: stride_jump_bytes={stride_jump_bytes} is not a multiple "
+                f"of the {beat}-byte AXI beat; sub-beat strides are not supported"
+                + (f"; {hint}" if hint else "")
+            )
 
 
 # LARGEST SINGLE os.write()/os.read() ON AN XDMA CHAR DEVICE.
@@ -1698,7 +1715,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x25302117, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x25302117. Please update FPGA with update_25302117.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0xa605a799, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xa605a799. Please update FPGA with update_a605a799.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;

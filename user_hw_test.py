@@ -5252,8 +5252,14 @@ def stride_field_width_test(name: str = "stride_field_widths") -> None:
     level being modelled. So this test checks the descriptor field widths
     directly, which is the layer that actually failed.
     """
+    beat = ue_axi_beat_bytes()
     bad = [(1 << 17, 4096, "chunk one over the 17-bit field"),
-           (4096, 1 << 21, "jump one over the 21-bit field")]
+           (4096, 1 << 21, "jump one over the 21-bit field"),
+           # The write FSM builds no sub-beat merge path, so chunk and jump
+           # must be whole AXI beats (see ue_assert_stride_fields_fit).
+           (beat // 2, 4 * beat, "chunk shorter than one AXI beat"),
+           (beat + 8, 4 * beat, "chunk not a whole number of AXI beats"),
+           (beat, 4 * beat + 8, "jump not a whole number of AXI beats")]
     for chunk, jump, why in bad:
         try:
             ue_assert_stride_fields_fit(chunk, jump, "test")
@@ -5261,8 +5267,10 @@ def stride_field_width_test(name: str = "stride_field_widths") -> None:
             pass
         else:
             raise AssertionError(f"{name}: guard accepted an overflowing stride ({why})")
+    # Largest whole-beat values that still fit the 17- and 21-bit fields.
     for chunk, jump in ((65536, 131072),
-                        (UE_STRIDE_CHUNK_MAX_BYTES, UE_STRIDE_JUMP_MAX_BYTES),
+                        (UE_STRIDE_CHUNK_MAX_BYTES // beat * beat,
+                         UE_STRIDE_JUMP_MAX_BYTES // beat * beat),
                         (1792, 3584), (1024, 2048), (0, 0)):
         ue_assert_stride_fields_fit(chunk, jump, "test")
 
