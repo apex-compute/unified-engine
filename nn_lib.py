@@ -1348,8 +1348,8 @@ def flash_attention_batched_pbi(
 #   A call emits its own copy of everything: 7^L products (~110 instructions each, the core's
 #   dynamic matmul), 11 to 15 elementwise passes per tree node (~37 each) and, with online
 #   leaves, 4 to 12 instructions per piece of every sum: ~1,200 at level 1, ~9,400 at level 2.
-#   Three ways to emit less, all bit-identical to the inline program on the board
-#   (strassen_program_size_probe.py); STRASSEN_SHARE_OPS is on by default, the sums loop is off:
+#   Three ways to emit less, all bit-identical to the inline program on the board;
+#   STRASSEN_SHARE_OPS is on by default, the sums loop is off:
 #   STRASSEN_SHARE_OPS = 1    inside a call, every distinct product / pass (same shape, formats,
 #       bias, activation) is emitted once and jumped to, its addresses in registers; each use is
 #       a stub of 5 to 8 instructions (level 1 ~800, level 2 ~2,100). Costs two absolute jumps
@@ -1887,8 +1887,7 @@ def _strassen_activate(ue, addr: int, elements: int, activation: dict, identity_
 
     The products run in a hardware loop through one pointer row whose vector and result rows
     advance by one per product; the full 65536-value pieces loop too, through two more pointer
-    rows for the load and the store. Board: bit-identical to one literal product per 64 values
-    (activation_pass_probe.py)."""
+    rows for the load and the store. Board: bit-identical to one literal product per 64 values."""
     fm = TensorFormats(a=StorageFormat.FP16, b=StorageFormat.BF16, output=out_format)
     mode, la, lb = ue._matmul_activation(
         activation.get("gelu_enable", False), activation.get("silu_enable", False), activation.get("sigmoid_enable", False),

@@ -102,19 +102,18 @@ Online costs 1-2 points of speed against stored leaves and no weight memory (sto
 
 **Fused activation.** `activation=` (the `matmat_mul_core` arguments, e.g. `{"gelu_enable": True}`) with `identity_addr=` (a 64 x 64 bf16 identity in DRAM). The output quarters that end in a product take the activation fused. The rest (1/2 of the output at level 1, 3/4 at level 2) go through an on-chip identity product, because the hardware ignores the activation on elementwise ops. Measured cost of that pass: 3.1-4.1 ns per value, 55 dB for GELU, SiLU and ReLU. The pass is a hardware loop, a few dozen instructions per call instead of one per 64 values; board: bit-identical to the unrolled form for GELU, SiLU and ReLU, same time, 200,704 values in 39 instructions instead of 3,148. Board, one engine, bf16, time vs the native matmul with the same fused activation: GELU 720 x 1152 -> 4352 level 1 0.96x (53.8 dB, native 54.3); ReLU 408 x 2048 -> 4608 level 1 0.90x (54.5 dB), level 2 0.87x (52.6 dB, native 55.1). Online leaves, 8 engines, 408 rows per engine: GELU 2048 -> 4608 4-bit level 1 0.93x, level 2 0.90x (19.8 dB vs bf16, same as plain 4-bit); bf16 level 1 0.91x (53.7 dB), level 2 0.89x (51.9 dB, native 54.3). SiLU 2048 -> 2048 4-bit 0.94x at both levels.
 
-**In models.** Alpamayo 2 Edge, vision `o_proj` / `fc2` and projector `fc2` at level 1 (on by default): 73.2 s -> 72.6 s per plan, same output. Parakeet, 128-row clips: 1.8%. Swin, last stage only: 0.4%. Both are off by default (`--strassen-level`). Alpamayo 2 Edge prefill (4-bit, online leaves, on by default): level 2 on fc1 / fc2, level 1 on q / k / v / o, 72.5 s -> 69.6 s per plan on 8 engines, same 23 tokens, trajectory within 0.026 m. The weights are stored once as input-column slabs that decode also reads (decode step 29.9 -> 30.3 ms); weight region 2731 of 2752 MB, program 80-87 MB per engine.
+**In models.** Alpamayo 2 Edge, vision `o_proj` / `fc2` and projector `fc2` at level 1 (on by default): 73.2 s -> 72.6 s per plan, same output. Alpamayo 2 Edge prefill (4-bit, online leaves, on by default): level 2 on fc1 / fc2, level 1 on q / k / v / o, 72.5 s -> 69.6 s per plan on 8 engines, same 23 tokens, trajectory within 0.026 m. The weights are stored once as input-column slabs that decode also reads (decode step 29.9 -> 30.3 ms); weight region 2731 of 2752 MB, program 80-87 MB per engine.
 
 Strassen on vs off, same session (board, U50):
 
 | Model | Engines | Gain | Default |
 |---|---|---|---|
-| Qwen2.5-Omni 7B `--speak`, Token2Wav DiT | 8 | 64.4 -> 64.1 s (0.5%) | off (`--strassen`) |
 | pi05 prefix MLP | 8 | 13.39 -> 12.82 s total (4.2%), prefix 10.59 -> 10.02 s | on |
 | Gemma 4 E4B / E2B prefill, 500-row prompt | 8 | 4.1% / 2.0% (decode 0.5% slower) | on |
 | Qwen2.5-VL 3B prefill | 8 | 3.30 -> 3.19 s (3.3%) | on |
 | FLUX.2 klein 4B DiT, 512 x 512 | 8 | 90.7 -> 88.4 s (2.5%) | on |
 | LocateAnything 3B vision | 1 | 1.0% (256 rows) / 2.7% (896 rows) | vision on, LM off |
-| BigCodec, Qwen3.5 2B vision, Parakeet, Swin | 1 | none or slower: one engine builds every call's weight sums | off |
+| Tried and removed: Omni DiT (8 engines, 0.5%), BigCodec, Qwen3.5 2B vision, Parakeet, Swin (1 engine, no gain or slower) | | | |
 
 **API** (all in `nn_lib.py`):
 

@@ -33,12 +33,6 @@ import torch
 
 from user_dma_core import CONV_GEOMETRY_QUEUE_CONFIG, DMA_DEVICE_H2C, UE_MODE
 
-try:                                     # nn_lib section 10 (absent on older checkouts: plain matmuls)
-    from nn_lib import (strassen_bf16_cells, strassen_matmul_core_dram, strassen_online_items,
-                        strassen_online_sum_count, strassen_online_sums_core, strassen_online_tree)
-except ImportError:                      # pragma: no cover
-    strassen_matmul_core_dram = None
-
 BLOCK = 24
 HEADS = 16
 HD = 64
@@ -55,17 +49,6 @@ def _align(x: int, a: int) -> int:
     return (x + a - 1) // a * a
 
 
-def strassen_level(rows: int, K: int, N: int) -> int:
-    """Strassen depth for one matmul call of ``rows`` rows (per engine), K -> N.
-    Measured rule: under 128 rows or a width under 1024 it loses; 256+ rows with
-    one width of 2048+ takes two levels; otherwise one."""
-    if strassen_matmul_core_dram is None or rows < 128 or min(K, N) < 1024:
-        return 0
-    if rows >= 256 and max(K, N) >= 2048 and K % 256 == 0 and N % 256 == 0:
-        return 2
-    return 1 if K % 128 == 0 and N % 128 == 0 else 0
-
-
 
 class DiTFpga:
     """DiT forward over the engines of a ``Cores`` runner (bf16 weights).
@@ -79,7 +62,7 @@ class DiTFpga:
     """
 
     def __init__(self, cores, dit, *, frames: int, layers: int = LAYERS,
-                 query_chunk_blocks: int = 4, verbose: bool = True, strassen: bool = True):
+                 query_chunk_blocks: int = 4, verbose: bool = True):
         self.cores = cores
         self.n = cores.n
         self.dit = dit
@@ -100,16 +83,8 @@ class DiTFpga:
         self._zero_tiles: dict[int, int] = {}
         self._mregs: dict[int, int] = {}
         self._next_reg = 40
-        # Strassen (nn_lib section 10, online leaves) per block matmul: op -> (K, N, level).
-        # The rows per engine are fixed for the program (built for Tmax), so the level is too.
-        shapes = {"q": (HID, HID), "k": (HID, HID), "v": (HID, HID), "o": (HID, HID),
-                  "f1": (HID, FF), "f2": (FF, HID)}
-        self.st = {op: (K, N, strassen_level(self.rs, K, N) if strassen else 0)
-                   for op, (K, N) in shapes.items()}
-        self.st = {op: v for op, v in self.st.items() if v[2]}
         self._stage_weights()
         self._alloc_tensors()
-        self._stage_strassen()
         self._stage_constants()
 
     # ------------------------------------------------------------------ memory
@@ -126,8 +101,6 @@ class DiTFpga:
         return self._put(name, t)
 
     def _tensor(self, n_elem: int) -> int:
-        if self.st:                                        # Strassen writes whole 128-byte lines
-            return self.cores.alloc(n_elem * 2, align=128)
         return self.cores.alloc(n_elem * 2)
 
     def _write(self, addr: int, t: torch.Tensor) -> None:
@@ -145,18 +118,15 @@ class DiTFpga:
         self._put("in.mel", wm)
         self.static_weight = proj.weight[:, MEL:].detach().float()
         self.static_bias = proj.bias.detach().float()
-        self.st_cells: dict[str, tuple] = {}     # "li.op" -> (cells, bias) of a Strassen layer
         for i in range(self.layers):
             b = dit.transformer_blocks[i]
             a = b.attn
-            for op, lin in (("q", a.to_q), ("k", a.to_k), ("v", a.to_v), ("o", a.to_out[0]),
-                            ("f1", b.ff.ff[0]), ("f2", b.ff.ff[3])):
-                if op in self.st:        # the same bytes, cut into the cells the board sums
-                    cells = strassen_bf16_cells(lin.weight.detach(), self.st[op][2],
-                                                self.cores.put_weight)
-                    self.st_cells[f"{i}.{op}"] = (cells, lin.bias.detach())
-                else:
-                    self._put(f"{i}.{op}", lin.weight); self._put(f"{i}.{op}b", lin.bias)
+            self._put(f"{i}.q", a.to_q.weight); self._put(f"{i}.qb", a.to_q.bias)
+            self._put(f"{i}.k", a.to_k.weight); self._put(f"{i}.kb", a.to_k.bias)
+            self._put(f"{i}.v", a.to_v.weight); self._put(f"{i}.vb", a.to_v.bias)
+            self._put(f"{i}.o", a.to_out[0].weight); self._put(f"{i}.ob", a.to_out[0].bias)
+            self._put(f"{i}.f1", b.ff.ff[0].weight); self._put(f"{i}.f1b", b.ff.ff[0].bias)
+            self._put(f"{i}.f2", b.ff.ff[3].weight); self._put(f"{i}.f2b", b.ff.ff[3].bias)
         wp = torch.zeros(MEL_PAD, HID)
         wp[:MEL] = dit.proj_out.weight
         bp = torch.zeros(MEL_PAD)
@@ -206,56 +176,6 @@ class DiTFpga:
             nb = (R * HID + 512 * HD) * 2
             c.zero(base, nb)
 
-    def _stage_strassen(self) -> None:
-        """Strassen buffers: the weight-sum leaves and each engine's private scratch.
-
-        The sums (one fp16 set per op, shared by all 22 blocks) live in the activation
-        pool: they are remade on the board before every block that reads them, so the
-        BigVGAN may reuse that memory once the DiT is done, like the rest of the pool.
-        The scratch is per engine, sized for this program's rows and zero-filled."""
-        self.st_sums: dict[str, list[int]] = {}
-        self.st_tree: dict[str, dict] = {}
-        self.st_scr: list[list[tuple[int, int]]] = [[] for _ in self.cores.engines]
-        self._st_sizes: list[tuple[int, int]] = []
-        self._st_scratch_bytes = 0
-        if not self.st:
-            return
-        store_b = lambda t: self.cores.put_weight(t, keep_dtype=True)   # fp16 / bf16 leaf bias as given
-        for op, (K, N, L) in self.st.items():
-            cell = (N >> L) * (K >> L)
-            self.st_sums[op] = [self.cores.alloc(cell * 2, align=128)
-                                for _ in range(strassen_online_sum_count(L))]
-        for key, (cells, bias) in self.st_cells.items():
-            op = key.split(".")[1]
-            self.st_tree[key] = strassen_online_tree(cells, self.st_sums[op], self.st[op][2],
-                                                     bias, store_b)
-        rs, depth = self.rs, max(L for _K, _N, L in self.st.values())
-        sizes = []
-        for d in range(depth):
-            live = [(K, N) for K, N, L in self.st.values() if L > d]
-            sizes.append((9 * max((rs >> (d + 1)) * (K >> (d + 1)) for K, _N in live) * 2,
-                          14 * max((rs >> (d + 1)) * (N >> (d + 1)) for _K, N in live) * 2))
-        for e, ue in enumerate(self.cores.engines):
-            for xb, pb in sizes:
-                pair = (ue.allocate_tensor_dram(xb, align_bytes=128),
-                        ue.allocate_tensor_dram(pb, align_bytes=128))
-                self.st_scr[e].append(pair)
-        self._st_sizes = sizes
-        self._st_scratch_bytes = sum(xb + pb for xb, pb in sizes)
-        self._zero_st_scratch()
-        if self.verbose:
-            sums = sum(len(v) * (self.st[op][0] >> self.st[op][2]) * (self.st[op][1] >> self.st[op][2]) * 2
-                       for op, v in self.st_sums.items())
-            print(f"  [T2W] Strassen {', '.join(f'{op} L{L}' for op, (_K, _N, L) in self.st.items())} "
-                  f"on {rs} rows/engine: sums {sums / 2**20:.1f} MiB (pool), scratch "
-                  f"{self._st_scratch_bytes / 2**20:.1f} MiB/engine", flush=True)
-
-    def _zero_st_scratch(self) -> None:
-        for ue, pairs in zip(self.cores.engines, self.st_scr):
-            for (xa, pa), (xb, pb) in zip(pairs, self._st_sizes):
-                ue.dma_write(DMA_DEVICE_H2C, xa, bytes(xb), xb)
-                ue.dma_write(DMA_DEVICE_H2C, pa, bytes(pb), pb)
-
     def set_length(self, frames: int) -> None:
         """Run the already-compiled program on ``frames`` live frames.
 
@@ -274,7 +194,6 @@ class DiTFpga:
         for ue, pv in zip(self.cores.engines, self.priv):
             ue.dma_write(DMA_DEVICE_H2C, pv["scratch"],
                          bytes(self._scratch_bytes), self._scratch_bytes)
-        self._zero_st_scratch()
         for base in (self.KH, self.VH):
             self.cores.zero(base, (self.rows * HID + 512 * HD) * 2)
 
@@ -418,46 +337,22 @@ class DiTFpga:
         self._ln(ue, rs, row(self.X, HID), row(self.XN, HID),
                  self._mod(li, 1), self._mod(li, 0))
         for name, dst in (("q", self.Q), ("k", self.K), ("v", self.V)):
-            self._block_mm(ue, e, li, name, rs, HID, HID, row(self.XN, HID), row(dst, HID))
-
-    def _block_mm(self, ue, e, li, op, M, K, N, a, out, gelu=False):
-        """One block matmul (with its bias): Strassen when the op has a level, else plain."""
-        key = f"{li}.{op}"
-        tree = self.st_tree.get(key)
-        if tree is None:
-            return self._mm(ue, M, K, N, a, self.w[key], out, self.w[key + "b"], gelu=gelu)
-        L = self.st[op][2]
-        assert M % (1 << L) == 0 and len(self.st_scr[e]) >= L, \
-            f"Strassen {key}: {M} rows / {len(self.st_scr[e])} scratch levels for level {L}"
-        strassen_matmul_core_dram(ue, M, K, N, a, tree, out, self.st_scr[e][:L],
-                                  activation={"gelu_enable": True} if gelu else None,
-                                  identity_addr=self.IDENT if gelu else None)
-        return 0
-
-    def _st_sums(self, ue, e: int, keys) -> None:
-        """Make the weight sums of the Strassen layers ``keys`` ("li.op"), this engine's
-        share of the pieces. Their buffers are shared by every block, so this must run
-        in a region before the one that reads them (and after the last that did)."""
-        for key in keys:
-            if key not in self.st_tree:
-                continue
-            op = key.split(".")[1]
-            K, N, L = self.st[op]
-            n, k = N >> L, K >> L
-            items = strassen_online_items(n, k, L)[e::self.n]
-            strassen_online_sums_core(ue, self.st_cells[key][0], n, k, self.st_sums[op], L, items)
+            self._mm(ue, rs, HID, HID, row(self.XN, HID), w[f"{li}.{name}"],
+                     row(dst, HID), w[f"{li}.{name}b"])
 
     def _tail(self, ue, e: int, li: int) -> None:
         """Output projection, gated residual, LayerNorm2, MLP, gated residual."""
-        rs, r0 = self.rs, e * self.rs
+        w, rs, r0 = self.w, self.rs, e * self.rs
         row = lambda base, width: base + r0 * width * 2
-        self._block_mm(ue, e, li, "o", rs, HID, HID, row(self.ATT, HID), row(self.Y, HID))
+        self._mm(ue, rs, HID, HID, row(self.ATT, HID), w[f"{li}.o"], row(self.Y, HID),
+                 w[f"{li}.ob"])
         self._gated_residual(ue, row(self.X, HID), row(self.Y, HID), self._gate_tile(li, 0), rs)
         self._ln(ue, rs, row(self.X, HID), row(self.XN, HID),
                  self._mod(li, 4), self._mod(li, 3))
-        self._block_mm(ue, e, li, "f1", rs, HID, FF, row(self.XN, HID), row(self.H1, FF),
-                       gelu=True)
-        self._block_mm(ue, e, li, "f2", rs, FF, HID, row(self.H1, FF), row(self.Y, HID))
+        self._mm(ue, rs, HID, FF, row(self.XN, HID), w[f"{li}.f1"], row(self.H1, FF),
+                 w[f"{li}.f1b"], gelu=True)
+        self._mm(ue, rs, FF, HID, row(self.H1, FF), w[f"{li}.f2"], row(self.Y, HID),
+                 w[f"{li}.f2b"])
         self._gated_residual(ue, row(self.X, HID), row(self.Y, HID), self._gate_tile(li, 1), rs)
 
     # ------------------------------------------------------------------ regions
@@ -467,9 +362,6 @@ class DiTFpga:
         t0 = time.perf_counter()
         self.sequence: list[int] = []
         rs = self.rs
-        qkv = lambda li: [f"{li}.{op}" for op in ("q", "k", "v")]
-        if self.st_tree:            # the weight sums block 0's Q/K/V read in embed+pre0
-            self.sequence.append(c.region("sums0", lambda e, ue: self._st_sums(ue, e, qkv(0))))
 
         def embed(e, ue):
             self._begin(ue)
@@ -485,9 +377,6 @@ class DiTFpga:
         for li in range(self.layers):
             def attn(e, ue, li=li):
                 self._begin(ue)
-                # the weight sums tail{li} reads: this block's o/f1/f2, the next one's q/k/v
-                self._st_sums(ue, e, [f"{li}.{op}" for op in ("o", "f1", "f2")]
-                              + (qkv(li + 1) if li + 1 < self.layers else []))
                 for p in range(e, HEADS * 2, self.n):
                     h, b = divmod(p, 2)
                     self._split_plane(ue, self.Q, self.QH, h, b)
@@ -1170,8 +1059,7 @@ class Token2WavFpga:
     """Codec IDs -> waveform with the DiT and the BigVGAN both on the accelerator."""
 
     def __init__(self, cores, t2w, *, codes: int, verbose: bool = True,
-                 compile: bool = True, state=None, conv_router: bool = False,
-                 strassen: bool = True):
+                 compile: bool = True, state=None, conv_router: bool = False):
         """``compile=False`` builds the objects and uploads the DiT weights but
         compiles nothing; ``state`` (from ``compile_state()``) then restores what
         the compilers left, so ``--run_from_bin`` needs no compile pass."""
@@ -1181,8 +1069,7 @@ class Token2WavFpga:
         self.max_codes = codes
         self.frames = codes * self.repeats        # live frames; the programs are built for max
         self.verbose = verbose
-        self.dit = DiTFpga(cores, t2w.code2wav_dit_model, frames=self.frames, verbose=verbose,
-                           strassen=strassen)
+        self.dit = DiTFpga(cores, t2w.code2wav_dit_model, frames=self.frames, verbose=verbose)
         self.vocoder = None
         self._compile_state = {}
         if compile:

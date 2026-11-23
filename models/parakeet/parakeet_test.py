@@ -53,36 +53,11 @@ from user_dma_core import (
 from nn_lib import (
     batch_norm_core_dram, tanh_core_dram, silu_core_dram, glu_core_dram,
     half_step_residual_core_dram, rel_shift_core_dram, chunked_transpose_core_dram,
-    strassen_levels, strassen_matmul_core_dram, strassen_bf16_cells, strassen_online_tree,
-    strassen_online_sum_count, strassen_online_sums_core,
 )
 
 URAM_A_BASE = 0x00000
 URAM_B_BASE = 0x80000
 EPS = 1e-5
-
-# Strassen matmul (nn_lib §10, fp16 intermediates) on the encoder's bf16 matmuls that are wide
-# enough to gain: the 1024 -> 1024 projections (PW1B with its sigmoid fused), the two FF up halves
-# (1024 -> 2048, SiLU fused) and the two FF down halves (2048 -> 1024), all at level 1. The rows
-# of every call are the length bucket's static L_pad / P_pad (the encoder is compiled per bucket),
-# and a bucket under 128 rows stays plain. Level 2 only pays from 256
-# rows, which the depthwise Toeplitz matrices (D x L_pad^2 per layer, filling the params region by
-# L_pad 192) keep this port from reaching.
-# Online leaves: each weight is stored once, cut into its 4 cells (the same bytes as the plain
-# weight), and the board forms the 5 weight sums into one shared set of fp16 buffers right before
-# each Strassen matmul. The sum buffers (5 MB) and the scratch live in the tensor region.
-# OFF by default (--strassen-level 1 turns it on). Measured with the earlier stored leaves (540 MB
-# more weights), 10 s clip, one engine: encoder 4473.7 -> 4357.1 ms (2.6%), one transcript word
-# changed. The online version trades that memory for the per-call sums: not yet measured.
-ST_LEVEL = 0
-ST_BIN_TAG = "online-act"   # recorded with the level in the bins: a layout change must not reuse old bins
-ST_MIN_ROWS = 128
-ST_SQ_KEYS = ("ATTN_Q_W", "ATTN_K_W", "ATTN_V_W", "ATTN_OUT_W",
-              "CONV_PW1A_W", "CONV_PW1B_W", "CONV_PW2_W")                                      # L_pad rows, D -> D
-ST_POS_KEYS = ("ATTN_POS_W",)                                                                  # P_pad rows, D -> D
-ST_FF_KEYS = ("FF1_W2_LO", "FF1_W2_HI", "FF2_W2_LO", "FF2_W2_HI")                              # L_pad rows, FF/2 -> D
-ST_UP_KEYS = ("FF1_W1_LO", "FF1_W1_HI", "FF2_W1_LO", "FF2_W1_HI")                              # L_pad rows, D -> FF/2
-ST_ACT_KEYS = ("gelu_enable", "silu_enable", "sigmoid_enable", "clamp_enable", "clamp_min", "clamp_max")
 
 def _make_add_set_bytes(dst_reg, immediate_value):
     """Build raw 32-byte ADD_SET instruction: dst_reg = immediate_value."""
@@ -551,35 +526,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.allocate_params_dram(nbytes)
         self.dma_to_accelerator_memory(addr, t)
         return addr
-    def _st_plan(self, L_pad):
-        """{layer weight key: Strassen level} for one length bucket; empty = every matmul plain."""
-        # A bucket under 128 encoder rows is left whole as it is (its pos-proj has 128 rows, where
-        # the measured gain is 4% of one matmul: not worth a second program / weight layout).
-        if not ST_LEVEL or L_pad is None or L_pad < ST_MIN_ROWS:
-            return {}
-        D, P_pad = self.d_model, pad_to_multiple(2 * L_pad - 1, self.block_size)
-        def level(rows, K, N, want):
-            L = strassen_levels(K, N, min(want, ST_LEVEL)) if rows >= ST_MIN_ROWS else 0
-            while L and rows % (1 << L):
-                L -= 1
-            return L
-        FH = self.ff_dim // 2
-        plan = {k: level(L_pad, D, D, 1) for k in ST_SQ_KEYS}
-        plan.update({k: level(P_pad, D, D, 1) for k in ST_POS_KEYS})
-        plan.update({k: level(L_pad, FH, D, 1) for k in ST_FF_KEYS})
-        plan.update({k: level(L_pad, D, FH, 1) for k in ST_UP_KEYS})
-        return {k: L for k, L in plan.items() if L}
-    def _st_uses(self, L_pad):
-        """[(rows, K, N, level)] of the bucket's Strassen calls: sizes the shared scratch."""
-        D, P_pad, plan = self.d_model, pad_to_multiple(2 * L_pad - 1, self.block_size), self._st_plan(L_pad)
-        FH = self.ff_dim // 2
-        shape = lambda k: ((P_pad if k in ST_POS_KEYS else L_pad), (FH if k in ST_FF_KEYS else D),
-                           (FH if k in ST_UP_KEYS else D), plan[k])
-        return sorted({shape(k) for k in plan})
-    def _st_cache_key(self, L_pad):
-        """What the bins record beside L_pad: the Strassen level cap the bucket was built with
-        (0 when the bucket has no Strassen matmul, so those bins stay valid either way)."""
-        return f"{ST_LEVEL}-{ST_BIN_TAG}" if self._st_plan(L_pad) else 0
     def _stage_dw_conv1d(self, weight):
         """(C,1,K) -> (C,64) im2col padded."""
         C, _, K = weight.shape
@@ -629,9 +575,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         if not os.path.exists(TOKENIZER_PATH):
             sys.exit(f"Failed to extract tokenizer.model")
         print("  Download complete.")
-    def weight_init(self, L_pad=None):
-        """Load checkpoint, stage all weights to DRAM. L_pad: the length bucket the encoder will be
-        compiled for; it picks the matmuls that get Strassen leaves in place of the plain weight."""
+    def weight_init(self):
+        """Load checkpoint, stage all weights to DRAM."""
         self.ensure_model_files()
         ckpt_path = WEIGHTS_PATH
         print(f"Loading weights from {ckpt_path} ...")
@@ -710,16 +655,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
 
         # Per-layer conformer weights
         self.layer_addrs = []
-        st_plan = self._st_plan(L_pad)
-        def put(la, key, W):
-            # A Strassen matmul's weight is stored as its 4^L cells (same bytes as the plain weight);
-            # tensor_init allocates the shared sum buffers and builds the tree that reads them.
-            if key in st_plan:
-                L = st_plan[key]
-                la[key] = {"L": L, "cells": strassen_bf16_cells(W, L, self._alloc_write),
-                           "n": W.shape[0] >> L, "k": W.shape[1] >> L}
-            else:
-                la[key] = self._alloc_write(W)
         for i in range(self.num_layers):
             la = {}
             pfx = f"encoder.layers.{i}"
@@ -729,26 +664,25 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 la[f"{our_key}_WEIGHT"] = self._alloc_write(sd[f"{pfx}.{nemo_key}.weight"])
                 la[f"{our_key}_BIAS"] = self._alloc_write(sd[f"{pfx}.{nemo_key}.bias"])
             w1 = sd[f"{pfx}.feed_forward1.linear1.weight"]  # (4096, 1024)
-            put(la, "FF1_W1_LO", w1[:FF//2, :].contiguous())
-            put(la, "FF1_W1_HI", w1[FF//2:, :].contiguous())
+            la["FF1_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
+            la["FF1_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
             w2 = sd[f"{pfx}.feed_forward1.linear2.weight"]  # (1024, 4096)
-            put(la, "FF1_W2_LO", w2[:, :FF//2].contiguous())
-            put(la, "FF1_W2_HI", w2[:, FF//2:].contiguous())
+            la["FF1_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
+            la["FF1_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
             w1 = sd[f"{pfx}.feed_forward2.linear1.weight"]
-            put(la, "FF2_W1_LO", w1[:FF//2, :].contiguous())
-            put(la, "FF2_W1_HI", w1[FF//2:, :].contiguous())
+            la["FF2_W1_LO"] = self._alloc_write(w1[:FF//2, :].contiguous())
+            la["FF2_W1_HI"] = self._alloc_write(w1[FF//2:, :].contiguous())
             w2 = sd[f"{pfx}.feed_forward2.linear2.weight"]
-            put(la, "FF2_W2_LO", w2[:, :FF//2].contiguous())
-            put(la, "FF2_W2_HI", w2[:, FF//2:].contiguous())
-            put(la, "ATTN_Q_W", sd[f"{pfx}.self_attn.linear_q.weight"])
-            put(la, "ATTN_K_W", sd[f"{pfx}.self_attn.linear_k.weight"])
-            put(la, "ATTN_V_W", sd[f"{pfx}.self_attn.linear_v.weight"])
-            put(la, "ATTN_POS_W", sd[f"{pfx}.self_attn.linear_pos.weight"])
-            put(la, "ATTN_OUT_W", sd[f"{pfx}.self_attn.linear_out.weight"])
-            pw1 = sd[f"{pfx}.conv.pointwise_conv1.weight"].squeeze(-1)      # (2D, D): the GLU halves a, b
-            put(la, "CONV_PW1A_W", pw1[:D].contiguous())
-            put(la, "CONV_PW1B_W", pw1[D:].contiguous())
-            put(la, "CONV_PW2_W", sd[f"{pfx}.conv.pointwise_conv2.weight"].squeeze(-1))
+            la["FF2_W2_LO"] = self._alloc_write(w2[:, :FF//2].contiguous())
+            la["FF2_W2_HI"] = self._alloc_write(w2[:, FF//2:].contiguous())
+            la["ATTN_Q_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_q.weight"])
+            la["ATTN_K_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_k.weight"])
+            la["ATTN_V_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_v.weight"])
+            la["ATTN_POS_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_pos.weight"])
+            la["ATTN_OUT_W"] = self._alloc_write(sd[f"{pfx}.self_attn.linear_out.weight"])
+            pw1_a, pw1_b = self._split_pw_conv1(sd[f"{pfx}.conv.pointwise_conv1.weight"])
+            la["CONV_PW1A_W"], la["CONV_PW1B_W"] = pw1_a, pw1_b
+            la["CONV_PW2_W"] = self._alloc_write(sd[f"{pfx}.conv.pointwise_conv2.weight"].squeeze(-1))
             la["ATTN_BIAS_U"] = self._alloc_write(sd[f"{pfx}.self_attn.pos_bias_u"].reshape(-1))
             la["ATTN_BIAS_V"] = self._alloc_write(sd[f"{pfx}.self_attn.pos_bias_v"].reshape(-1))
             la["CONV_DW_W"] = self._stage_dw_conv1d(sd[f"{pfx}.conv.depthwise_conv.weight"])
@@ -794,13 +728,10 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         b_dur[:N_dur] = out_b[N_tok:N_tok + N_dur]
         self.w["JOINT_OUT_DUR_W"] = self._alloc_write(w_dur)
         self.w["JOINT_OUT_DUR_B"] = self._alloc_write(b_dur)
-        if st_plan:
-            _original_print(f"\n  Strassen (L_pad={L_pad}): {len(st_plan)} matmuls per layer on online leaves "
-                            f"(no extra weight memory)")
-        params_limit = self._tensor_dram_base - self._params_dram_base
         # Store checkpoint for mel spectrogram (filterbank + window)
         self._ckpt_sd = sd
         params_used = self.get_params_dram_usage()
+        params_limit = self._tensor_dram_base - self._params_dram_base
         print(f"  Weight staging complete: {params_used / 1024**2:.1f} MB in DRAM "
               f"(budget: {params_limit / 1024**2:.0f} MB)")
         assert params_used <= params_limit, (
@@ -916,31 +847,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.JOINT_SUM_DRAM = self.allocate_tensor_dram(self.joint_hidden * bpe)
         self.JOINT_TOK_DRAM = self.allocate_tensor_dram(N_tok_pad * bpe)
         self.JOINT_DUR_DRAM = self.allocate_tensor_dram(N_dur_pad * bpe)
-        # Strassen scratch, one (x, product) pair per depth, sized for the bucket's largest call.
-        # It must start out zero: the whole region was zero-filled above. Allocated last so no
-        # other buffer moves, and the same on a bin run (the programs carry these addresses).
-        uses, self.st_scratch = self._st_uses(L_pad), []
-        for d in range(max((u[3] for u in uses), default=0)):
-            live = [u for u in uses if u[3] > d]
-            x = 9 * max((m >> (d + 1)) * (K >> (d + 1)) for m, K, N, L in live)
-            p = 14 * max((m >> (d + 1)) * (N >> (d + 1)) for m, K, N, L in live)
-            self.st_scratch.append((self.allocate_tensor_dram(x * bpe, align_bytes=128),
-                                    self.allocate_tensor_dram(p * bpe, align_bytes=128)))
-        # Online-leaf sum buffers: one fp16 set per level, sized for the largest cell, shared by every
-        # Strassen matmul of every layer (each call refills them just before it runs, see _enc_matmul).
-        # Every element a matmul reads is written first, so they need no zeroing. Sized from the
-        # plan alone, like the scratch, so a bin run (no weight_init, no layer_addrs) lays the
-        # tensor region out the same way the compiled programs expect.
-        sums = {}
-        for L in sorted({u[3] for u in uses}):
-            cell = max((K >> L) * (N >> L) for m, K, N, l in uses if l == L)
-            sums[L] = [self.allocate_tensor_dram(cell * bpe, align_bytes=128) for _ in range(strassen_online_sum_count(L))]
-            _original_print(f"  Strassen level-{L} sum buffers: {len(sums[L])} x {cell * bpe / 1024**2:.1f} MB (tensor region)")
-        for la in getattr(self, "layer_addrs", []):
-            for nd in la.values():
-                if isinstance(nd, dict):
-                    nd["sums"] = sums[nd["L"]]
-                    nd["tree"] = strassen_online_tree(nd["cells"], nd["sums"], nd["L"])
         tensor_used = self.get_tensor_dram_usage()
         tensor_limit = self._program_dram_base - self._tensor_dram_base
         print(f"  Tensor alloc: {tensor_used / 1024**2:.1f} MB "
@@ -1348,23 +1254,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                     head_addrs.append(addr)
                 la[tiled_key] = head_addrs
     def _enc_matmul(self, M, K, N, A_DRAM_ADDR, w_addr, OUTPUT_DRAM_ADDR, **kw):
-        """Encoder matmul (bf16). w_addr: the plain weight's address, or the Strassen node
-        weight_init stored in its place (M is then the bucket's static row count). A Strassen
-        call first has the board form this weight's sums into the shared sum buffers: one engine,
-        in order, so the previous call's matmul has read them before they are overwritten.
-        A fused activation (silu_enable / sigmoid_enable ...) goes to the kernel unchanged, with
-        the 64x64 identity its non-product quarters need."""
-        if isinstance(w_addr, dict):
-            L = w_addr["L"]
-            act = {k: v for k, v in kw.items() if k in ST_ACT_KEYS}
-            assert not set(kw) - {"gpr_M_reg"} - set(act), f"Strassen takes no bias here: {sorted(kw)}"
-            assert M % (1 << L) == 0 and OUTPUT_DRAM_ADDR % 128 == 0 and len(self.st_scratch) >= L
-            assert (w_addr["n"] << L, w_addr["k"] << L) == (N, K), f"Strassen node is {w_addr['n'] << L}x{w_addr['k'] << L}, call {N}x{K}"
-            strassen_online_sums_core(self, w_addr["cells"], w_addr["n"], w_addr["k"], w_addr["sums"], L)
-            strassen_matmul_core_dram(self, M, K, N, A_DRAM_ADDR, w_addr["tree"], OUTPUT_DRAM_ADDR, self.st_scratch,
-                                      activation=act or None, identity_addr=self.w["IDENTITY_64"] if act else None)
-            self._st_flops += 7 ** L * 2 * (M >> L) * (K >> L) * (N >> L) - 2 * M * K * N
-            return
+        """Encoder matmul (bf16)."""
         self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
             B_DRAM_ADDR=w_addr, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, **kw)
     def compile_encoder(self, L_pad, toeplitz_addrs, bn_tiled):
@@ -1384,7 +1274,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.start_capture()
         self.generate_instruction_flag_clear()
         total_flops = 0
-        self._st_flops = 0      # Strassen work minus the plain 2*M*K*N the call sites count
 
         L_PAD_REG = self.alloc_isa_reg()
         P_PAD_REG = self.alloc_isa_reg()
@@ -1554,7 +1443,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(program_addr)
         program_bytes = self.get_capture_instruction_size_bytes()
         self.allocate_program_dram(program_bytes)
-        self.enc_flops = total_flops + self._st_flops
+        self.enc_flops = total_flops
         return program_addr, program_bytes
     def compile_decoder(self):
         """Compile decoder programs with on-device DMA (no host round-trips per step).
@@ -1736,11 +1625,8 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 extras_meta[name] = {"offset": cursor, "size": len(b),
                                      "shape": list(arr.shape), "dtype": str(arr.dtype)}
                 cursor += len(b)
-        meta = {"L_pad": L_pad, "size": total, "extras": extras_meta}
-        if self._st_cache_key(L_pad):
-            meta["strassen"] = self._st_cache_key(L_pad)
         with open(meta_path, "w") as f:
-            json.dump(meta, f)
+            json.dump({"L_pad": L_pad, "size": total, "extras": extras_meta}, f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
     def load_params(self, L_pad):
         """Load params DRAM from bin. Returns True if loaded, False if the cache is incomplete/mismatched."""
@@ -1753,11 +1639,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             meta = json.load(f)
         if meta.get("L_pad") != L_pad:
             _original_print(f"  Params bin L_pad={meta.get('L_pad')} != {L_pad}, reloading weights")
-            return False
-        # Strassen leaves and the programs that read them are part of the cache unit too.
-        if meta.get("strassen", 0) != self._st_cache_key(L_pad):
-            _original_print(f"  Params bin Strassen level {meta.get('strassen', 0)} != {self._st_cache_key(L_pad)}, "
-                            "rebuilding weights and programs together")
             return False
         # params.bin stores raw DRAM bytes, but not the Python-side self.w address
         # map needed to compile programs. Therefore params and programs form one
@@ -1779,9 +1660,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 "rebuilding weights and programs together"
             )
             return False
-        if programs_meta.get("strassen", 0) != self._st_cache_key(L_pad):
-            _original_print("  Programs bin Strassen level differs; rebuilding weights and programs together")
-            return False
         total = meta["size"]
         CHUNK = 1 * 1024 * 1024
         with open(bin_path, "rb") as f:
@@ -1801,8 +1679,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         bin_path = os.path.join(bin_dir, "programs.bin")
         meta_path = os.path.join(bin_dir, "programs.json")
         manifest = {"L_pad": L_pad, "programs": {}, "flops": dict(flops or {})}
-        if self._st_cache_key(L_pad):
-            manifest["strassen"] = self._st_cache_key(L_pad)
         all_bytes = bytearray()
         for name, (addr, size) in program_addrs.items():
             buf = bytearray(size)
@@ -1832,9 +1708,6 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             manifest = json.load(f)
         if manifest.get("L_pad") != L_pad:
             _original_print(f"  Bin L_pad={manifest.get('L_pad')} != current {L_pad}, recompiling")
-            return None
-        if manifest.get("strassen", 0) != self._st_cache_key(L_pad):
-            _original_print("  Programs bin Strassen level differs, recompiling")
             return None
         with open(bin_path, "rb") as f:
             all_bytes = f.read()
@@ -2010,7 +1883,6 @@ def write_run_summary(engine, args, *, audio_path, audio_dur, T_mel, L, L_pad, m
     return out
 
 def main():
-    global _SILENT_MODE, ST_LEVEL
     import argparse
     parser = argparse.ArgumentParser(description="Parakeet-TDT-0.6B accelerator inference")
     parser.add_argument("--audio", type=str, default=None, help="Path to audio file (.wav, .flac, etc.)")
@@ -2019,12 +1891,10 @@ def main():
     parser.add_argument("--run-from-bin", dest="run_from_bin", action="store_true",
                         help="Skip weight staging and compile; load params.bin + programs.bin from parakeet_bin/ "
                              "(error if missing or built for another L_pad). Default: rebuild and recompile.")
-    parser.add_argument("--strassen-level", type=int, default=ST_LEVEL, choices=(0, 1),
-                        help="Strassen level on the encoder's wide plain matmuls (default 0 = off; 1 engages at the 128-frame bucket).")
     args = parser.parse_args()
 
+    global _SILENT_MODE
     _SILENT_MODE = True
-    ST_LEVEL = args.strassen_level
 
     cfg = load_config()
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
@@ -2075,7 +1945,7 @@ def main():
         sys.exit(1)
     if not params_loaded:
         _original_print("  Loading weights...", end=" ", flush=True)
-        engine.weight_init(L_pad)
+        engine.weight_init()
         _original_print("done")
 
     # Mel filterbank: always populate self.w (weight_init handles it fresh; on bin reload it's missing)

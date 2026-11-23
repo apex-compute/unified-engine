@@ -26,7 +26,6 @@ from bigcodec_conv import (
     prepare_conv_transpose1d, emit_conv1d, emit_conv_transpose1d,
 )
 from bigcodec_lstm import scratch_bytes as lstm_scratch_bytes, prepare_lstm, emit_lstm, tanh_identity, tanh_scratch_bytes, TANH_ARGUMENT_LIMIT, TANH_CHUNK_ELEMENTS, _tanh_sram
-from bigcodec_lstm import strassen_bytes, strassen_level
 from bigcodec_quantizer import quantizer_scratch_bytes, prepare_quantizer, emit_quantizer
 from bigcodec_layout import MemoryLayout, LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT, LAYOUTS
 
@@ -89,7 +88,6 @@ class Graph:
     scratch_bytes: int = 0
     tensor_end: int = 0
     layout: MemoryLayout = LEGACY_LAYOUT
-    strassen: bool = False      # LSTM input projections on the Strassen matmul (bigcodec_lstm.input_projection)
 
 
 def compiled_sample_count(samples: int) -> int:
@@ -343,11 +341,9 @@ def _plan_memory(graph: Graph, layout: MemoryLayout) -> Graph:
             operation.scratch_bytes = activation_scratch_bytes(shape, **_filter_numerics(graph, operation))
         elif operation.op == "lstm":
             numerics = _lstm_numerics(graph, operation)
-            operation.scratch_bytes = aligned(lstm_scratch_bytes(shape,
+            operation.scratch_bytes = lstm_scratch_bytes(shape,
                 compensated_cell=numerics["compensated_cell"],
-                preserve_cell_residual=numerics["preserve_cell_residual"]))
-            if graph.strassen:      # sum buffers + scratch, after the LSTM workspace
-                operation.scratch_bytes += strassen_bytes(shape)
+                preserve_cell_residual=numerics["preserve_cell_residual"])
         elif operation.op == "quantizer":
             operation.scratch_bytes = quantizer_scratch_bytes(shape[0])
         elif operation.op == "tanh":
@@ -414,9 +410,7 @@ def _prepare_operation(graph, image, identity_address, zero_address, operation):
             input_address=source.address, output_address=output.address,
             scratch_address=graph.scratch_address, identity_address=identity_address,
             zero_address=zero_address, skip=module.skip,
-            recurrent_precision=recurrent_precision, **_lstm_numerics(graph, operation),
-            strassen_address=(graph.scratch_address + operation.scratch_bytes - strassen_bytes(source.shape)
-                              if graph.strassen and strassen_level(source.shape) else None))
+            recurrent_precision=recurrent_precision, **_lstm_numerics(graph, operation))
     elif operation.op == "quantizer":
         operation.plan = prepare_quantizer(module, image, frames=source.shape[0],
             source_address=source.address, destination_address=output.address,
@@ -479,7 +473,7 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm
                    lstm_cell_precision="bf16", lstm_tanh_precision="bf16", lstm_math_scope="both",
                    lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False,
                    filter_accumulation="serial", filter_math_scope="both", filter_stage="both",
-                   memory_layout=None, strassen=True) -> dict:
+                   memory_layout=None) -> dict:
     if memory_layout is not None and memory_layout not in LAYOUTS:
         raise ValueError("Unsupported BigCodec memory layout")
     layout = memory_layout
@@ -493,7 +487,7 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm
                 compensated_codebook=compensated_codebook,
                 filter_accumulation=filter_accumulation, filter_math_scope=filter_math_scope,
                 filter_stage=filter_stage,
-                memory_layout=layout, strassen=strassen)
+                memory_layout=layout)
         except _ModelCapacityError as error:
             if memory_layout is not None:
                 raise
@@ -513,24 +507,23 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                     lstm_math_scope="both", lstm_fused_gates=False, center_quantizer_scores=False,
                     compensated_codebook=False,
                     filter_accumulation="serial", filter_math_scope="both", filter_stage="both",
-                    memory_layout=None, strassen=True) -> dict:
+                    memory_layout=None) -> dict:
     if encoder.training or decoder.training:
         raise ValueError("Compile eval models loaded with remove_weight_norm=True")
     if any(name.endswith(("weight_g", "weight_v"))
            for model in (encoder, decoder) for name, _ in model.named_parameters()):
         raise ValueError("Remove all weight normalization before reading compile-time weights")
     compiled_samples = compiled_sample_count(samples)
-    graph = build_graph(encoder, decoder, compiled_samples,
-                        conv_precision=conv_precision, lstm_precision=lstm_precision,
-                        lstm_cell_precision=lstm_cell_precision,
-                        lstm_tanh_precision=lstm_tanh_precision, lstm_math_scope=lstm_math_scope,
-                        lstm_fused_gates=lstm_fused_gates,
-                        center_quantizer_scores=center_quantizer_scores,
-                        compensated_codebook=compensated_codebook,
-                        filter_accumulation=filter_accumulation, filter_math_scope=filter_math_scope,
-                        filter_stage=filter_stage)
-    graph.strassen = bool(strassen)
-    graph = plan_memory(graph, layout=memory_layout)
+    graph = plan_memory(build_graph(encoder, decoder, compiled_samples,
+                                   conv_precision=conv_precision, lstm_precision=lstm_precision,
+                                   lstm_cell_precision=lstm_cell_precision,
+                                   lstm_tanh_precision=lstm_tanh_precision, lstm_math_scope=lstm_math_scope,
+                                   lstm_fused_gates=lstm_fused_gates,
+                                   center_quantizer_scores=center_quantizer_scores,
+                                   compensated_codebook=compensated_codebook,
+                                   filter_accumulation=filter_accumulation, filter_math_scope=filter_math_scope,
+                                   filter_stage=filter_stage),
+                        layout=memory_layout)
     layout = graph.layout
     image = shared._ImageBuilder(layout.model_base, layout.model_limit)
     zero_address = image.allocate(torch.zeros(udc.URAM_NEAR_FULL_SIZE // 2, dtype=torch.bfloat16), alignment=128)
@@ -638,8 +631,6 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                 "fused_projection_bias": lstm_fused_gates,
                 "timestep_program": "Counted device loop for SRAM recurrence; unrolled DRAM fallback",
                 "paired_sigmoid_operations": paired_operations,
-                "strassen_input_projection": {op.name: op.plan.layers[0].strassen["level"]
-                    for op in graph.operations if op.op == "lstm" and op.plan.layers[0].strassen},
             },
             "quantizer": "SRAM comparison masks and first seven tournament rounds",
             "waveform_tanh": "SRAM Pade evaluation with full 128-byte sample rows and explicit zero padding",
@@ -695,8 +686,6 @@ def main():
                         help="Select the stack that uses the requested FIR accumulation")
     parser.add_argument("--filter-stage", choices=("up", "down", "both"), default="both",
                         help="Select resampling stages for matrix FIR; remaining stages use legacy FIR")
-    parser.add_argument("--strassen", action=argparse.BooleanOptionalAction, default=False,
-                        help="LSTM input projections (>=128 frames) on the level-2 Strassen matmul (off by default: no measured gain on one engine)")
     parser.add_argument("--memory-layout", choices=("auto", *(layout.name for layout in LAYOUTS)),
                         default="auto", help="Auto replans larger programs; an explicit arena avoids retrying compilation")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -732,7 +721,7 @@ def main():
                                  center_quantizer_scores=args.center_quantizer_scores,
                                  compensated_codebook=args.compensated_codebook,
                                  filter_accumulation=args.filter_accumulation, filter_math_scope=args.filter_math_scope,
-                                 filter_stage=args.filter_stage, strassen=args.strassen,
+                                 filter_stage=args.filter_stage,
                                  memory_layout=next((layout for layout in LAYOUTS if layout.name == args.memory_layout), None))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix="bigcodec-", suffix=".tmp", dir=args.output.parent)
@@ -755,7 +744,6 @@ def main():
         "filter_accumulation": args.filter_accumulation, "filter_math_scope": args.filter_math_scope,
         "filter_stage": args.filter_stage,
         "memory_layout": payload["hardware"]["memory_layout"],
-        "lstm_strassen": payload["execution_optimizations"]["lstm"]["strassen_input_projection"],
         "bin_bytes": args.output.stat().st_size, "native_samples": samples,
         "compiled_samples": hardware["compiled_samples"], "code_frames": hardware["code_frames"],
         "operations": len(hardware["operations"]), "instructions": hardware["instructions"],

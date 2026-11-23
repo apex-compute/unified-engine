@@ -183,9 +183,6 @@ except Exception:                                    # pragma: no cover
 # the mel frames) no longer fit the shared activation pool.
 T2W_FPGA_MAX_CODES = 300
 T2W_CONV_ROUTER = False   # --conv-router: BigVGAN conv1ds via UnifiedEngine.conv2d_auto
-# Strassen matmuls (nn_lib section 10, online leaves) on the Token2Wav DiT block matmuls.
-# Off by default: on vs off back to back the DiT measured 64.1 vs 64.4 s (0.5%). --strassen.
-STRASSEN = False
 
 REQUIRED_ENGINES = _layout_mod.REQUIRED_ENGINES
 REQUIRED_DRAM_GIB = _layout_mod.REQUIRED_DRAM_GIB
@@ -3442,8 +3439,7 @@ def _token2wav_on_fpga(vocoder, codes: list[int], spk: dict, layout=None):
     cores = cores_mod.Cores(REQUIRED_ENGINES, memory_map=memory_map)
     pipe = t2w_mod.Token2WavFpga(
         cores, vocoder, codes=len(codes),
-        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")), conv_router=T2W_CONV_ROUTER,
-        strassen=STRASSEN)
+        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")), conv_router=T2W_CONV_ROUTER)
     setup_s = time.perf_counter() - started
     wav, info = pipe.synthesize(
         _torch.tensor([codes], dtype=_torch.long), spk["cond"].float(),
@@ -3490,8 +3486,7 @@ def _host_build_token2wav(model_dir: str, plan) -> dict:
     cores = cores_mod.ImageCores(REQUIRED_ENGINES, memory_map=memory_map)
     pipe = t2w_mod.Token2WavFpga(
         cores, vocoder, codes=T2W_FPGA_MAX_CODES,
-        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")), conv_router=T2W_CONV_ROUTER,
-        strassen=STRASSEN)
+        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")), conv_router=T2W_CONV_ROUTER)
     build = {"cores": cores, "pipe": pipe, "memory_map": memory_map, "vocoder": vocoder,
              "built_s": time.perf_counter() - started}
     _T2W_HOST_BUILDS[key] = build
@@ -3517,8 +3512,7 @@ def _ensure_speech_params(script_dir: str, cfg: dict, args, plan) -> None:
     regions = _weight_mod.params_regions(script_dir)
     if "token2wav" in regions and (
             "talker" not in regions   # keep the order
-            or bool(regions["token2wav"].get("meta", {}).get("conv_router")) != T2W_CONV_ROUTER
-            or bool(regions["token2wav"].get("meta", {}).get("strassen")) != STRASSEN):
+            or bool(regions["token2wav"].get("meta", {}).get("conv_router")) != T2W_CONV_ROUTER):
         _weight_mod.drop_params_regions(script_dir, ["token2wav"])
         regions = _weight_mod.params_regions(script_dir)
     if "talker" not in regions:
@@ -3538,8 +3532,7 @@ def _ensure_speech_params(script_dir: str, cfg: dict, args, plan) -> None:
             for e, off, size in cores_mod.weight_images(cores))
         _weight_mod.append_params_region(
             script_dir, "token2wav", items,
-            meta={"max_codes": T2W_FPGA_MAX_CODES, "conv_router": T2W_CONV_ROUTER,
-                  "strassen": STRASSEN})
+            meta={"max_codes": T2W_FPGA_MAX_CODES, "conv_router": T2W_CONV_ROUTER})
 
 
 def _stage_token2wav(ue, model_dir: str, saved: dict | None = None,
@@ -3578,8 +3571,7 @@ def _stage_token2wav(ue, model_dir: str, saved: dict | None = None,
                  "cores": cores_mod.compile_state(build["cores"])}
     pipe = t2w_mod.Token2WavFpga(
         cores, vocoder, codes=T2W_FPGA_MAX_CODES, compile=False, state=state["pipe"],
-        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")), conv_router=T2W_CONV_ROUTER,
-        strassen=STRASSEN)
+        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")), conv_router=T2W_CONV_ROUTER)
     cores_mod.restore_state(cores, state["cores"])
     # Weights: params.bin -> DRAM (engine 0: the pool; the others: their constants).
     region = ue._read_params_region("token2wav")
@@ -4082,14 +4074,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="FPGA Token2Wav: BigVGAN conv1ds via UnifiedEngine.conv2d_auto (Winograd / CONV2D walker)",
     )
     parser.add_argument(
-        "--strassen", action="store_true",
-        help="Strassen on the Token2Wav DiT block matmuls (off by default: ~0.5%% measured)",
-    )
-    parser.add_argument(
-        "--no-strassen", action="store_true",
-        help="plain matmuls everywhere (the default; kept for older command lines)",
-    )
-    parser.add_argument(
         "--token2wav-host", action="store_true",
         help=("run Token2Wav (DiT + BigVGAN) on the CPU in FP32 instead of the eight FPGA "
               f"engines. By default --speak is FPGA end to end, and speech is capped at "
@@ -4278,14 +4262,8 @@ def run_summary_filename(args) -> str:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
-    global T2W_CONV_ROUTER, STRASSEN
+    global T2W_CONV_ROUTER
     T2W_CONV_ROUTER = args.conv_router
-    STRASSEN = args.strassen and not args.no_strassen
-    if STRASSEN:
-        # Token2Wav program space per engine: 16.6 MiB measured plain + 132 Strassen
-        # calls (22 blocks x 6 matmuls) x ~0.23 MiB each (Alpamayo's measured cost per
-        # call) = ~47 MiB; 52 leaves ~10% for the difference in shapes.
-        _layout_mod.FLAT_T2W_ISA_MIB = 52
     if T2W_CONV_ROUTER:                 # Winograd kernel planes: 672.6 MiB of Token2Wav weights
         _layout_mod.FLAT_WEIGHT_POOLS_MIB["t2w"] = 680
     if os.environ.get("OMNI_WATCHDOG_S"):

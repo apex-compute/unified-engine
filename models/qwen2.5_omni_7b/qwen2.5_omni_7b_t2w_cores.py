@@ -200,10 +200,8 @@ class Cores:
     def weights(self) -> UnifiedEngine:
         return self.engines[0]
 
-    def put_weight(self, t: torch.Tensor, keep_dtype: bool = False) -> int:
-        """Upload a weight as bf16 (keep_dtype: in its own 16-bit dtype, e.g. an fp16
-        Strassen leaf bias, which must not be cast)."""
-        blob = user_dma_core.tensor_le_bytes(t.detach()) if keep_dtype else _bf16_bytes(t)
+    def put_weight(self, t: torch.Tensor) -> int:
+        blob = _bf16_bytes(t)
         addr = self.engines[0].allocate_params_dram(len(blob))
         if not self.upload_weights:
             return addr          # the bytes are already in DRAM (loaded from params.bin)

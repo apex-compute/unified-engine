@@ -74,17 +74,8 @@ from user_dma_core import (                          # noqa: E402
 )
 from models.profile_report import (aggregate_checkpoints, annotate_execution,
                                    measurement, write_profile_markdown)
-from nn_lib import (strassen_if4_cells, strassen_levels, strassen_matmul_core_dram,  # noqa: E402
-                    strassen_online_sum_count, strassen_online_sums_core, strassen_online_tree)
 
 BF16 = 2
-
-# Vision-encoder Strassen matmuls (nn_lib §10, online IF4 leaves: the weight is stored once as
-# cells, the program makes the weight sums right before each matmul in one shared fp16 pool).
-# Off by default (one engine builds every call's sums: vision measured ~4% slower);
-# --vision-strassen turns it on. The level follows the row count the encoder is compiled
-# for (_vis_st_level); the LM is untouched (it runs one row at a time).
-VIS_STRASSEN = False
 MODEL_PATH = "/srv/model_files/Qwen3.5-2B-ModelFiles/Qwen3.5-2B"
 CONFIG_PATH = _THIS.parent / "qwen3.5_2b_config.json"
 
@@ -4400,57 +4391,15 @@ def _upload_bf16(ue, t: torch.Tensor, nelem: int) -> int:
     return addr
 
 def run_fpga_vision_encoder(ue, model_dir: str, hf_inputs, setup_only: bool = False,
-                            build_only: bool = False, strassen: bool | None = None):
+                            build_only: bool = False):
     """Run the compact single-capture vision encoder STANDALONE (build + execute
     at program base) and return the merged ``[N_merged, fc2_dim]`` tokens; the
     encoder bytes are stashed on ``ue._vis_encoder_bytes`` for the unified bin.
     ``setup_only=True`` only uploads the vision weights + per-image inputs for
-    the bin-load path and returns None. ``strassen``: None = VIS_STRASSEN; the
-    bin-load path passes the setting the bin was built with (it moves addresses)."""
+    the bin-load path and returns None."""
     if os.environ.get("VIS_LEGACY"):
         return _run_fpga_vision_encoder_legacy(ue, model_dir, hf_inputs)
-    strassen = VIS_STRASSEN if strassen is None else strassen
-    ue._vis_strassen = bool(strassen)
-    return _run_fpga_vision_encoder_compact(ue, model_dir, hf_inputs, setup_only, build_only,
-                                            strassen)
-
-
-def _vis_st_level(on: bool, M: int, K: int, N: int) -> int:
-    """Strassen level for one vision matmul (0 = plain). Measured rule: under 128 rows or a
-    width under 1024 does not pay; 128-255 rows or both widths under 2048 -> level 1;
-    256+ rows and a width of 2048+ -> level 2. M must split evenly 2^level ways."""
-    if not on or M < 128 or min(K, N) < 1024:
-        return 0
-    L = strassen_levels(K, N, 2 if (M >= 256 and max(K, N) >= 2048) else 1)
-    return L if M % (1 << L) == 0 else 0
-
-
-def _upload_fp4_strassen(ue, w: torch.Tensor, b: torch.Tensor, L: int, pool: int) -> dict:
-    """One FP4_64 weight [N, K] as Strassen online leaves: the same pack quantize_fp4_64
-    makes (a valid IF4 pack: FP4 nibbles, low nibble first, positive bf16 scale per 64)
-    cut into 4^L cells, nothing re-quantized. Its sum leaves live in the shared pool."""
-    N, K = w.shape
-    scales, packed = quantize_fp4_64(w)
-
-    def store_pack(d, s, n, k, t):
-        s_addr = ue.allocate_params_dram(len(s))
-        ue.dma_write(DMA_DEVICE_H2C, s_addr, s, len(s))
-        d_addr = ue.allocate_params_dram(len(d))
-        ue.dma_write(DMA_DEVICE_H2C, d_addr, d, len(d))
-        return d_addr, s_addr
-
-    def store_b(t):                             # leaf bias, fp16 or bf16: uploaded as it is
-        t = t.detach().contiguous().cpu()
-        addr = ue.allocate_params_dram(t.numel() * BF16)
-        ue.dma_write(DMA_DEVICE_H2C, addr, t, t.numel() * BF16)
-        return addr
-
-    n, k = N >> L, K >> L
-    cells = strassen_if4_cells(packed.numpy().tobytes(), scales.contiguous().view(torch.uint8).numpy().tobytes(),
-                               N, K, L, store_pack)
-    sums = [pool + i * n * k * BF16 for i in range(strassen_online_sum_count(L))]
-    return {"L": L, "cells": cells, "n": n, "k": k, "sums": sums,
-            "tree": strassen_online_tree(cells, sums, L, b.detach(), store_b)}
+    return _run_fpga_vision_encoder_compact(ue, model_dir, hf_inputs, setup_only, build_only)
 
 
 UNIFIED_BIN_NAME  = "programs.bin"
@@ -4503,7 +4452,6 @@ def write_unified_bin(ue, bin_dir: str, encoder_bytes: bytes, vis_meta: dict,
         "mg_out":    vis_meta.get("mg_out"),
         "n_merged":  vis_meta.get("n_merged"),
         "fc2_dim":   vis_meta.get("fc2_dim"),
-        "vision_strassen": bool(vis_meta.get("vision_strassen", False)),
     }
     with open(uni_bin, "wb") as f:
         f.write(bytes(raw))
@@ -4520,8 +4468,7 @@ def run_vision_from_bin(ue, raw: bytes, meta: dict, model_dir: str, hf_inputs) -
     upload vision weights/inputs incl. the shared VIS_ZEROS buffer (setup_only) →
     DMA the encoder program to base 0xD0000000 → trigger → read merged tokens.
     Must run BEFORE the single prepare_inference (encoder owns params at base)."""
-    run_fpga_vision_encoder(ue, model_dir, hf_inputs, setup_only=True,
-                            strassen=meta.get("vision_strassen", False))
+    run_fpga_vision_encoder(ue, model_dir, hf_inputs, setup_only=True)
     ue.reset_program_dram_addr()
     enc_addr = ue.get_program_dram_addr()
     ue.dma_write(DMA_DEVICE_H2C, enc_addr,
@@ -4569,7 +4516,7 @@ def load_decoder_from_bin(ue, raw: bytes, meta: dict) -> None:
 
 
 def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: bool = False,
-                                     build_only: bool = False, strassen: bool = False):
+                                     build_only: bool = False):
     from transformers import AutoModelForImageTextToText
     print(f"  [vision-compact] Loading HF visual ...", end=" ", flush=True)
     t_load = time.time()
@@ -4650,26 +4597,6 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     MG_FC1_OUT = ue.allocate_tensor_dram(N_M * K_FC * BF16)
     MG_OUT     = ue.allocate_tensor_dram(N_M * FC2_DIM * BF16)
 
-    # Strassen (nn_lib §10): level per matmul from the compiled row count, then one private
-    # fp16 scratch per depth sized for the largest use (tensor DRAM, zero-filled below) and
-    # one fp16 pool for the on-chip weight sums (params DRAM). The pool is shared by every
-    # Strassen matmul: each one's sums are made right before it runs, on this one engine.
-    st_shapes = {"qkv": (N_P, HIDDEN, QKV_DIM), "proj": (N_P, HIDDEN, HIDDEN),
-                 "fc1": (N_P, HIDDEN, MLP_INT), "fc2": (N_P, MLP_INT, HIDDEN),
-                 "mg_fc1": (N_M, K_FC, K_FC), "mg_fc2": (N_M, K_FC, FC2_DIM)}
-    st_lv = {op: _vis_st_level(strassen, *shp) for op, shp in st_shapes.items()}
-    st_uses = [(*st_shapes[op], L) for op, L in st_lv.items() if L]
-    st_scr, st_scr_elems = [], []
-    for d in range(max((u[3] for u in st_uses), default=0)):
-        live = [u for u in st_uses if u[3] > d]
-        xe = 9 * max((m >> (d + 1)) * (k >> (d + 1)) for m, k, n, L in live)
-        pe = 14 * max((m >> (d + 1)) * (n >> (d + 1)) for m, k, n, L in live)
-        st_scr.append((ue.allocate_tensor_dram(xe * BF16, align_bytes=128),
-                       ue.allocate_tensor_dram(pe * BF16, align_bytes=128)))
-        st_scr_elems.append((xe, pe))
-    st_pool_elems = max((strassen_online_sum_count(L) * (n >> L) * (k >> L)
-                         for m, k, n, L in st_uses), default=0)
-
     # --- Params DRAM: BF16 (norms/biases/patch/pos) + FP4 weights ---
     PATCH_W = _upload_bf16(ue, pe_w, HIDDEN * K_PIXEL)
     PATCH_B = _upload_bf16(ue, pe_b, HIDDEN)
@@ -4679,15 +4606,6 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     # params layout so setup_only recreates it for a prebuilt encoder bin too.
     VIS_INV_N = _upload_bf16(
         ue, torch.full((HIDDEN,), 1.0 / HIDDEN, dtype=torch.bfloat16), HIDDEN)
-    ST_POOL = ue.allocate_params_dram(st_pool_elems * BF16, align_bytes=128) if st_uses else None
-
-    def _vis_w(op, lin, L, s_key, d_key):
-        """One FP4 linear: the plain pack into L[s_key], L[d_key], or Strassen cells into L["st"][op]."""
-        if st_lv[op]:
-            L.setdefault("st", {})[op] = _upload_fp4_strassen(
-                ue, lin.weight.detach().float(), lin.bias, st_lv[op], ST_POOL)
-        else:
-            L[s_key], L[d_key] = _upload_fp4(ue, lin.weight.detach().float())
     layer_addrs = []
     for li in range(DEPTH):
         bi = visual.blocks[li]
@@ -4701,21 +4619,18 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
             "FC1_B": _upload_bf16(ue, bi.mlp.linear_fc1.bias, MLP_INT),
             "FC2_B": _upload_bf16(ue, bi.mlp.linear_fc2.bias, HIDDEN),
         }
-        _vis_w("qkv",  bi.attn.qkv,       L, "QKV_W_SCALE",  "QKV_W_DATA")
-        _vis_w("proj", bi.attn.proj,      L, "PROJ_W_SCALE", "PROJ_W_DATA")
-        _vis_w("fc1",  bi.mlp.linear_fc1, L, "FC1_W_SCALE",  "FC1_W_DATA")
-        _vis_w("fc2",  bi.mlp.linear_fc2, L, "FC2_W_SCALE",  "FC2_W_DATA")
+        L["QKV_W_SCALE"], L["QKV_W_DATA"]   = _upload_fp4(ue, bi.attn.qkv.weight.detach().float())
+        L["PROJ_W_SCALE"], L["PROJ_W_DATA"] = _upload_fp4(ue, bi.attn.proj.weight.detach().float())
+        L["FC1_W_SCALE"], L["FC1_W_DATA"]   = _upload_fp4(ue, bi.mlp.linear_fc1.weight.detach().float())
+        L["FC2_W_SCALE"], L["FC2_W_DATA"]   = _upload_fp4(ue, bi.mlp.linear_fc2.weight.detach().float())
         layer_addrs.append(L)
     mg = visual.merger
     MG_LN_W  = _upload_bf16(ue, mg.norm.weight, HIDDEN)
     MG_LN_B  = _upload_bf16(ue, mg.norm.bias,   HIDDEN)
     MG_FC1_B = _upload_bf16(ue, mg.linear_fc1.bias, K_FC)
     MG_FC2_B = _upload_bf16(ue, mg.linear_fc2.bias, FC2_DIM)
-    MG = {}
-    _vis_w("mg_fc1", mg.linear_fc1, MG, "FC1_S", "FC1_D")
-    _vis_w("mg_fc2", mg.linear_fc2, MG, "FC2_S", "FC2_D")
-    MG_FC1_S, MG_FC1_D = MG.get("FC1_S"), MG.get("FC1_D")
-    MG_FC2_S, MG_FC2_D = MG.get("FC2_S"), MG.get("FC2_D")
+    MG_FC1_S, MG_FC1_D = _upload_fp4(ue, mg.linear_fc1.weight.detach().float())
+    MG_FC2_S, MG_FC2_D = _upload_fp4(ue, mg.linear_fc2.weight.detach().float())
 
     # Inputs.
     ue.dma_write(DMA_DEVICE_H2C, PIXEL, _bf(pixel_values), N_P * K_PIXEL * BF16)
@@ -4729,15 +4644,8 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
                  _bf(torch.zeros(HIDDEN, dtype=torch.bfloat16)), HIDDEN * BF16)
     ue.dma_write(DMA_DEVICE_H2C, VIS_ROPE, _bf(rope_tiled),
                  N_HEADS * N_P * 2 * HEAD_D * BF16)
-    for (xa, pa), (xe, pe) in zip(st_scr, st_scr_elems):     # fresh DRAM holds NaN patterns
-        for addr, elems in ((xa, xe), (pa, pe)):
-            ue.dma_write(DMA_DEVICE_H2C, addr, torch.zeros(elems, dtype=torch.bfloat16), elems * BF16)
     del hf
     print(f"({time.time()-t_w:.1f}s)")
-    if st_uses:
-        print(f"  [vision-compact] Strassen levels {st_lv}: scratch "
-              f"{sum(x + p for x, p in st_scr_elems) * BF16 / 2**20:.1f} MB (tensor DRAM), "
-              f"sum pool {st_pool_elems * BF16 / 2**20:.1f} MB (params DRAM)")
 
     # setup_only (bin-load path in run_from_bin): vision weights +
     # per-image inputs are now resident at the same deterministic addresses the
@@ -4798,23 +4706,6 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     # FLOP accounting only: sum what matmul / layer-norm / RoPE / attention return at compile
     # time. The chunked residual adds (eltwise_add_core returns no count) are not included.
     _vis_flops = _FlopSum()
-    def _vis_mm(op, M, K, N, A, OUT, B, W_DATA, W_SCALE, node, gelu=False):
-        """One FP4 linear: Strassen (its weight sums into the shared pool first) when the
-        upload gave it a node, else the plain PBI matmul on vis_M rows. -> FLOPs for _vis_flops."""
-        act = {"gelu_enable": True} if gelu else {}
-        if node is None:
-            return ue.matmat_mul_core(M=M, K=K, N=N,
-                A_DRAM_ADDR=A, B_DRAM_ADDR=W_DATA, OUTPUT_DRAM_ADDR=OUT,
-                C_DRAM_ADDR=B, bias_mode="broadcast_N",
-                is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=W_SCALE,
-                gpr_M_reg=vis_M, **act)
-        assert (M, K, N) == st_shapes[op] and M % (1 << node["L"]) == 0, \
-            f"Strassen {op}: scratch sized for {st_shapes[op]}, asked for {(M, K, N)}"
-        strassen_online_sums_core(ue, node["cells"], node["n"], node["k"], node["sums"], node["L"])
-        strassen_matmul_core_dram(ue, M, K, N, A, node["tree"], OUT, st_scr[:node["L"]],
-                                  activation=act or None, identity_addr=VIS_EYE if gelu else None)
-        return 2 * M * K * N                                    # the model's FLOPs, as the plain matmul counts them
-
     ue.start_capture()
     ue.generate_instruction_add_set(vis_M, N_P)
 
@@ -4832,9 +4723,11 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
             OUTPUT_DRAM_ADDR=LN1_OUT, GAMMA_DRAM_ADDR=L["LN1_W"],
             BETA_DRAM_ADDR=L["LN1_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS,
             INV_N_DRAM_ADDR=ln_inv_n)
-        st = L.get("st", {})
-        _vis_flops += _vis_mm("qkv", N_P, HIDDEN, QKV_DIM, LN1_OUT, QKV_OUT, L["QKV_B"],
-                L.get("QKV_W_DATA"), L.get("QKV_W_SCALE"), st.get("qkv"))
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=HIDDEN, N=QKV_DIM,
+            A_DRAM_ADDR=LN1_OUT, B_DRAM_ADDR=L["QKV_W_DATA"], OUTPUT_DRAM_ADDR=QKV_OUT,
+            C_DRAM_ADDR=L["QKV_B"], bias_mode="broadcast_N",
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["QKV_W_SCALE"],
+            gpr_M_reg=vis_M)
         # Permute Q,K,V (interleaved [N_P, 3*HIDDEN]) → head-major [N_HEADS, N_P, HEAD_D].
         for h in range(N_HEADS):
             for srcbase, dst in ((0,        Q_PERM),
@@ -4868,17 +4761,26 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
             ue.ue_memcpy_to_dram(MEMCPY_TYPE.URAM.value, URAM_SECTION.URAM_A.value,
                 URAM_START_ADDR, ATTN_CONCAT + h * HEAD_D * BF16, N_P * HEAD_D * BF16,
                 stride_bytes_per_chunk=HEAD_D * BF16, stride_jump_bytes=HIDDEN * BF16)
-        _vis_flops += _vis_mm("proj", N_P, HIDDEN, HIDDEN, ATTN_CONCAT, ATTN_PROJ, L["PROJ_B"],
-                L.get("PROJ_W_DATA"), L.get("PROJ_W_SCALE"), st.get("proj"))
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=HIDDEN, N=HIDDEN,
+            A_DRAM_ADDR=ATTN_CONCAT, B_DRAM_ADDR=L["PROJ_W_DATA"], OUTPUT_DRAM_ADDR=ATTN_PROJ,
+            C_DRAM_ADDR=L["PROJ_B"], bias_mode="broadcast_N",
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["PROJ_W_SCALE"],
+            gpr_M_reg=vis_M)
         _emit_residual_add(BLOCK_OUT, ATTN_PROJ, POST_ATTN)
         _vis_flops += ue.layer_norm_core_dram(M=N_P, N=HIDDEN, A_DRAM_ADDR=POST_ATTN,
             OUTPUT_DRAM_ADDR=LN2_OUT, GAMMA_DRAM_ADDR=L["LN2_W"],
             BETA_DRAM_ADDR=L["LN2_B"], gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS,
             INV_N_DRAM_ADDR=ln_inv_n)
-        _vis_flops += _vis_mm("fc1", N_P, HIDDEN, MLP_INT, LN2_OUT, FC1_GELU_OUT, L["FC1_B"],
-                L.get("FC1_W_DATA"), L.get("FC1_W_SCALE"), st.get("fc1"), gelu=True)
-        _vis_flops += _vis_mm("fc2", N_P, MLP_INT, HIDDEN, FC1_GELU_OUT, FC2_OUT, L["FC2_B"],
-                L.get("FC2_W_DATA"), L.get("FC2_W_SCALE"), st.get("fc2"))
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=HIDDEN, N=MLP_INT,
+            A_DRAM_ADDR=LN2_OUT, B_DRAM_ADDR=L["FC1_W_DATA"], OUTPUT_DRAM_ADDR=FC1_GELU_OUT,
+            C_DRAM_ADDR=L["FC1_B"], bias_mode="broadcast_N",
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["FC1_W_SCALE"],
+            gelu_enable=True, gpr_M_reg=vis_M)
+        _vis_flops += ue.matmat_mul_core(M=N_P, K=MLP_INT, N=HIDDEN,
+            A_DRAM_ADDR=FC1_GELU_OUT, B_DRAM_ADDR=L["FC2_W_DATA"], OUTPUT_DRAM_ADDR=FC2_OUT,
+            C_DRAM_ADDR=L["FC2_B"], bias_mode="broadcast_N",
+            is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=L["FC2_W_SCALE"],
+            gpr_M_reg=vis_M)
         _emit_residual_add(POST_ATTN, FC2_OUT, BLOCK_OUT)
 
     # Phase 4: merger (spatial-merge implicit via M=N_M, K=K_FC reshape).
@@ -4886,10 +4788,16 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
         OUTPUT_DRAM_ADDR=MG_LN_OUT, GAMMA_DRAM_ADDR=MG_LN_W, BETA_DRAM_ADDR=MG_LN_B,
         gpr_M_reg=ln_reg, ZEROS_DRAM_ADDR=VIS_ZEROS, INV_N_DRAM_ADDR=ln_inv_n)
     ue.generate_instruction_add_set(vis_M, N_M)
-    _vis_flops += _vis_mm("mg_fc1", N_M, K_FC, K_FC, MG_LN_OUT, MG_FC1_OUT, MG_FC1_B,
-            MG_FC1_D, MG_FC1_S, MG.get("st", {}).get("mg_fc1"), gelu=True)
-    _vis_flops += _vis_mm("mg_fc2", N_M, K_FC, FC2_DIM, MG_FC1_OUT, MG_OUT, MG_FC2_B,
-            MG_FC2_D, MG_FC2_S, MG.get("st", {}).get("mg_fc2"))
+    _vis_flops += ue.matmat_mul_core(M=N_M, K=K_FC, N=K_FC,
+        A_DRAM_ADDR=MG_LN_OUT, B_DRAM_ADDR=MG_FC1_D, OUTPUT_DRAM_ADDR=MG_FC1_OUT,
+        C_DRAM_ADDR=MG_FC1_B, bias_mode="broadcast_N",
+        is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=MG_FC1_S,
+        gelu_enable=True, gpr_M_reg=vis_M)
+    _vis_flops += ue.matmat_mul_core(M=N_M, K=K_FC, N=FC2_DIM,
+        A_DRAM_ADDR=MG_FC1_OUT, B_DRAM_ADDR=MG_FC2_D, OUTPUT_DRAM_ADDR=MG_OUT,
+        C_DRAM_ADDR=MG_FC2_B, bias_mode="broadcast_N",
+        is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=MG_FC2_S,
+        gpr_M_reg=vis_M)
 
     ue.generate_instruction_halt()
     ue.stop_capture()
@@ -5270,12 +5178,7 @@ def main():
                     help="Skip compiling: load qwen3.5_2b_bin/programs.{bin,json} written by an "
                          "earlier run (error if missing or stale). Default: always recompile "
                          "and rewrite programs.bin.")
-    ap.add_argument("--vision-strassen", action="store_true",
-                    help="Strassen matmuls in the FPGA vision encoder (nn_lib §10; off by "
-                         "default: on one engine it measured ~4%% slower).")
     args = ap.parse_args()
-    global VIS_STRASSEN
-    VIS_STRASSEN = args.vision_strassen
     if args.profile and (args.image or args.vision_enable):
         ap.error("--profile currently benchmarks the LM path; omit --image/--vision-enable")
     if args.run_from_bin and (args.profile or args.multi_core > 1):
@@ -5455,17 +5358,14 @@ def main():
     # match this code/context, and carry an encoder section for an on-FPGA VLM run.
     ue.max_context = MAX_CONTEXT
     need_build = ((_meta is None) or (_meta.get("cache_key") != ue._decoder_cache_key())
-                  or (want_vision and _meta.get("encoder_size", 0) == 0)
-                  or (want_vision and _meta.get("vision_strassen", False) != VIS_STRASSEN))
+                  or (want_vision and _meta.get("encoder_size", 0) == 0))
     if args.run_from_bin and need_build:
         if _meta is None:
             _why = f"{uni_bin} / {uni_meta_path} not found"
         elif _meta.get("cache_key") != ue._decoder_cache_key():
             _why = f"{uni_bin} is stale (cache_key mismatch for this code / context)"
-        elif want_vision and _meta.get("encoder_size", 0) == 0:
-            _why = f"{uni_bin} has no vision-encoder section (needed for on-FPGA vision)"
         else:
-            _why = f"{uni_bin} was built with the other vision Strassen setting (--vision-strassen)"
+            _why = f"{uni_bin} has no vision-encoder section (needed for on-FPGA vision)"
         print(f"ERROR: --run-from-bin: {_why}. Rerun without --run-from-bin to compile.",
               file=sys.stderr, flush=True)
         sys.exit(1)
@@ -5499,8 +5399,7 @@ def main():
             vis_encoder_bytes = ue._vis_encoder_bytes
             vis_meta = {"n_patches": ue._vis_n_patches, "mg_out": ue._vis_encoder_out_dram,
                         "n_merged": ue._vis_n_merged, "fc2_dim": ue._vis_fc2_dim,
-                        "encoder_flops": getattr(ue, "_vis_encoder_flops", None),
-                        "vision_strassen": getattr(ue, "_vis_strassen", False)}
+                        "encoder_flops": getattr(ue, "_vis_encoder_flops", None)}
             ue.reset_params_dram_addr()
             ue.reset_tensor_dram_addr()
             ue.reset_program_dram_addr()
