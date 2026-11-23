@@ -13,8 +13,8 @@ on one buffer of known values:
   C  identity dot  an on-chip identity matrix-vector product per 64 values with the activation
                    fields set (the matmul epilogue, without the DRAM round trip)  <- slower fallback
   D  looped C      nn_lib._strassen_activate in place on a DRAM buffer: route C with the products
-                   in a hardware loop (STRASSEN_ACTIVATE_LOOPED 1 = rows, 2 = rows and pieces)
-                   against its unrolled form (0), on the full buffer and on a multi-piece one
+                   and the pieces in hardware loops, against route C unrolled over the same buffer
+                   (one product per 64 values), on one piece and on a multi-piece buffer
 
 for GELU (x * sigmoid(1.702 x), the hardware's), SiLU and ReLU. Per method and activation it says
 WORKS (the result is the activation), IGNORED (the result is x: the field does nothing there) or
@@ -27,20 +27,14 @@ prints the size of every program (instructions, bytes at 32 B per instruction).
   python models/alpamayo2_edge/utility/activation_pass_probe.py --looped-only     # baseline and route D
 """
 import argparse
-import os
 import sys
 import traceback
 
 import torch
 
-BF, FP = torch.bfloat16, torch.float16
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ACTS = {"gelu": lambda x: x * torch.sigmoid(1.702 * x), "silu": lambda x: x * torch.sigmoid(x), "relu": lambda x: x.clamp(min=0)}
+from strassen_probe_util import ACT_FN, ACT_KW, BF, FP, open_board, put as put_on, snr
 
-
-def snr(ref, x):
-    ref, x = ref.double(), x.double()
-    return float(10 * torch.log10(ref.pow(2).sum() / (ref - x).pow(2).sum().clamp_min(1e-300)))
+ACTS = {a: f for a, f in ACT_FN.items() if a}
 
 
 def main():
@@ -54,25 +48,16 @@ def main():
     assert E % 64 == 0 and 64 <= E <= 65536
     rows = E // 64
 
-    sys.path.insert(0, HERE)
-    import alpamayo2_edge_test as T
+    _, ue, _, _ = open_board(args.dev)
     import nn_lib
     import user_dma_core
     from storage_format import StorageFormat, TensorFormats
     from user_dma_core import BROADCAST_MODE, UE_MODE, URAM_SECTION, URAM_WRITE_SRC
-    dev = args.dev or T.CFG["defaults"]["dev"]
-    user_dma_core.set_dma_device(dev)
-    user_dma_core.configure_clock_from_hardware()
-    ue = T.Alpamayo2Edge_UnifiedEngine(dev=dev, engines=1)
     F16, B16 = StorageFormat.FP16, StorageFormat.BF16
     fm = TensorFormats(a=F16, b=B16, output=B16)              # fp16 in (zeros / identity are bf16), bf16 out
     A, WB = URAM_SECTION.URAM_A.value, URAM_WRITE_SRC.URAM_WRITE_BACK.value
     OUT_SRAM = 0x40000                                         # where route C writes inside URAM A, clear of the input
-
-    def put(t):
-        a = ue._alloc(t.numel())
-        ue.dma_to_accelerator_memory(a, t.contiguous().flatten())
-        return a
+    put = lambda t: put_on(ue, t)
 
     x = (torch.randn(E, generator=torch.Generator().manual_seed(args.seed)) * 2.0).to(FP)
     a_x, a_zero, a_eye = put(x), put(torch.zeros(E, dtype=BF)), put(torch.eye(64, dtype=BF))
@@ -157,11 +142,18 @@ def main():
         print(f"\nRESULT: FAIL (stopped in '{crashed}'; if it was a timeout the board needs a reset)")
         return 1
 
-    # Route D: the kernel's own pass, in place on DRAM, looped against unrolled.
-    KW = {"gelu": {"gelu_enable": True}, "silu": {"silu_enable": True},
-          "relu": {"clamp_enable": True, "clamp_min": 0.0, "clamp_max": float("inf")}}
-    FORMS = ((0, "unrolled"), (1, "rows looped"), (2, "rows + pieces looped"))
-    keep, d_bad = nn_lib.STRASSEN_ACTIVATE_LOOPED, []
+    # Route D: the kernel's own pass, in place on DRAM, against route C unrolled over the same buffer.
+    def unrolled(act, a_buf, n):                               # per piece: load, one identity product per 64 values, store
+        P = nn_lib.STRASSEN_PIECE_ELEMENTS
+        for e0 in range(0, n, P):
+            take = min(P, n - e0)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=a_buf + e0 * 2, sram_address=0x00000, element_size=take)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=a_eye, sram_address=0x80000, element_size=64 * 64)
+            identity_dot(act, take // 64)
+            ue.sram_to_accelerator_memory(OUT_SRAM, a_buf + e0 * 2, take)
+    FORMS = (("unrolled", unrolled),
+             ("looped (the kernel)", lambda act, a_buf, n: nn_lib._strassen_activate(ue, a_buf, n, ACT_KW[act], a_eye, B16)))
+    d_bad = []
     print(f"\n  route D: nn_lib._strassen_activate in place (time includes its loads and stores)")
     print(f"  {'values':>8} {'activation':10s} {'program':22s} {'instr':>7} {'bytes':>9} {'SNR vs activation':>18} {'SNR vs unrolled':>16} {'ns per value':>13}")
     try:
@@ -170,21 +162,21 @@ def main():
             a_buf = ue._alloc(n)
             for act, fn in ACTS.items():
                 want, first = fn(xn.double()), None
-                for form, name in FORMS:
+                for name, emit in FORMS:
                     crashed = f"D: {name}, {act}, {n} values"
                     print(f"  running: {crashed} ...", flush=True)
                     ue.dma_to_accelerator_memory(a_buf, xn)
-                    nn_lib.STRASSEN_ACTIVATE_LOOPED = form
                     count = [0]
 
-                    def body(act=act, a_buf=a_buf, n=n, count=count):
-                        nn_lib._strassen_activate(ue, a_buf, n, KW[act], a_eye, B16)
+                    def body(act=act, a_buf=a_buf, n=n, count=count, emit=emit):
+                        emit(act, a_buf, n)
                         count[0] = ue.capture_count
                     us = ue._run_transient(body, 60.0)
                     y = ue.dma_from_accelerator_memory(a_buf, (n,)).double()
-                    first = y if first is None else first
+                    reference = first is None
+                    first = y if reference else first
                     good, same = snr(want, y), snr(first, y)
-                    ok = bool(torch.isfinite(y).all()) and good >= 30 and (form == 0 or same >= good - 1)
+                    ok = bool(torch.isfinite(y).all()) and good >= 30 and (reference or same >= good - 1)
                     if not ok:
                         d_bad.append(crashed)
                     print(f"  {n:8d} {act:10s} {name:22s} {count[0]:7d} {count[0] * 32:9d} {good:15.1f} dB {same:13.1f} dB "
@@ -192,8 +184,6 @@ def main():
         crashed = None
     except Exception:
         traceback.print_exc()
-    finally:
-        nn_lib.STRASSEN_ACTIVATE_LOOPED = keep
     if crashed:
         print(f"\nRESULT: FAIL (stopped in '{crashed}'; if it was a timeout the board needs a reset)")
         return 1

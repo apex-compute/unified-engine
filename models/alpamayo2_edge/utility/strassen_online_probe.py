@@ -22,35 +22,16 @@ matmul to the accuracy expected of its level. Which variant is fastest is the su
   python models/alpamayo2_edge/utility/strassen_online_probe.py --case if4 832 4608 2048 --case bf16 720 4352 1152
 """
 import argparse
-import os
 import sys
 import traceback
 
-import numpy as np
 import torch
 
-BF, FP = torch.bfloat16, torch.float16
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from strassen_probe_util import ACT_FN, ACT_KW, BF, FP, decode_if4, open_board, put as put_on, snr
+
 # (weights, rows PER ENGINE, K, N)
 CASES = [("if4", 408, 2048, 2048), ("if4", 408, 4608, 2048), ("if4", 832, 4608, 2048),
          ("bf16", 408, 4608, 2048), ("bf16", 720, 4352, 1152)]
-
-
-def snr(ref, x):
-    ref, x = ref.double(), x.double()
-    return float(10 * torch.log10(ref.pow(2).sum() / (ref - x).pow(2).sum().clamp_min(1e-300)))
-
-
-def decode(data, scales, N, K):
-    """An IF4 pack -> code x |scale| in float64, no rounding: the sign of a block's scale says
-    whether its 64 codes are integers -8..7 or the small-float table. (quant_lib.dequant multiplies
-    in bf16 and is off by up to a bf16 step, so it cannot check an fp16 result.)"""
-    nib = np.frombuffer(data, dtype=np.uint8).reshape(N, K // 2)
-    codes = np.stack([nib & 0xF, nib >> 4], -1).reshape(N, K // 64, 64)
-    sc = torch.frombuffer(bytearray(scales), dtype=torch.int16).view(BF).double().numpy().reshape(N, K // 64, 1)
-    table = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6])
-    ints = np.where(codes >= 8, codes.astype(np.int64) - 16, codes).astype(np.float64)
-    return torch.from_numpy((np.where(sc < 0, ints, table[codes]) * np.abs(sc)).reshape(N, K))
 
 
 def main():
@@ -68,18 +49,9 @@ def main():
     assert all(c[0] in ("if4", "bf16") and c[1] % 2 == 0 and c[2] % 128 == 0 and c[3] % 128 == 0 for c in cases), \
         "a case is: if4 | bf16, even rows, K and N multiples of 128"
 
-    sys.path.insert(0, HERE)
-    import alpamayo2_edge_test as T
+    T, ue, NE, cores = open_board(args.dev, args.engines)
     import nn_lib
-    import user_dma_core
     from user_dma_core import TYPE
-    dev = args.dev or T.CFG["defaults"]["dev"]
-    user_dma_core.set_dma_device(dev)
-    user_dma_core.configure_clock_from_hardware()
-    cores = getattr(user_dma_core, "ANDROMEDA_CORE_COUNT", None) or 1
-    NE = cores if args.engines == "max" else int(args.engines)
-    assert 1 <= NE <= cores, f"--engines {NE} but the bitstream reports {cores} core(s)"
-    ue = T.Alpamayo2Edge_UnifiedEngine(dev=dev, engines=NE)
     base = ue.get_tensor_dram_addr()
     print(f"engines: {NE} of {cores}; rows are per engine")
 
@@ -94,10 +66,7 @@ def main():
             ue._palloc(f"OX{d}", max(s[0] for s in sizes))
             ue._palloc(f"OP{d}", max(s[1] for s in sizes))
 
-    def put(t):                                                             # bf16 or fp16, uploaded as it is
-        a = ue._alloc(t.numel())
-        ue.dma_to_accelerator_memory(a, t.contiguous().flatten())
-        return a
+    put = lambda t: put_on(ue, t)
 
     def out_buffer(elements):
         a = ue.allocate_tensor_dram(elements * 2, align_bytes=128)
@@ -134,10 +103,7 @@ def main():
               + (f"; workers {', '.join(str(b // 32) for b in psize[1:])} instr ({sum(psize)} B in all)" if psize[1:] else ""), flush=True)
 
     checks, summary = [], []
-    act = {"gelu": {"gelu_enable": True}, "silu": {"silu_enable": True},
-           "relu": {"clamp_enable": True, "clamp_min": 0.0, "clamp_max": float("inf")}, None: {}}[args.act]
-    fn = {"gelu": lambda v: v * torch.sigmoid(1.702 * v), "silu": lambda v: v * torch.sigmoid(v),
-          "relu": lambda v: v.clamp(min=0), None: lambda v: v}[args.act]
+    act, fn = ACT_KW[args.act], ACT_FN[args.act]
     if args.act:
         print(f"activation: {args.act}, fused in the plain matmul and in the kernel")
 
@@ -172,7 +138,7 @@ def main():
                                                       OUTPUT_DRAM_ADDR=a_c + rows_of(E)[1], gpr_M_reg=reg(E, r),
                                                       is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=a_w[1], **act))
             truth = fn(X.double() @ W.to(BF).double().T)                      # the product with 16-bit weights
-            exact = decode(data, scales, N, K)
+            exact = decode_if4(data, scales, N, K)
             loaded = lambda t: t.to(FP).double()                            # a cell is dequantized to fp16 on the way in
             need = lambda L, online: 40 if online else (30, 28)[L - 1]      # agreement with the plain IF4 result, dB
         else:

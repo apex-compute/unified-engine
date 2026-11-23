@@ -77,13 +77,9 @@ import user_dma_core
 from user_dma_core import DRAM_INSTRUCTION_ADDR, TYPE, UE_MODE, UE_VECTOR_SIZE, UnifiedEngine
 from multi_engine_shard import MultiEngineScheduler, PrivateArena, model_multicore_layout
 from nn_lib import eltwise_add_core_dram, layer_norm_core_dram_post_add
-try:        # nn_lib §10 (Strassen matmul) arrives with its own PR; without it every matmul is the plain one
-    from nn_lib import (strassen_if4_slab_cells, strassen_levels, strassen_matmul_core_dram, strassen_online_items,
-                        strassen_online_sum_count, strassen_online_sums_core, strassen_online_tree, strassen_weight_tree)
-except ImportError:
-    strassen_levels = strassen_matmul_core_dram = strassen_weight_tree = None
-    print("nn_lib.py has no Strassen section in this checkout: Strassen matmuls are off")
-
+from nn_lib import (strassen_if4_slab_cells, strassen_levels, strassen_matmul_core_dram, strassen_online_items,
+                    strassen_online_sum_count, strassen_online_sums_core, strassen_online_tree, strassen_scratch_elements,
+                    strassen_weight_tree)
 
 from alpamayo2_edge_cpu_reference import (  # host oracle + weight loading; no hardware in there
     AIP, EXP, LM, PROJ, STAT_KEYS, VIS, Alpamayo2EdgeRef, KVCache, cos_sim, resolve_model_dir, snr_db, synthetic_inputs,
@@ -118,13 +114,13 @@ ZERO_CHUNK = 1 << 26               # elements per zero-fill DMA
 # ops -> 69.6 s with the prefill too, same tokens and trajectory. --strassen-level 0 turns it off,
 # --strassen-ops / A2E_STRASSEN_OPS pick the layers. These module values are the default for
 # every user of this file (the sim driver too).
-ST_DEFAULT_OPS = ("v.o", "v.fc2", "pj.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc1", "lm.fc2")
-ST_LEVEL = 1 if strassen_levels is not None else 0
-ST_OPS, ST_MIN_ROWS = (ST_DEFAULT_OPS if ST_LEVEL else ()), 64
+ST_ALL_OPS = ("v.o", "v.fc2", "pj.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc1", "lm.fc2")
+ST_DEFAULT_OPS = ST_ALL_OPS
+ST_LEVEL = 1
+ST_OPS, ST_MIN_ROWS = ST_DEFAULT_OPS, 64
 PJ_ST_ROWS = 384        # most projector rows one Strassen call takes (bounds its private scratch)
 ST_LAYERS = None        # None: every layer. --probe: only the probed layer gets Strassen weights (level 3 of all does not fit)
 st_on = lambda li: ST_LAYERS is None or li in ST_LAYERS
-ST_ALL_OPS = ("v.o", "v.fc2", "pj.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc1", "lm.fc2")
 # lm.* (prefill, 4-bit) uses online leaves at the levels of ST_LM_LEVEL, whatever --strassen-level
 # says: the IF4 weight is stored once, as 2^level input-column slabs, the Strassen cells are row
 # ranges of the slabs, and the board makes the sum leaves before each run of matmuls, in one fp16
@@ -403,9 +399,9 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self.st_rows = getattr(self, "st_rows", {})
         self.st_rows[scr] = max((u[0] for u in uses), default=0)       # most rows one call may take (_st_rows checks)
         for d in range(max((u[3] for u in uses), default=0)):
-            live = [u for u in uses if u[3] > d]
-            self._palloc(f"{scr}_X{d}", 9 * max((m >> (d + 1)) * (K >> (d + 1)) for m, K, N, L in live))
-            self._palloc(f"{scr}_P{d}", 14 * max((m >> (d + 1)) * (N >> (d + 1)) for m, K, N, L in live))
+            live = [strassen_scratch_elements(m, K, N, L)[d] for m, K, N, L in uses if L > d]
+            self._palloc(f"{scr}_X{d}", max(x for x, _ in live))
+            self._palloc(f"{scr}_P{d}", max(p for _, p in live))
 
     def _st_rows(self, E, n, K, N, A, node, OUT, native, act=None):
         """One layer on n rows: Strassen on the largest multiple of 2^L rows, the plain matmul
@@ -1799,8 +1795,7 @@ def main():
                     help="launch vision, projector, image scatter, prefill and the V^T build one by one (per-stage times "
                          "and the prompt-embedding check). Default: one merged instruction stream, one launch")
     ap.add_argument("--strassen-level", type=int, default=None, choices=(0, 1, 2, 3),
-                    help="Strassen depth for the layers in --strassen-ops (0 = off; default 1 when nn_lib has the "
-                         "Strassen section); a layer whose widths "
+                    help="Strassen depth for the layers in --strassen-ops (0 = off; default 1); a layer whose widths "
                          "cannot split that deep uses the deepest level they allow")
     ap.add_argument("--strassen-ops", default=None,
                     help=f"comma list of {', '.join(ST_ALL_OPS)} (v = vision tower, pj = projector, lm = prefill); "
@@ -1822,10 +1817,9 @@ def main():
     vision_only = args.stop_at == "vision" or args.staged == "vision"
     global ST_LEVEL, ST_OPS, ST_LAYERS
     ST_LAYERS = (args.probe_layer,) if args.probe else None
-    if args.strassen_level is not None or args.strassen_ops is not None:     # asked for: no silent fallback
+    if args.strassen_level is not None or args.strassen_ops is not None:
         ST_LEVEL = 1 if args.strassen_level is None else args.strassen_level
         ST_OPS = (tuple(o for o in args.strassen_ops.split(",") if o) if args.strassen_ops else ST_DEFAULT_OPS) if ST_LEVEL else ()
-        assert not ST_LEVEL or strassen_levels is not None, "Strassen needs the Strassen section of nn_lib.py (not in this checkout)"
     assert all(o in ST_ALL_OPS for o in ST_OPS), f"--strassen-ops: unknown entry in {ST_OPS}"
     if ST_LEVEL:
         print(f"Strassen level {ST_LEVEL} on {', '.join(ST_OPS)}")

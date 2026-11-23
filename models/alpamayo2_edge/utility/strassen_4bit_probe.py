@@ -35,18 +35,13 @@ import sys
 
 import torch
 
-BF, FP = torch.bfloat16, torch.float16
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from strassen_probe_util import (BF, FP, HERE, T_DEF, block_strassen, combo, from_blocks, hangs, leaves, open_board,
+                                 products, put as put_on, quarters, run_regs, snr, to_blocks)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))          # repo root: quant_lib
 import quant_lib  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-QUARTERS = ((0, 0), (0, 1), (1, 0), (1, 1))
-# 7 products = (input sum) . (weight sum)^T. Input quarter index = 2 * row half + K half; weight
-# quarter index = 2 * N half + K half. An entry: (quarter, other quarter or None, sign).
-S_DEF = [(0, 3, +1), (2, 3, +1), (0, None, 0), (3, None, 0), (0, 1, +1), (2, 0, -1), (1, 3, -1)]
-T_DEF = [(0, 3, +1), (0, None, 0), (2, 3, -1), (1, 0, -1), (3, None, 0), (0, 2, +1), (1, 3, +1)]
-C_DEF = [[(0, +1), (3, +1), (4, -1), (6, +1)], [(2, +1), (4, +1)], [(1, +1), (3, +1)], [(0, +1), (1, -1), (2, +1), (5, +1)]]
 SHAPES = [("q / o", 408, 2048, 2048), ("k / v", 408, 2048, 1024), ("fc1 (one half)", 408, 2048, 4608), ("fc2 (one half)", 408, 4608, 2048)]
 # key, label, source of the weight sums ("raw" unquantized | "q4" the dequantized IF4 weight),
 # storage of a true sum, storage of a plain quarter ("keep" = the IF4 values as they are)
@@ -65,34 +60,11 @@ def size_factor(L, sums, plain):
     return (2 ** L * BYTES[plain] + (7 ** L - 2 ** L) * BYTES[sums]) / 4 ** L / BYTES["if4"]
 
 
-def snr(ref, x):
-    ref, x = ref.double(), x.double()
-    return float(10 * torch.log10(ref.pow(2).sum() / (ref - x).pow(2).sum().clamp_min(1e-300)))
-
-
-def quarters(t):
-    a, b = t.shape[0] // 2, t.shape[1] // 2
-    return [t[i * a:(i + 1) * a, j * b:(j + 1) * b] for i, j in QUARTERS]
-
-
-def combo(q, a, b, sign):
-    return q[a] if b is None else q[a] + sign * q[b]
-
-
 def deq(prec, W):
     """What a weight is once it is stored in `prec` (if4 / if8)."""
     Wc = W.float().cpu().contiguous()
     data, scale = quant_lib.quantize(prec, Wc)
     return quant_lib.dequant(prec, data, scale, *Wc.shape).double().to(W.device)
-
-
-def leaves(W, L, plain=True):
-    """The level-L leaf weights in product order: [(exact fp64 sum of the source weight, plain?)].
-    plain: no sum on the path to this block, i.e. it is a quarter of the source itself."""
-    if L == 0:
-        return [(W, plain)]
-    wq = quarters(W)
-    return [x for t in T_DEF for x in leaves(combo(wq, *t), L - 1, plain and t[1] is None)]
 
 
 def stored(blocks, how):
@@ -114,23 +86,7 @@ def host_model(X, W, L, sums, plain_how):
         idx = [i for i, (_, p) in enumerate(lv) if p == want]
         for i, v in zip(idx, stored([lv[i][0] for i in idx], how)):
             val[i] = v
-    return _products(X, iter(val), L, True)
-
-
-def _products(X, leaf, L, top):
-    r = lambda t: t.to(FP).double()
-    if L == 0:
-        return r(X @ next(leaf).T)
-    xq = quarters(X)
-    m = [_products(r(combo(xq, *s)) if s[1] is not None else xq[s[0]], leaf, L - 1, False) for s in S_DEF]
-    out = []
-    for terms in C_DEF:
-        acc = m[terms[0][0]]
-        for i, (k, sign) in enumerate(terms[1:]):
-            acc = acc + sign * m[k]
-            acc = acc.to(BF).double() if (top and i == len(terms) - 2) else r(acc)
-        out.append(acc)
-    return torch.cat([torch.cat(out[:2], 1), torch.cat(out[2:], 1)])
+    return products(X, iter(val), L)
 
 
 def real_weights(layers):
@@ -191,23 +147,14 @@ def host(args):
 def board(args):
     """Every variant on the device, one engine: SNR against the board's native bf16 result and
     against its native IF4 result, time against native IF4."""
-    sys.path.insert(0, HERE)
-    import alpamayo2_edge_test as T
-    import user_dma_core
+    _, ue, _, _ = open_board(args.dev)
     from storage_format import StorageFormat, TensorFormats
-    from user_dma_core import TYPE, UE_MODE, URAM_FULL_ELEMENTS
-    dev = args.dev or T.CFG["defaults"]["dev"]
-    user_dma_core.set_dma_device(dev)
-    user_dma_core.configure_clock_from_hardware()
-    ue = T.Alpamayo2Edge_UnifiedEngine(dev=dev, engines=1)
+    from user_dma_core import TYPE
     base = ue.get_tensor_dram_addr()
     F16, B16 = StorageFormat.FP16, StorageFormat.BF16
     QT = {"if4": TYPE.IF4, "if8": TYPE.IF8}
-
-    def put(t):
-        a = ue._alloc(t.numel())
-        ue.dma_to_accelerator_memory(a, t.contiguous().flatten())
-        return a
+    put = lambda t: put_on(ue, t)
+    run = lambda emit: run_regs(ue, emit)[0]
 
     def pack(prec, W):                                                      # -> (type, data address, scale address)
         Wc = W.float().cpu().contiguous()
@@ -219,24 +166,6 @@ def board(args):
         the pack holds the same values)."""
         return put(W.to(FP)) if how == "fp16" else pack("if4" if how == "keep" else how, W)
 
-    def run(emit):
-        regs = {}
-
-        def reg(v):
-            if v not in regs:
-                regs[v] = ue.alloc_isa_reg()
-                ue.generate_instruction_add_set(regs[v], v)
-            return regs[v]
-
-        def body():
-            ue.reset_isa_reg_counter()
-            emit(reg)
-        return ue._run_transient(body, 600.0)
-
-    def hangs(M, K, N):
-        """The softmax-free bf16 / fp16 matmul shape that took the board down twice (2026-11-18)."""
-        return N * (K // 64) <= 4095 and M * (K + -(-N // 64) * 64) > URAM_FULL_ELEMENTS
-
     def matmul(reg, m, k, n, a, w, out, fa, fo):
         """w: an fp16 / bf16 weight address (bf16 only for the native), or (type, data, scales)."""
         if isinstance(w, tuple):
@@ -245,15 +174,6 @@ def board(args):
         else:
             ue.matmat_mul_core(M=m, K=k, N=n, A_DRAM_ADDR=a, B_DRAM_ADDR=w, OUTPUT_DRAM_ADDR=out, gpr_M_reg=reg(m),
                                formats=TensorFormats(a=fa, b=F16, output=fo))
-
-    def to_blocks(t, L):
-        return t.reshape(-1) if L == 0 else torch.cat([to_blocks(q, L - 1) for q in quarters(t)])
-
-    def from_blocks(v, rows, cols, L):
-        if L == 0:
-            return v.reshape(rows, cols)
-        q = [from_blocks(c, rows // 2, cols // 2, L - 1) for c in v.chunk(4)]
-        return torch.cat([torch.cat(q[:2], 1), torch.cat(q[2:], 1)])
 
     g = torch.Generator().manual_seed(args.seed)
     for name, M, K, N in SHAPES:
@@ -291,35 +211,7 @@ def board(args):
 
                 a_xz, a_t, a_out = put(to_blocks(X, L)), tree(W if src == "raw" else Wq4, L, True), ue._alloc(M * N)
 
-                def node(reg, x, xf, t, out, of, m, k, n, lv):
-                    if lv == 0:
-                        matmul(reg, m, k, n, x, t, out, xf, of)
-                        return
-                    h, kk, nn = m // 2, k // 2, n // 2
-                    elt = lambda p, c, o, sign, cols, fm: ue.eltwise_core_dram(
-                        M=h, N=cols, dram_a=p, dram_b=c, dram_out=o,
-                        mode=UE_MODE.ELTWISE_ADD if sign > 0 else UE_MODE.ELTWISE_SUB, gpr_M_reg=reg(h), formats=fm)
-                    xq = [x + i * h * kk * 2 for i in range(4)]
-                    prod = []
-                    for s, child in zip(S_DEF, t):
-                        if s[1] is None:
-                            src_a, sf = xq[s[0]], xf
-                        else:
-                            src_a, sf = ue._alloc(h * kk), F16
-                            elt(xq[s[0]], xq[s[1]], src_a, s[2], kk, TensorFormats(a=xf, b=xf, output=F16))
-                        p = ue._alloc(h * nn)
-                        node(reg, src_a, sf, child, p, F16, h, kk, nn, lv - 1)
-                        prod.append(p)
-                    tmp = [ue._alloc(h * nn) for _ in range(2)]
-                    for qi, terms in enumerate(C_DEF):
-                        acc = prod[terms[0][0]]
-                        for i, (kx, sign) in enumerate(terms[1:]):
-                            last = i == len(terms) - 2
-                            dst = out + qi * h * nn * 2 if last else tmp[i % 2]
-                            elt(acc, prod[kx], dst, sign, nn, TensorFormats(a=F16, b=F16, output=of if last else F16))
-                            acc = dst
-
-                us = run(lambda reg: node(reg, a_xz, B16, a_t, a_out, B16, M, K, N, L))
+                us = run(lambda reg: block_strassen(ue, reg, matmul, a_xz, B16, a_t, a_out, B16, M, K, N, L))
                 C = from_blocks(ue.dma_from_accelerator_memory(a_out, (M * N,)).double(), M, N, L)
                 print(f"  {tag:54s} {snr(a, C):5.1f} dB {snr(b, C):5.1f} dB {size_factor(L, sums, plain):7.2f}x {us / 1e3:9.2f} {us / t_if4:5.2f}x"
                       + ("" if bool(torch.isfinite(C).all()) else "  NaN/Inf!"), flush=True)

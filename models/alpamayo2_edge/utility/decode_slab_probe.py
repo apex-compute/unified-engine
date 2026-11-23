@@ -20,34 +20,16 @@ the whole-weight result (>= 35 dB); the time cost is the summary.
   python models/alpamayo2_edge/utility/decode_slab_probe.py --slabs 2 4 --engines 8
 """
 import argparse
-import os
 import sys
 import traceback
 
-import numpy as np
 import torch
 
-BF = torch.bfloat16
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RELU = {"clamp_enable": True, "clamp_min": 0.0, "clamp_max": float("inf")}
+from strassen_probe_util import ACT_KW, BF, decode_if4, open_board, put as put_on, snr
+
 # (name, K, N, fused activation, how many of it one decoder layer has)
 OPS = [("q / o", 2048, 2048, {}, 2), ("k / v", 2048, 1024, {}, 2),
-       ("fc1 half (ReLU)", 2048, 4608, RELU, 2), ("fc2 half", 4608, 2048, {}, 2)]
-
-
-def snr(ref, x):
-    ref, x = ref.double(), x.double()
-    return float(10 * torch.log10(ref.pow(2).sum() / (ref - x).pow(2).sum().clamp_min(1e-300)))
-
-
-def decode(data, scales, N, K):
-    """An IF4 pack -> code x |scale| in float64 (the sign of a block's scale picks the code table)."""
-    nib = np.frombuffer(data, dtype=np.uint8).reshape(N, K // 2)
-    codes = np.stack([nib & 0xF, nib >> 4], -1).reshape(N, K // 64, 64)
-    sc = torch.frombuffer(bytearray(scales), dtype=torch.int16).view(BF).double().numpy().reshape(N, K // 64, 1)
-    table = np.array([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6])
-    ints = np.where(codes >= 8, codes.astype(np.int64) - 16, codes).astype(np.float64)
-    return torch.from_numpy((np.where(sc < 0, ints, table[codes]) * np.abs(sc)).reshape(N, K))
+       ("fc1 half (ReLU)", 2048, 4608, ACT_KW["relu"], 2), ("fc2 half", 4608, 2048, {}, 2)]
 
 
 def main():
@@ -59,24 +41,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    sys.path.insert(0, HERE)
-    import alpamayo2_edge_test as T
-    import user_dma_core
+    T, ue, NE, cores = open_board(args.dev, args.engines)
     from user_dma_core import TYPE
-    dev = args.dev or T.CFG["defaults"]["dev"]
-    user_dma_core.set_dma_device(dev)
-    user_dma_core.configure_clock_from_hardware()
-    cores = getattr(user_dma_core, "ANDROMEDA_CORE_COUNT", None) or 1
-    NE = cores if args.engines == "max" else int(args.engines)
-    assert 1 <= NE <= cores, f"--engines {NE} but the bitstream reports {cores} core(s)"
-    ue = T.Alpamayo2Edge_UnifiedEngine(dev=dev, engines=NE)
     base = ue.get_tensor_dram_addr()
     print(f"engines: {NE} of {cores}; one row, each op x {args.rep} per program")
-
-    def put(t):
-        a = ue._alloc(t.numel())
-        ue.dma_to_accelerator_memory(a, t.contiguous().flatten())
-        return a
+    put = lambda t: put_on(ue, t)
 
     count = [0]
 
@@ -107,7 +76,7 @@ def main():
         W = torch.randn(N, K, generator=g_) / K ** 0.5
         pack = T.if4_pack(W)
         fn = (lambda v: v.clamp(min=0)) if act else (lambda v: v)
-        exact = fn(X.double() @ decode(pack[0], pack[1], N, K).T)
+        exact = fn(X.double() @ decode_if4(pack[0], pack[1], N, K).T)
         a_x, a_w = put(X), ue._qstore(pack)
         a_o, a_p = ue._alloc(N, zero=True), ue._alloc(N, zero=True)        # result, and the ping-pong partner
         shard = ue._split(N)

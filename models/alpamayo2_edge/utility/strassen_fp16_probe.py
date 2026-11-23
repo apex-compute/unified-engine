@@ -26,19 +26,11 @@ write-back the nn_lib kernel does around a level are NOT in these times, nor is 
 import argparse
 import json
 import os
-import sys
 
 import torch
 
-BF, FP = torch.bfloat16, torch.float16
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QUARTERS = ((0, 0), (0, 1), (1, 0), (1, 1))
-# 7 products = (input sum) . (weight sum)^T. Input quarter index = 2 * row half + K half; weight
-# quarter index = 2 * N half + K half. An entry: (quarter, other quarter or None, sign).
-S_DEF = [(0, 3, +1), (2, 3, +1), (0, None, 0), (3, None, 0), (0, 1, +1), (2, 0, -1), (1, 3, -1)]
-T_DEF = [(0, 3, +1), (0, None, 0), (2, 3, -1), (1, 0, -1), (3, None, 0), (0, 2, +1), (1, 3, +1)]
-# C quarter (2 * row half + N half) from the products: signed sums, left to right
-C_DEF = [[(0, +1), (3, +1), (4, -1), (6, +1)], [(2, +1), (4, +1)], [(1, +1), (3, +1)], [(0, +1), (1, -1), (2, +1), (5, +1)]]
+from strassen_probe_util import (ACT_FN, ACT_KW, BF, FP, HERE, T_DEF, block_strassen, combo, from_blocks, hangs, leaves,
+                                 open_board, products, put as put_on, quarters, run_regs, snr, to_blocks)
 
 
 def shapes():
@@ -58,54 +50,16 @@ def shapes():
             ("prefill fc2 (one half)", 408, 4608, 2048, "if4")]
 
 
-def snr(ref, x):
-    ref, x = ref.double(), x.double()
-    return float(10 * torch.log10(ref.pow(2).sum() / (ref - x).pow(2).sum().clamp_min(1e-300)))
-
-
-def quarters(t):
-    a, b = t.shape[0] // 2, t.shape[1] // 2
-    return [t[i * a:(i + 1) * a, j * b:(j + 1) * b] for i, j in QUARTERS]
-
-
-def to_blocks(t, L):
-    return t.reshape(-1) if L == 0 else torch.cat([to_blocks(q, L - 1) for q in quarters(t)])
-
-
-def from_blocks(v, rows, cols, L):
-    if L == 0:
-        return v.reshape(rows, cols)
-    q = [from_blocks(c, rows // 2, cols // 2, L - 1) for c in v.chunk(4)]
-    return torch.cat([torch.cat(q[:2], 1), torch.cat(q[2:], 1)])
-
-
-def combo(q, a, b, sign):
-    return q[a] if b is None else q[a] + sign * q[b]
-
-
 def pad_to(t, rows, cols):
     out = torch.zeros(rows, cols, dtype=t.dtype)
     out[: t.shape[0], : t.shape[1]] = t
     return out
 
 
-def host_model(X, W, L, leaf_w, top=True):
+def host_model(X, W, L, leaf_w):
     """Strassen level L with the sums / products / recombination rounded to fp16 and the leaf
-    weights stored by leaf_w (W: exact fp32 weight sums); the top result is rounded to bf16."""
-    r = lambda t: t.to(FP).double()
-    if L == 0:
-        return r(X @ leaf_w(W).T)
-    xq, wq = quarters(X), quarters(W)
-    m = [host_model(r(combo(xq, *s)) if s[1] is not None else xq[s[0]], combo(wq, *t), L - 1, leaf_w, False)
-         for s, t in zip(S_DEF, T_DEF)]
-    out = []
-    for terms in C_DEF:
-        acc = m[terms[0][0]]
-        for i, (k, sign) in enumerate(terms[1:]):
-            acc = acc + sign * m[k]
-            acc = acc.to(BF).double() if (top and i == len(terms) - 2) else r(acc)
-        out.append(acc)
-    return torch.cat([torch.cat(out[:2], 1), torch.cat(out[2:], 1)])
+    weights (exact sums of W) stored by leaf_w; the top result is rounded to bf16."""
+    return products(X, iter([leaf_w(w) for w, _ in leaves(W, L)]), L)
 
 
 def main():
@@ -125,47 +79,21 @@ def main():
     args = ap.parse_args()
     todo = [("--shape", *args.shape, args.weights)] if args.shape else [s for s in shapes() if not args.only or args.only in s[0]]
 
-    sys.path.insert(0, HERE)
-    import alpamayo2_edge_test as T
+    T, ue, _, _ = open_board(args.dev)
     import quant_lib
-    import user_dma_core
     from storage_format import StorageFormat, TensorFormats
-    from user_dma_core import TYPE, UE_MODE, URAM_FULL_ELEMENTS
-    dev = args.dev or T.CFG["defaults"]["dev"]
-    user_dma_core.set_dma_device(dev)
-    user_dma_core.configure_clock_from_hardware()
-    ue = T.Alpamayo2Edge_UnifiedEngine(dev=dev, engines=1)
+    from user_dma_core import TYPE, UE_MODE
     base = ue.get_tensor_dram_addr()
     F16, B16 = StorageFormat.FP16, StorageFormat.BF16
     deq = lambda W: quant_lib.dequant("if4", *T.if4_pack(W.float())).double()        # what a 4-bit weight really is
-
-    def put(t):
-        a = ue._alloc(t.numel())
-        ue.dma_to_accelerator_memory(a, t.contiguous().flatten())
-        return a
+    put = lambda t: put_on(ue, t)
 
     def run(emit):
-        regs = {}
-
-        def reg(v):
-            if v not in regs:
-                regs[v] = ue.alloc_isa_reg()
-                ue.generate_instruction_add_set(regs[v], v)
-            return regs[v]
-
-        def body():
-            ue.reset_isa_reg_counter()
-            emit(reg)
-            instr[0] = ue.capture_count
-        return ue._run_transient(body, 600.0)
+        us, instr[0] = run_regs(ue, emit)
+        return us
 
     instr = [0]                                                             # instructions of the last program run
     prog = lambda: f"  {instr[0]} instr ({instr[0] * 32} B)"
-
-    def hangs(M, K, N):
-        """The softmax-free bf16 / fp16 matmul shape that took the board down twice (2026-11-18): a
-        short K whose rows do not fit one on-chip tile."""
-        return N * (K // 64) <= 4095 and M * (K + -(-N // 64) * 64) > URAM_FULL_ELEMENTS
 
     def matmul(reg, m, k, n, a, w, out, fm):
         """w: a bf16 / fp16 weight address, or an IF4 (data, scales) pair."""
@@ -224,10 +152,7 @@ def main():
         cases = [("--shape", *args.shape)] if args.shape else [
             ("vision o", 720, 1152, 1152), ("vision fc2", 720, 4352, 1152), ("2048 -> 2048", 408, 2048, 2048), ("4608 -> 2048", 408, 4608, 2048)]
         print("nn_lib.strassen_matmul_core_dram (fp16 intermediates, fp16 leaves, bias folded in), one engine")
-        act = {"gelu": {"gelu_enable": True}, "silu": {"silu_enable": True},
-               "relu": {"clamp_enable": True, "clamp_min": 0.0, "clamp_max": float("inf")}, None: {}}[args.act]
-        fn = {"gelu": lambda v: v * torch.sigmoid(1.702 * v), "silu": lambda v: v * torch.sigmoid(v),
-              "relu": lambda v: v.clamp(min=0), None: lambda v: v}[args.act]
+        act, fn = ACT_KW[args.act], ACT_FN[args.act]
         bad = []
         for name, M, K, N in cases:
             ue._tensor_dram_addr = base
@@ -323,13 +248,13 @@ def main():
             Xp, Wp = pad_to(X, M, Kp), pad_to(W.float(), Np, Kp)
             pad = "" if (Kp, Np) == (K, N) else f", padded {Kp} -> {Np}"
             leaf = (M >> L, Kp >> L, Np >> L)
-            for leaves in (("fp16", "if4") if wtype == "if4" else ("fp16",)):
-                label = f"Strassen L{L}, {'4-bit' if leaves == 'if4' else 'fp16'} leaves{pad}"
-                if leaves == "fp16" and hangs(*leaf):
+            for kind in (("fp16", "if4") if wtype == "if4" else ("fp16",)):
+                label = f"Strassen L{L}, {'4-bit' if kind == 'if4' else 'fp16'} leaves{pad}"
+                if kind == "fp16" and hangs(*leaf):
                     print(f"  {label}: leaf matmul {leaf} is the shape that hangs the board, skipped")
                     continue
-                pred = host_model(Xp.double(), Wp.double(), L, (lambda t: t.to(FP).double()) if leaves == "fp16" else deq)[:, :N]
-                store = (lambda t: put(t.to(FP))) if leaves == "fp16" else (lambda t: ue._qstore(T.if4_pack(t)))
+                pred = host_model(Xp.double(), Wp.double(), L, (lambda t: t.to(FP).double()) if kind == "fp16" else deq)[:, :N]
+                store = (lambda t: put(t.to(FP))) if kind == "fp16" else (lambda t: ue._qstore(T.if4_pack(t)))
 
                 def tree(Wn, lv):                                           # weight sums in fp32 on the host, one store per leaf
                     if lv == 0:
@@ -340,36 +265,10 @@ def main():
                 ue._tensor_dram_addr = mark
                 a_xz, a_t, a_out = put(to_blocks(Xp, L)), tree(Wp, L), ue._alloc(M * Np)
 
-                def node(reg, x, xf, t, out, of, m, k, n, lv):
-                    """x: [m, k] in block layout (format xf) -> out: [m, n] in block layout (format of)."""
-                    if lv == 0:
-                        matmul(reg, m, k, n, x, t, out, TensorFormats(a=xf, b=B16 if isinstance(t, tuple) else F16, output=of))
-                        return
-                    h, kk, nn = m // 2, k // 2, n // 2
-                    elt = lambda a, c, o, sign, cols, fm: ue.eltwise_core_dram(
-                        M=h, N=cols, dram_a=a, dram_b=c, dram_out=o,
-                        mode=UE_MODE.ELTWISE_ADD if sign > 0 else UE_MODE.ELTWISE_SUB, gpr_M_reg=reg(h), formats=fm)
-                    xq = [x + i * h * kk * 2 for i in range(4)]
-                    prod = []
-                    for s, child in zip(S_DEF, t):
-                        if s[1] is None:
-                            src, sf = xq[s[0]], xf
-                        else:
-                            src, sf = ue._alloc(h * kk), F16
-                            elt(xq[s[0]], xq[s[1]], src, s[2], kk, TensorFormats(a=xf, b=xf, output=F16))
-                        p = ue._alloc(h * nn)
-                        node(reg, src, sf, child, p, F16, h, kk, nn, lv - 1)
-                        prod.append(p)
-                    tmp = [ue._alloc(h * nn) for _ in range(2)]
-                    for qi, terms in enumerate(C_DEF):
-                        acc = prod[terms[0][0]]
-                        for i, (kx, sign) in enumerate(terms[1:]):
-                            last = i == len(terms) - 2
-                            dst = out + qi * h * nn * 2 if last else tmp[i % 2]
-                            elt(acc, prod[kx], dst, sign, nn, TensorFormats(a=F16, b=F16, output=of if last else F16))
-                            acc = dst
+                def leaf_mm(reg, m, k, n, x, t, out, xf, of):
+                    matmul(reg, m, k, n, x, t, out, TensorFormats(a=xf, b=B16 if isinstance(t, tuple) else F16, output=of))
 
-                us = run(lambda reg: node(reg, a_xz, B16, a_t, a_out, B16, M, Kp, Np, L))
+                us = run(lambda reg: block_strassen(ue, reg, leaf_mm, a_xz, B16, a_t, a_out, B16, M, Kp, Np, L))
                 C = from_blocks(ue.dma_from_accelerator_memory(a_out, (M * Np,)).double(), M, Np, L)[:, :N]
                 line(label, ratio, pred, C, us)
 
