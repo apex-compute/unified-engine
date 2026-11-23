@@ -695,8 +695,8 @@ def main():
                         help="Select the stack that uses the requested FIR accumulation")
     parser.add_argument("--filter-stage", choices=("up", "down", "both"), default="both",
                         help="Select resampling stages for matrix FIR; remaining stages use legacy FIR")
-    parser.add_argument("--strassen", action=argparse.BooleanOptionalAction, default=True,
-                        help="LSTM input projections (>=128 frames) on the level-2 Strassen matmul; --no-strassen for the plain matmul")
+    parser.add_argument("--strassen", action=argparse.BooleanOptionalAction, default=False,
+                        help="LSTM input projections (>=128 frames) on the level-2 Strassen matmul (off by default: no measured gain on one engine)")
     parser.add_argument("--memory-layout", choices=("auto", *(layout.name for layout in LAYOUTS)),
                         default="auto", help="Auto replans larger programs; an explicit arena avoids retrying compilation")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)

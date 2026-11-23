@@ -81,9 +81,10 @@ BF16 = 2
 
 # Vision-encoder Strassen matmuls (nn_lib §10, online IF4 leaves: the weight is stored once as
 # cells, the program makes the weight sums right before each matmul in one shared fp16 pool).
-# --no-vision-strassen turns it off. The level follows the row count the encoder is compiled
+# Off by default (one engine builds every call's sums: vision measured ~4% slower);
+# --vision-strassen turns it on. The level follows the row count the encoder is compiled
 # for (_vis_st_level); the LM is untouched (it runs one row at a time).
-VIS_STRASSEN = True
+VIS_STRASSEN = False
 MODEL_PATH = "/srv/model_files/Qwen3.5-2B-ModelFiles/Qwen3.5-2B"
 CONFIG_PATH = _THIS.parent / "qwen3.5_2b_config.json"
 
@@ -5269,13 +5270,12 @@ def main():
                     help="Skip compiling: load qwen3.5_2b_bin/programs.{bin,json} written by an "
                          "earlier run (error if missing or stale). Default: always recompile "
                          "and rewrite programs.bin.")
-    ap.add_argument("--no-vision-strassen", action="store_true",
-                    help="Plain matmuls in the FPGA vision encoder instead of Strassen "
-                         "(nn_lib §10; on by default). Rebuilds the cached bin when it "
-                         "was built with the other setting.")
+    ap.add_argument("--vision-strassen", action="store_true",
+                    help="Strassen matmuls in the FPGA vision encoder (nn_lib §10; off by "
+                         "default: on one engine it measured ~4%% slower).")
     args = ap.parse_args()
     global VIS_STRASSEN
-    VIS_STRASSEN = not args.no_vision_strassen
+    VIS_STRASSEN = args.vision_strassen
     if args.profile and (args.image or args.vision_enable):
         ap.error("--profile currently benchmarks the LM path; omit --image/--vision-enable")
     if args.run_from_bin and (args.profile or args.multi_core > 1):
@@ -5465,7 +5465,7 @@ def main():
         elif want_vision and _meta.get("encoder_size", 0) == 0:
             _why = f"{uni_bin} has no vision-encoder section (needed for on-FPGA vision)"
         else:
-            _why = f"{uni_bin} was built with the other vision Strassen setting (--no-vision-strassen)"
+            _why = f"{uni_bin} was built with the other vision Strassen setting (--vision-strassen)"
         print(f"ERROR: --run-from-bin: {_why}. Rerun without --run-from-bin to compile.",
               file=sys.stderr, flush=True)
         sys.exit(1)
