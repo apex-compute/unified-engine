@@ -1487,6 +1487,14 @@ def main():
                     "gflops": gflops, "pct_peak": pct}],
         "total_hw_s": hw_s, "total_gflop": gflop, "avg_gflops": gflops, "avg_pct_peak": pct,
         "hw_runs": len(dev_times), "first_hw_s": float(dev_times[0])})
+    try:   # weights: primary [params base, weights end) + the per-engine controller replicas of them
+        # (not the constants the kernels allocate past the weights, nor the workers' constant arenas)
+        _wregions = [(ue._params_dram_base, ue._controller_weight_end)]
+        for _src, _size, _addrs in ue._controller_replicas.records:
+            _wregions += [(_a, _a + _size) for _a in set(_addrs)]
+        results["dram_weight_regions"] = [[int(_a), int(_b)] for _a, _b in (_wregions)]
+    except Exception:
+        results["dram_weight_regions"] = None
     _original_print("TEST_RESULT:" + json.dumps(results))
 
 

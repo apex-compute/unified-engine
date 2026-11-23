@@ -2618,6 +2618,20 @@ def main():
     _dec_lats_us = getattr(ue, "_report_decode_lats_us", [])
     _dec_hw_us = sum(_dec_lats_us)
     _pf_hw_us = getattr(ue, "_report_prefill_hw_us", None)
+    # Weight DRAM: the params image, the BF16 embedding table in its fixed slot, plus every
+    # engine's private decode shard copies (multi-core).
+    try:
+        _weight_regions = [
+            (ue._params_dram_base, ue._next_params_dram_addr),
+            (ue.DRAM_ADDR_TOKEN_EMBEDDING,
+             ue.DRAM_ADDR_TOKEN_EMBEDDING + ue.DEVICE_EMBEDDING_TABLE_SIZE)]
+        _arena = getattr(ue.shard_group, "arena", None)
+        if _arena is not None:
+            _weight_regions += [(_a["base"], _a["base"] + _a["size"])
+                                for _a in _arena.weight_allocations()]
+        _dram_weight_regions = [[int(_a), int(_b)] for _a, _b in (_weight_regions)]
+    except Exception:
+        _dram_weight_regions = None
     _original_print("TEST_RESULT: " + json.dumps({
         "decoded_text": "".join(getattr(ue, "_report_decoded_chars", [])),
         "generated_token_ids": [int(t) for t in ue._generated_tokens[len(prefill_seq):]],
@@ -2630,6 +2644,7 @@ def main():
         "prefill_hw_ms": _pf_hw_us / 1e3 if _pf_hw_us is not None else None,
         "decode_first_hw_ms": _dec_lats_us[0] / 1e3 if _dec_lats_us else None,
         "decode_avg_hw_ms": _dec_hw_us / len(_dec_lats_us) / 1e3 if _dec_lats_us else None,
+        "dram_weight_regions": _dram_weight_regions,
         # decode_first_tok_s: HW-latency rate of the first decode step;
         # decode_avg_tok_s: wall-clock average over the loop (the "speed:" printed above).
         **_shared_report(

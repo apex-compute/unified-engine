@@ -2197,6 +2197,7 @@ def main():
     result["prefill_tokens"] = 0          # the transducer starts from blank: no prompt is prefilled
     result["decode_joint_steps"] = dec_steps
     result["wall_s"] = round(total, 3)
+    result["dram_weight_regions"] = [[getattr(engine, "_params_dram_base", 0), getattr(engine, "_next_params_dram_addr", 0)]]
     import json as _json
     _original_print("TEST_RESULT:" + _json.dumps(result))
 

@@ -45,6 +45,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
+
+
+def _weight_dram_no_rope(ue):
+    """Weight DRAM: the params region without the host RoPE tables (not weights)."""
+    try:
+        r0 = min(ue.DRAM_ADDR_ROPE_LOCAL, ue.DRAM_ADDR_ROPE_GLOBAL)
+        r1 = max(ue.DRAM_ADDR_ROPE_LOCAL + ue.weight_defs["ROPE_LOCAL_SIZE"],
+                 ue.DRAM_ADDR_ROPE_GLOBAL + ue.weight_defs["ROPE_GLOBAL_SIZE"])
+        return [[int(_a), int(_b)] for _a, _b in ([(ue._params_dram_base, r0),
+                                          (r1, ue._next_params_dram_addr)])]
+    except Exception:
+        return [[getattr(ue, "_params_dram_base", 0), getattr(ue, "_next_params_dram_addr", 0)]]
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 from quant_lib import quantize_if4
 
@@ -1456,6 +1468,7 @@ def main():
     run_result = ue.run_llama()
     run_result["input"] = (args.prompt if args.prompt is not None
                            else ue.tokenizer.decode(list(ue.prefill_seq)))
+    run_result["dram_weight_regions"] = _weight_dram_no_rope(ue)
     print("Llama-3.2-3B test ends.")
     _original_print(f"TEST_RESULT: {json.dumps(run_result, ensure_ascii=False)}")
 

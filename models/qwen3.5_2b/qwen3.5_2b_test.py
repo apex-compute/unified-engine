@@ -1525,6 +1525,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         print(f"  Tensor DRAM reserved for caches: {reserved_mb:.0f} MB")
 
         # Final norm gamma (Qwen3_5RMSNorm: (1+w) already folded in by extractor).
+        self._lm_weight_start = self._next_params_dram_addr   # TEST_RESULT dram_weight_regions
         self._final_norm_gamma = _upload(self, weights["final_norm_gamma"])
 
         # Embedding table — kept on host (~1 GB bf16 too big for params DRAM).
@@ -1561,6 +1562,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                 print(f"    {idx+1}/{self.num_layers}  "
                       f"params DRAM used: {used_mb:.0f} MB")
         print(f"  Weight upload done ({time.time()-t0:.1f}s).")
+        self._lm_weight_end = self._next_params_dram_addr     # TEST_RESULT dram_weight_regions
 
         # Fill conv weight tiles now that W_conv1d is captured on host.
         # Layout: [K, conv_dim] row-major, tap s at offset s*conv_dim*BF16.
@@ -4598,6 +4600,7 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     MG_OUT     = ue.allocate_tensor_dram(N_M * FC2_DIM * BF16)
 
     # --- Params DRAM: BF16 (norms/biases/patch/pos) + FP4 weights ---
+    ue._vis_weight_start = ue._next_params_dram_addr     # TEST_RESULT dram_weight_regions
     PATCH_W = _upload_bf16(ue, pe_w, HIDDEN * K_PIXEL)
     PATCH_B = _upload_bf16(ue, pe_b, HIDDEN)
     POS     = _upload_bf16(ue, pos_embeds, N_P * HIDDEN)
@@ -4631,6 +4634,7 @@ def _run_fpga_vision_encoder_compact(ue, model_dir: str, hf_inputs, setup_only: 
     MG_FC2_B = _upload_bf16(ue, mg.linear_fc2.bias, FC2_DIM)
     MG_FC1_S, MG_FC1_D = _upload_fp4(ue, mg.linear_fc1.weight.detach().float())
     MG_FC2_S, MG_FC2_D = _upload_fp4(ue, mg.linear_fc2.weight.detach().float())
+    ue._vis_weight_end = ue._next_params_dram_addr       # TEST_RESULT dram_weight_regions
 
     # Inputs.
     ue.dma_write(DMA_DEVICE_H2C, PIXEL, _bf(pixel_values), N_P * K_PIXEL * BF16)
@@ -5494,6 +5498,23 @@ def _print_test_result(ue, args, image_path, vision_ran_on_fpga: bool) -> None:
                    dec["flops_per_step"] * dec_steps / 1e9 if "flops_per_step" in dec else None))
     first_hw_us = dec.get("first_hw_us")
     wall_s = dec.get("wall_s") or 0.0
+    # Weights in DRAM: the LM weights prepare_inference uploaded (final norm, FP4 LM head,
+    # layers; not the eps-tail / identity / spreader tables placed around them), the conv1d
+    # weight tiles kept in tensor DRAM, the vision weights when the encoder uploaded them (same
+    # params base as the LM, reset in between, so the union counts that DRAM once), plus each
+    # engine's private decode shard copies when --multi-core > 1.
+    try:
+        _w_regions = [(ue._lm_weight_start, ue._lm_weight_end)]
+        _conv_bytes = ue._conv_K * ue.lin_conv_dim * BF16
+        _w_regions += [(_a, _a + _conv_bytes) for _a in ue._conv_weight_tiles_dram.values()]
+        if getattr(ue, "_vis_weight_end", None) is not None:
+            _w_regions.append((ue._vis_weight_start, ue._vis_weight_end))
+        if ue._decode_sharder is not None:
+            _w_regions += [(_a["base"], _a["base"] + _a["size"])
+                           for _a in ue._decode_sharder.scheduler.arena.weight_allocations()]
+        _dram_weight_regions = [[int(_a), int(_b)] for _a, _b in (_w_regions)]
+    except Exception:
+        _dram_weight_regions = None
     result = {
         "decoded_text": dec.get("generated_text", ""),
         "generated_token_ids": dec.get("token_ids"),
@@ -5507,6 +5528,7 @@ def _print_test_result(ue, args, image_path, vision_ran_on_fpga: bool) -> None:
         "prefill_hw_ms": pf["hw_us"] / 1e3 if "hw_us" in pf else None,
         "decode_first_hw_ms": first_hw_us / 1e3 if first_hw_us else None,
         "decode_avg_hw_ms": dec["hw_us"] / dec_steps / 1e3 if dec_steps else None,
+        "dram_weight_regions": _dram_weight_regions,
         # decode_first_tok_s: HW-latency rate of the first decode step; decode_avg_tok_s: the
         # wall-clock average of the "Decode summary" line. decoded_tokens is that line's count
         # (decode-loop steps; the text also holds the first token, which prefill produced).

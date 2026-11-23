@@ -717,6 +717,22 @@ class Qwen25OmniUnifiedEngine(
     def get_params_dram_usage(self) -> int:
         return self._params_staged
 
+    # Shared-pool sections allocate_params_dram places that are constants, not weights.
+    _NON_WEIGHT_PARAMS = ("params", "vision.identity", "audio.identity64",
+                          "audio.layernorm.zeros", "audio.layernorm.inv_n")
+
+    def _note_weight_sections(self) -> None:
+        """Remember the shared-pool weight sections placed so far (TEST_RESULT
+        dram_weight_regions). The windowed map releases a phase's sections when the
+        next phase loads, so they are noted before every release. Never raises."""
+        try:
+            spans = self.__dict__.setdefault("_weight_section_spans", set())
+            for item in self.layout.shared_allocations():
+                if item["what"] not in self._NON_WEIGHT_PARAMS:
+                    spans.add((item["base"], item["base"] + item["size"]))
+        except Exception:
+            pass
+
     def reset_params_dram_addr(self) -> None:
         """Hand the previous phase's weights back to the windows.
 
@@ -725,6 +741,7 @@ class Qwen25OmniUnifiedEngine(
         mark taken when the phase began. The caller must already have
         invalidated its cached addresses -- the next DMA overwrites these bytes.
         """
+        self._note_weight_sections()
         reclaimed = self.layout.release_weight_phase()
         for extent in self._reserved_extents.values():
             extent[2] = extent[0]
@@ -4717,6 +4734,19 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         prefill_tokens=reported_prefill_tokens, decoded_tokens=generated,
         decode_first_tok_s=result["first_token_tok_s"], decode_avg_tok_s=decode_tok_s,
         peak_gflops=ue.vis_peak_gflops() or None))
+    # Weights in DRAM: every shared-pool weight section placed in this run (Thinker LM norms /
+    # biases, and the vision / audio encoder weights of the mode that ran; on the windowed map
+    # those share the pool with the LM, so the union counts that DRAM once), without the
+    # identity / LayerNorm constant tables, plus every engine's private weight copies (the
+    # Thinker projection and LM-head column shards, and any other private weight carve).
+    try:
+        ue._note_weight_sections()
+        _w_regions = list(getattr(ue, "_weight_section_spans", ()))
+        _w_regions += [(_a["base"], _a["base"] + _a["size"])
+                       for _a in ue.layout.weight_allocations()]
+        result["dram_weight_regions"] = [[int(_a), int(_b)] for _a, _b in (_w_regions)]
+    except Exception:
+        result["dram_weight_regions"] = None
     print("TEST_RESULT: " + json.dumps(result, ensure_ascii=False))
     _write_summary()
 
