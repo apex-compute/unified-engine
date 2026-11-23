@@ -547,7 +547,7 @@ def main():
     paths = T._paths(cfg)
     user_dma_core.set_dma_device(args.dev)
     user_dma_core.configure_clock_from_hardware()
-    ue = T.Flux2KleinEngine(cfg, geo, num_engines=args.engines)
+    ue = T.Flux2KleinEngine(cfg, geo, num_engines=args.engines, strassen=())   # loads the image as exported
     with open(paths["params_dit_meta"]) as f:
         meta = json.load(f)
     vae_w = torch.load(paths["vae_weights"], map_location="cpu")

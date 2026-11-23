@@ -58,6 +58,7 @@ Usage (repo root):
     python models/flux2_klein_4b/flux2_klein_4b_test.py --prompt "..." [--height 512 --width 512 --max-seq-len 512] [--engines max]
     python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only      # no device needed
     python models/flux2_klein_4b/flux2_klein_4b_test.py --run-from-bin ...  # reuse programs, no compile
+    python models/flux2_klein_4b/flux2_klein_4b_test.py --strassen off      # gate/up on the plain kernel (A/B)
 
 Every run (and --compile-only) recompiles and overwrites programs/<config>.bin; only
 --run-from-bin (alias --no-compile) reuses it. Exported weight images stay cached.
@@ -73,6 +74,7 @@ import os
 import sys
 import time
 
+import numpy as np
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -89,8 +91,30 @@ from user_dma_core import (  # noqa: E402
 import flux2_klein_4b_ref as ref  # noqa: E402
 import flux2_klein_4b_weights as W  # noqa: E402
 import flux2_klein_4b_vae  # noqa: E402
+from nn_lib import (  # noqa: E402
+    strassen_if4_cells, strassen_matmul_core_dram, strassen_online_sum_count,
+    strassen_online_sums_core, strassen_online_tree,
+)
 
 BPE = 2  # bf16
+
+# Strassen matmul (nn_lib §10) on the SwiGLU gate / up projections, 4-bit online leaves: each
+# engine's output-column lane of the weight is stored as its 2x2 cells (the same bytes, re-cut on
+# the host when the weight image is loaded), the engine makes its own lane's weight sums right
+# before the matmul, and the kernel writes the lane result straight into its columns of the wide
+# output (out_pitch). Groups:
+# "te" (text encoder gate/up, 2560 -> 9728, lanes 4 x 1280 + 4 x 1152 on 8 engines), "double"
+# and "single" (DiT ff gate/up, 3072 -> 9216, lanes 1152). Level 1 everywhere: on the measured
+# shapes nearest these lanes level 2 gains no more, and it needs 256-multiple (uneven) lanes and
+# 2.2x the sum-buffer bytes. Rows run in fixed chunks of at most ST_MAX_ROWS (the kernel's M is a
+# compile-time constant): 1088 (512 x 512 joint) and 1024 -> one call, 2048 -> 2 x 1024. Program:
+# a 4-step DiT with "single" is 200 Strassen sites per engine (compile_programs checks the slots).
+ST_GROUPS = ("te", "double", "single")
+ST_DEFAULT = ("te", "double", "single")
+ST_LEVEL = 1
+ST_MAX_ROWS = 1152      # most rows one call takes (bounds the private scratch)
+ST_MIN_ROWS = 128       # fewer rows per call: the plain kernel is as fast
+ST_MIN_WIDTH = 1024     # a narrower lane or K: the plain kernel is as fast
 
 # The engine cores print a line per emitted op; a 4-step DiT program is ~10^5
 # ops, so printing is switched off while compiling (qwen3's _SILENT_MODE).
@@ -202,7 +226,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
     FIRST_DYNAMIC_REG = 15
 
     def __init__(self, cfg: dict, geo: ref.Flux2Geometry, *, num_engines: int = 1,
-                 offline: bool = False, clock_period_ns: float | None = None):
+                 offline: bool = False, clock_period_ns: float | None = None,
+                 strassen: tuple = ST_DEFAULT):
         lay = cfg["dram_layout"]
         self.offline = offline
         if offline and user_dma_core.UE_AXI_DATA_WIDTH_BITS is None:
@@ -248,7 +273,10 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         self.flops = {"te": 0, "dit": 0}
         self._flops_acc = 0
         self.timings = {}
+        assert all(g in ST_GROUPS for g in strassen), f"strassen groups: {strassen} (known: {ST_GROUPS})"
+        self.st_groups = tuple(g for g in ST_GROUPS if g in strassen)
         self.weight_init()
+        self._st_init()
         self.tensor_init()
         # worker engines: shared DRAM, own program slot after the primary's
         slot = self.PROGRAM_SLOT
@@ -316,6 +344,156 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         if name in regs:                               # bf16 B operand
             return {"B_DRAM_ADDR": self.dit_nl[name], "is_B_quantized": False}
         return self._bq(self.dit_nl[name + "_scale"], self.dit_nl[name + "_data"])
+
+    # ---------------- Strassen gate / up (see ST_GROUPS) ----------------
+    @staticmethod
+    def _st_chunks(M: int) -> list[tuple[int, int]]:
+        """Fixed row chunks of one call site: (first row, rows), at most ST_MAX_ROWS each, 64-multiples."""
+        n = -(-M // ST_MAX_ROWS)
+        m = -(-M // n // 64) * 64
+        return [(r0, min(m, M - r0)) for r0 in range(0, M, m)]
+
+    def _st_lanes(self, N: int, L: int) -> list[tuple[int, int]]:
+        """Output-column lane (first column, width) per engine: whole halving units, as even as they go."""
+        unit = 64 << L
+        blocks = N // unit
+        lanes, c0 = [], 0
+        for e in range(self.ne):
+            n = (blocks // self.ne + (e < blocks % self.ne)) * unit
+            lanes.append((c0, n))
+            c0 += n
+        assert c0 == N
+        return lanes
+
+    def _st_plan(self, rows: int, K: int, N: int) -> dict | None:
+        m = max(c for _, c in self._st_chunks(rows))
+        L = ST_LEVEL if m >= ST_MIN_ROWS else 0
+        while L and (K % (64 << L) or N % (64 << L)):
+            L -= 1
+        if not L or K >= 8192 or K < ST_MIN_WIDTH:
+            return None
+        lanes = self._st_lanes(N, L)
+        if min(n for _, n in lanes) < ST_MIN_WIDTH:
+            return None
+        return {"L": L, "K": K, "N": N, "rows": m, "lanes": lanes}
+
+    @staticmethod
+    def _st_cells(data_addr: int, scale_addr: int, K: int, L: int, c0: int, n: int) -> dict:
+        """Where the cells of the lane (c0, n) of a [N, K] IF4 weight live once re-cut: the lane keeps
+        its byte span, its cells follow each other in (N index, K index) order inside it. The one
+        layout both the compile path (_mm_st) and the host re-cut (_st_recut) use."""
+        g = 1 << L
+        nc, kc = n // g, K // g
+        d, s = data_addr + c0 * K // 2, scale_addr + c0 * (K // 64) * BPE
+        return {(i, j): (d + (i * g + j) * nc * kc // 2, s + (i * g + j) * nc * (kc // 64) * BPE)
+                for i in range(g) for j in range(g)}
+
+    def _st_init(self) -> None:
+        """The Strassen plan of every gate / up weight, and per engine its private buffers in the
+        params arena above the weight image (the sum leaves of its lane, the kernel scratch)."""
+        self.st, self.st_buf, self.st_bytes = {}, [], 0
+        q = self.cfg["quantization"]["precision"]
+        if not self.st_groups or q not in ("if4", "int4", "fp4"):
+            return
+        D, Dm = self.D, self.Dm
+        sites = {"te": [(("te", nm), self.L, self.TE_H, self.TE_I) for nm in ("gate", "up")],
+                 "double": [(("dbl", f"{s}_{nm}"), rows, D, Dm) for s, rows in (("txt", self.L), ("img", self.NI))
+                            for nm in ("ff_gate", "ff_up")],
+                 "single": [(("sgl", nm), self.S, D, Dm) for nm in ("mlp_gate", "mlp_up")]}
+        for g in self.st_groups:
+            for key, rows, K, N in sites[g]:
+                p = self._st_plan(rows, K, N)
+                if p is not None:
+                    self.st[key] = p
+        plans = list(self.st.values())
+        if not plans:
+            return
+        start = self.get_params_dram_addr()
+        A = lambda n_elems: self.allocate_params_dram(n_elems * BPE, align_bytes=4096)
+        for e in range(self.ne):
+            lane = lambda p, e=e: p["lanes"][e][1]
+            scr = []
+            for d in range(max(p["L"] for p in plans)):
+                live = [p for p in plans if p["L"] > d]
+                scr.append((A(9 * max((p["rows"] >> (d + 1)) * (p["K"] >> (d + 1)) for p in live)),
+                            A(14 * max((p["rows"] >> (d + 1)) * (lane(p) >> (d + 1)) for p in live))))
+            zero_end = self.get_params_dram_addr()
+            sums = A(max(strassen_online_sum_count(p["L"]) * (lane(p) >> p["L"]) * (p["K"] >> p["L"]) for p in plans))
+            self.st_buf.append({"scr": scr, "sums": sums, "zero": (scr[0][0], zero_end)})
+        end = self.get_params_dram_addr()
+        self.st_bytes = end - start
+        assert end <= self._tensor_dram_base, (
+            f"Strassen buffers ({self.st_bytes / 1e6:.0f} MB) run past the params arena into the tensors "
+            f"(0x{end:X} > 0x{self._tensor_dram_base:X}): narrow --strassen")
+
+    def _st_weights(self, phase: str) -> list[tuple[int, int, dict]]:
+        """(data address, scale address, plan) of every re-cut weight the phase's image holds."""
+        out = []
+        if phase == "te":
+            for li in range(self.TE_L):
+                for (grp, nm), p in self.st.items():
+                    if grp == "te":
+                        out.append((self.te_w(li, nm + "_data"), self.te_w(li, nm + "_scale"), p))
+        else:
+            for grp, n_blocks, w in (("dbl", self.N_DOUBLE, self.dbl_w), ("sgl", self.N_SINGLE, self.sgl_w)):
+                for i in range(n_blocks):
+                    for (g, nm), p in self.st.items():
+                        if g == grp:
+                            out.append((w(i, nm + "_data"), w(i, nm + "_scale"), p))
+        return out
+
+    def _st_recut(self, data, phase: str):
+        """Host side, per load: the phase's weight image (path or bytes-like) with every Strassen
+        weight's lanes re-cut into their cells (strassen_if4_cells, same bytes, nothing re-quantized).
+        Unchanged when the phase has none."""
+        entries = self._st_weights(phase)
+        if not entries:
+            return data
+        t0 = time.time()
+        if isinstance(data, str):
+            blob = bytearray(os.path.getsize(data))
+            with open(data, "rb") as f:
+                assert f.readinto(blob) == len(blob)
+        else:
+            blob = bytearray(data)
+        buf = np.frombuffer(blob, dtype=np.uint8)
+        base = self.params_base
+        for d_addr, s_addr, p in entries:
+            K, N, L = p["K"], p["N"], p["L"]
+            ds, ss = N * K // 2, N * (K // 64) * BPE
+            d = buf[d_addr - base:d_addr - base + ds].reshape(N, K // 2).copy()
+            s = buf[s_addr - base:s_addr - base + ss].reshape(N, (K // 64) * BPE).copy()
+            for c0, n in p["lanes"]:
+                cur = [d_addr + c0 * K // 2, s_addr + c0 * (K // 64) * BPE]
+
+                def put(db, sb, nn, kk, t=None, cur=cur):          # strassen_if4_cells' store_pack
+                    at = (cur[0], cur[1])
+                    buf[at[0] - base:at[0] - base + len(db)] = np.frombuffer(db, dtype=np.uint8)
+                    buf[at[1] - base:at[1] - base + len(sb)] = np.frombuffer(sb, dtype=np.uint8)
+                    cur[0] += len(db)
+                    cur[1] += len(sb)
+                    return at
+                got = strassen_if4_cells(d[c0:c0 + n].tobytes(), s[c0:c0 + n].tobytes(), n, K, L, put)
+                assert got == self._st_cells(d_addr, s_addr, K, L, c0, n), "Strassen re-cut disagrees with the compiled cells"
+        _log(f"  [{phase} weights] {len(entries)} Strassen weights re-cut into lane cells in {time.time() - t0:.1f}s")
+        return blob
+
+    def _st_zero(self) -> None:
+        """Zero every engine's Strassen scratch (fresh / reused DRAM may hold NaN patterns; the VAE
+        phase reuses this part of the params arena)."""
+        if not self.st_buf:
+            return
+        size = max(z1 - z0 for z0, z1 in (b["zero"] for b in self.st_buf))
+        zeros = torch.zeros(size // BPE, dtype=torch.bfloat16)
+        for b in self.st_buf:
+            z0, z1 = b["zero"]
+            self.dma_to_accelerator_memory(z0, zeros[:(z1 - z0) // BPE])
+
+    def st_summary(self) -> str:
+        if not self.st:
+            return "Strassen off"
+        names = ", ".join(f"{g}.{n} L{p['L']}" for (g, n), p in self.st.items())
+        return f"Strassen on {names}; private buffers {self.st_bytes / 1e6:.0f} MB in the params arena"
 
     # ---------------- tensors ----------------
     def tensor_init(self) -> None:
@@ -486,8 +664,11 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                 self.cur.sram_to_accelerator_memory(0x00000, dst + r * width * BPE, width)
         self.B()
 
-    def _mm(self, M, K, N, A, OUT, mkind: str, Bw: dict, **kw) -> None:
-        """A[M,K] @ B[N,K]^T -> OUT[M,N], split over output columns."""
+    def _mm(self, M, K, N, A, OUT, mkind: str, Bw: dict, st: tuple | None = None, **kw) -> None:
+        """A[M,K] @ B[N,K]^T -> OUT[M,N], split over output columns.
+        st: the weight's Strassen key; when it has a plan the call goes through _mm_st."""
+        if st is not None and st in self.st:
+            return self._mm_st(M, K, N, A, OUT, Bw, self.st[st], dict(kw) or None)
         c0, n = self._cols(N)
         if n:
             Bw = dict(Bw)
@@ -508,6 +689,32 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                 self.cur.release_isa_reg()
             self._flops_acc += f if f else 2 * M * K * n
         self.B()
+
+    def _mm_st(self, M, K, N, A, OUT, Bw: dict, p: dict, act: dict | None) -> None:
+        """_mm by Strassen: this engine's lane of the re-cut weight. The engine makes its own lane's
+        sum leaves (its private buffers, so no round between), then runs the fixed row chunks."""
+        c0, n = p["lanes"][self.e]
+        if n:
+            assert Bw.get("is_B_quantized") and Bw["data_type"] == TYPE.IF4, "Strassen lanes are IF4 cells"
+            L = p["L"]
+            cells = self._st_cells(Bw["B_DRAM_ADDR"], Bw["SCALE_DRAM_ADDR"], K, L, c0, n)
+            nc, kc = n >> L, K >> L
+            sums = [self.st_buf[self.e]["sums"] + i * nc * kc * BPE for i in range(strassen_online_sum_count(L))]
+            strassen_online_sums_core(self.cur, cells, nc, kc, sums, L)
+            tree = strassen_online_tree(cells, sums, L)
+            for r0, m in self._st_chunks(M):
+                assert m <= p["rows"] and m % (1 << L) == 0, f"Strassen chunk of {m} rows (scratch holds {p['rows']})"
+                self._st_matmul(m, K, n, A + r0 * K * BPE, tree, L, OUT + (r0 * N + c0) * BPE, N, act)
+            self._flops_acc += 2 * M * K * n
+        self.B()
+
+    def _st_matmul(self, m, K, n, A, tree, L, dst, pitch, act) -> None:
+        """Every Strassen call of the port: [m, K] x lane^T -> the lane's columns of the wide
+        [*, pitch] buffer at dst, written there by the kernel (out_pitch: pitch a 64-multiple,
+        dst on a 128-byte line). New kernel options are adopted here."""
+        assert dst % 128 == 0 and pitch % 64 == 0, f"Strassen lane at 0x{dst:X}, pitch {pitch}: not line-aligned"
+        strassen_matmul_core_dram(self.cur, m, K, n, A, tree, dst, self.st_buf[self.e]["scr"][:L],
+                                  activation=act, identity_addr=self.IDENTITY if act else None, out_pitch=pitch)
 
     def _elt(self, M, N, a, b, out, mode, kind: str, scalar=None) -> None:
         r0, m = self._rows(M)
@@ -652,8 +859,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             self._mm(L, nh * hd, H, self.TE_ATT, self.TE_O, "TE", self.te_B(li, "o"))
             self._elt(L, H, X, self.TE_O, self.TE_RES, UE_MODE.ELTWISE_ADD, "TE")
             self._rms(L, H, self.TE_RES, self.TE_XN2, self.te_w(li, "ffn_norm"), "TE")
-            self._mm(L, H, I, self.TE_XN2, self.TE_GATE, "TE", self.te_B(li, "gate"), silu_enable=True)
-            self._mm(L, H, I, self.TE_XN2, self.TE_UP, "TE", self.te_B(li, "up"))
+            self._mm(L, H, I, self.TE_XN2, self.TE_GATE, "TE", self.te_B(li, "gate"), st=("te", "gate"), silu_enable=True)
+            self._mm(L, H, I, self.TE_XN2, self.TE_UP, "TE", self.te_B(li, "up"), st=("te", "up"))
             self._elt(L, I, self.TE_GATE, self.TE_UP, self.TE_MULT, UE_MODE.ELTWISE_MUL, "TE")
             self._mm(L, I, H, self.TE_MULT, self.TE_DOWN, "TE", self.te_B(li, "down"))
             self._elt(L, H, self.TE_RES, self.TE_DOWN, XO, UE_MODE.ELTWISE_ADD, "TE")
@@ -756,8 +963,10 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             self._elt(M, D, self.AO + rb(r0), self.GATE_B[f"{s}_msa"], self.G + rb(r0), UE_MODE.ELTWISE_MUL, kM)
             self._elt(M, D, H + rb(r0), self.G + rb(r0), H2 + rb(r0), UE_MODE.ELTWISE_ADD, kM)
             self._ln_mod(M, H2 + rb(r0), self.HN + rb(r0), self.mod_addr(s, step, 4, True), self.mod_addr(s, step, 3), kM)
-            self._mm(M, D, Dm, self.HN + rb(r0), self.MG + r0 * Dm * BPE, kM, self.dbl_B(i, f"{s}_ff_gate"), silu_enable=True)
-            self._mm(M, D, Dm, self.HN + rb(r0), self.MU + r0 * Dm * BPE, kM, self.dbl_B(i, f"{s}_ff_up"))
+            self._mm(M, D, Dm, self.HN + rb(r0), self.MG + r0 * Dm * BPE, kM, self.dbl_B(i, f"{s}_ff_gate"),
+                     st=("dbl", f"{s}_ff_gate"), silu_enable=True)
+            self._mm(M, D, Dm, self.HN + rb(r0), self.MU + r0 * Dm * BPE, kM, self.dbl_B(i, f"{s}_ff_up"),
+                     st=("dbl", f"{s}_ff_up"))
             self._elt(M, Dm, self.MG + r0 * Dm * BPE, self.MU + r0 * Dm * BPE, self.MM + r0 * Dm * BPE, UE_MODE.ELTWISE_MUL, kM)
             self._mm(M, Dm, D, self.MM + r0 * Dm * BPE, self.MO + rb(r0), kM, self.dbl_B(i, f"{s}_ff_out"))
             self._elt(M, D, self.MO + rb(r0), self.GATE_B[f"{s}_mlp"], self.G + rb(r0), UE_MODE.ELTWISE_MUL, kM)
@@ -771,8 +980,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         self._mm(S, D, D, self.HN, self.Q, "S", self.sgl_B(i, "q"))
         self._mm(S, D, D, self.HN, self.K, "S", self.sgl_B(i, "k"))
         self._mm(S, D, D, self.HN, self.V, "S", self.sgl_B(i, "v"))
-        self._mm(S, D, Dm, self.HN, self.MG, "S", self.sgl_B(i, "mlp_gate"), silu_enable=True)
-        self._mm(S, D, Dm, self.HN, self.MU, "S", self.sgl_B(i, "mlp_up"))
+        self._mm(S, D, Dm, self.HN, self.MG, "S", self.sgl_B(i, "mlp_gate"), st=("sgl", "mlp_gate"), silu_enable=True)
+        self._mm(S, D, Dm, self.HN, self.MU, "S", self.sgl_B(i, "mlp_up"), st=("sgl", "mlp_up"))
         self._rms(S * nh, hd, self.Q, self.QN, self.sgl_w(i, "norm_q"), "MH_S")
         self._rms(S * nh, hd, self.K, self.KN, self.sgl_w(i, "norm_k"), "MH_S")
         self._rope_joint()
@@ -825,7 +1034,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                           "sigmas": [round(float(x), 7) for x in self.sigmas], "layout": self.cfg["dram_layout"],
                           "q": self.cfg["quantization"], "engines": self.ne, "emitter": self._emitter_hash(),
                           "vae_emitter": flux2_klein_4b_vae.emitter_hash(),
-                          "vae_conv3x3": self.cfg["vae"].get("conv3x3_mode", "walker"), "v": 4},
+                          "vae_conv3x3": self.cfg["vae"].get("conv3x3_mode", "walker"), "v": 4,
+                          "strassen": {f"{g}.{n}": [p["L"], p["rows"], p["lanes"]] for (g, n), p in self.st.items()}},
                          sort_keys=True)
         return hashlib.sha1(key.encode()).hexdigest()[:12]
 
@@ -881,6 +1091,12 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                 images.append({"engine": wi, "phase": name, "addr": addr, "size": len(wb), "offset": len(blob)})
                 blob.extend(wb)
         images[0]["offset"] = 0
+        if self.ne > 1:     # every engine's programs inside its own slot (Strassen calls add to every engine)
+            for im in images:
+                slot = self._program_dram_base + im["engine"] * self.PROGRAM_SLOT
+                assert im["addr"] + im["size"] <= slot + self.PROGRAM_SLOT, (
+                    f"engine {im['engine']} {im['phase']} program ends {(im['addr'] + im['size'] - slot) / 2**20:.1f} MiB "
+                    f"into its {self.PROGRAM_SLOT >> 20} MiB slot ({self.st_summary()}): narrow --strassen")
         self.clear_capture_buffer()
         _SILENT = True
         try:
@@ -1026,8 +1242,9 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         """The token embedding table must be on the board (load_embed_table)."""
         L = self.L
         assert input_ids.shape[-1] == L
-        self._dma_blob(params_te_bin, self.params_base, "TE weights")
-        blk = self.embed_gather_block(meta, input_ids.reshape(-1).tolist())
+        self._dma_blob(self._st_recut(params_te_bin, "te"), self.params_base, "TE weights")
+        self._st_zero()
+        blk =self.embed_gather_block(meta, input_ids.reshape(-1).tolist())
         addr = meta["te_program_start_addr"] + meta["te_embed_gather"]["offset"]
         n = self.dma_write(self.h2c_device, addr, blk, len(blk))
         assert n == len(blk), "embedding gather block: short DMA"
@@ -1044,7 +1261,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
 
     def run_dit(self, meta: dict, noise: torch.Tensor, params_dit_bin: str,
                 prompt_embeds: torch.Tensor | None = None) -> torch.Tensor:
-        self._dma_blob(params_dit_bin, self.params_base, "DiT weights")
+        self._dma_blob(self._st_recut(params_dit_bin, "dit"), self.params_base, "DiT weights")
+        self._st_zero()
         if prompt_embeds is not None:                       # bypass the TE phase (cached / host embeds)
             self.dma_to_accelerator_memory(self.TXT_EMB_IN, prompt_embeds.reshape(self.L, self.J).to(torch.bfloat16))
         self.dma_to_accelerator_memory(self.X_LAT[0], noise.reshape(self.NI, self.CIN).to(torch.bfloat16))
@@ -1120,19 +1338,22 @@ def config_key(geo: ref.Flux2Geometry) -> str:
     return f"{geo.height}x{geo.width}x{geo.max_sequence_length}x{geo.num_inference_steps}"
 
 
-def program_paths(cfg: dict, geo: ref.Flux2Geometry, engines: int) -> tuple[str, str]:
+def program_paths(cfg: dict, geo: ref.Flux2Geometry, engines: int, strassen: tuple = ST_DEFAULT) -> tuple[str, str]:
     """Where one configuration's compiled programs live:
-    flux2_klein_4b_bin/programs/<HxWxTOKENSxSTEPS>_e<engines>.{bin,json}."""
+    flux2_klein_4b_bin/programs/<HxWxTOKENSxSTEPS>_e<engines>[_st-<groups>].{bin,json}
+    (the suffix only when the Strassen groups are not the default)."""
     d = os.path.join(HERE, cfg["paths"]["bin_dir"], "programs")
     os.makedirs(d, exist_ok=True)
-    stem = os.path.join(d, f"{config_key(geo)}_e{engines}")
+    strassen = tuple(g for g in ST_GROUPS if g in strassen)
+    tag = "" if strassen == ST_DEFAULT else "_st-" + ("-".join(strassen) or "off")
+    stem = os.path.join(d, f"{config_key(geo)}_e{engines}{tag}")
     return stem + ".bin", stem + ".json"
 
 
 def ensure_programs(ue: "Flux2KleinEngine", cfg: dict, *, allow_compile: bool = True, force: bool = False) -> dict:
     """Return the program metadata for ``ue``'s configuration, compiling (offline-capable)
     when the files are missing or their signature is stale."""
-    bin_p, meta_p = program_paths(cfg, ue.geo, ue.ne)
+    bin_p, meta_p = program_paths(cfg, ue.geo, ue.ne, ue.st_groups)
     if not force and os.path.exists(bin_p) and os.path.exists(meta_p):
         with open(meta_p) as f:
             meta = json.load(f)
@@ -1175,6 +1396,8 @@ def main(argv=None) -> int:
     ap.add_argument("--text-encoder", choices=["fpga", "host"], default="fpga",
                     help="host: compute the prompt embedding with transformers and skip the TE phase")
     ap.add_argument("--no-reference", action="store_true", help="skip the host IF4 reference comparison")
+    ap.add_argument("--strassen", default=",".join(ST_DEFAULT),
+                    help=f"Strassen gate/up groups, comma list of {','.join(ST_GROUPS)}, or 'off' (A/B timing)")
     ap.add_argument("--ref-device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default=None, help="output PNG (default flux2_klein_4b_bin/flux2_<seed>.png)")
     args = ap.parse_args(argv)
@@ -1212,17 +1435,18 @@ def main(argv=None) -> int:
     _log(f"FLUX.2 klein 4B | {geo.height}x{geo.width} | text {geo.n_txt} + image {geo.n_img} tokens "
          f"(joint {geo.n_joint}) | {geo.num_inference_steps} steps | {ne} engine(s)")
 
-    ue = Flux2KleinEngine(cfg, geo, num_engines=ne, offline=args.compile_only)
+    strassen = () if args.strassen == "off" else tuple(g for g in args.strassen.split(",") if g)
+    ue = Flux2KleinEngine(cfg, geo, num_engines=ne, offline=args.compile_only, strassen=strassen)
     ue.phase_timeout = args.phase_timeout
-    _log(f"  tensor arena {ue.tensor_usage / 1e6:.0f} MB, params image {ue.params_image_size / 1e9:.2f} GB")
+    _log(f"  tensor arena {ue.tensor_usage / 1e6:.0f} MB, params image {ue.params_image_size / 1e9:.2f} GB; {ue.st_summary()}")
 
     # Default: always recompile (force); only --no-compile / --run-from-bin reuses the bin.
     meta = ensure_programs(ue, cfg, allow_compile=not args.no_compile,
                            force=args.force_compile or not args.no_compile)
     if args.compile_only:
-        _log(f"compile-only done: {program_paths(cfg, geo, ne)[0]}")
+        _log(f"compile-only done: {program_paths(cfg, geo, ne, ue.st_groups)[0]}")
         return 0
-    meta = ue.load_programs(*program_paths(cfg, geo, ne))
+    meta = ue.load_programs(*program_paths(cfg, geo, ne, ue.st_groups))
     ue.timings = {}
 
     snap = ref.snapshot_dir(cfg["paths"]["hf_model_repo"])
@@ -1273,6 +1497,7 @@ def main(argv=None) -> int:
     # ---------------- scoring ----------------
     result = {"height": geo.height, "width": geo.width, "max_sequence_length": geo.n_txt, "steps": geo.num_inference_steps,
               "seed": args.seed, "engines": ne, "image": out, "vae": args.vae, "text_encoder": args.text_encoder,
+              "strassen": sorted(f"{g}.{n}" for g, n in ue.st),
               "finite": bool(torch.isfinite(lat_denorm.float()).all()) and bool(torch.isfinite(img.float()).all()),
               "te_s": ue.timings.get("te_s"), "dit_s": ue.timings.get("dit_s"), "vae_s": ue.timings.get("vae_s"),
               "vae_psnr_db": vae_psnr}
