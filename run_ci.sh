@@ -22,6 +22,10 @@
 #                                  # not stopping on failure, with auto-triage that
 #                                  # classifies each failure as BIN-RELOAD /
 #                                  # CONTAMINATION (prev->model) / FLAKY
+#   ./run_ci.sh --engines N       # model round on N engines (1..board cores; 'max',
+#                                  # the default, uses every core HW_INFO reports).
+#                                  # user_hw_test.py is not affected.
+# Flags combine in any order; --only must come last (it takes the remaining names).
 
 set -uo pipefail
 
@@ -32,35 +36,29 @@ cd "$SCRIPT_DIR"
 # BEFORE user_hw_test.py, so a night run gets its pi05 verdict in ~2 minutes
 # instead of after the generic HW ops plus 18 other models. The harness stops on
 # the first failure, so an early pi05 failure also skips the rest.
-PI05_FIRST=0
-if [[ "${1:-}" == "--pi05-first" ]]; then
-    PI05_FIRST=1
-    shift
-fi
-
-SHUFFLE_PASS=0
-if [[ "${1:-}" == "--shuffle-pass" ]]; then
-    SHUFFLE_PASS=1
-    shift
-fi
-
 # --shuffle: the single model round runs in a seeded random order, so each night
 # covers different (previous -> model) pairs without a second round, and runs every
 # model even after one fails (the exit status still reports the failure).
+PI05_FIRST=0
+SHUFFLE_PASS=0
 SHUFFLE=0
-if [[ "${1:-}" == "--shuffle" ]]; then
-    SHUFFLE=1
-    shift
-fi
-
+ENGINES=max
 ONLY_ARGS=()
-if [[ "${1:-}" == "--only" ]]; then
-    shift
-    ONLY_ARGS=(--only "$@")
-fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pi05-first)   PI05_FIRST=1; shift ;;
+        --shuffle-pass) SHUFFLE_PASS=1; shift ;;
+        --shuffle)      SHUFFLE=1; shift ;;
+        --engines)
+            [[ $# -ge 2 ]] || { echo "!!! --engines needs N or max"; exit 2; }
+            ENGINES="$2"; shift 2 ;;
+        --only)         shift; ONLY_ARGS=(--only "$@"); break ;;
+        *) echo "!!! run_ci.sh: unknown argument '$1'"; exit 2 ;;
+    esac
+done
 
-FIRST_ARGS=()
-[[ $PI05_FIRST -eq 1 ]] && FIRST_ARGS=(--first pi05)
+FIRST_ARGS=(--engines "$ENGINES")
+[[ $PI05_FIRST -eq 1 ]] && FIRST_ARGS+=(--first pi05)
 [[ $SHUFFLE -eq 1 ]] && FIRST_ARGS+=(--shuffle-seed "${SHUFFLE_SEED:-$(date +%Y%m%d)}" --continue-on-fail)
 
 STEP_TOTAL=2
@@ -103,7 +101,7 @@ run_shuffle_pass() {
     echo "#       (reproduce with: SHUFFLE_SEED=$seed ./run_ci.sh --shuffle-pass)"
     echo "############################################################"
     cp -f model_auto_test_results.txt model_auto_test_results_pass1.txt 2>/dev/null || true
-    python model_auto_test.py "${ONLY_ARGS[@]}" --run-from-bin --shuffle-seed "$seed" --continue-on-fail --triage
+    python model_auto_test.py "${ONLY_ARGS[@]}" --engines "$ENGINES" --run-from-bin --shuffle-seed "$seed" --continue-on-fail --triage
     SHUFFLE_STATUS=$?
     cp -f model_auto_test_results.txt model_auto_test_results_shuffle.txt 2>/dev/null || true
     STEP=$((STEP + 1))

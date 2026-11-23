@@ -22,23 +22,29 @@ name: Model HW CI
 on:
   workflow_dispatch:
     inputs:
-      clean_bins:
-        description: "Wipe cached compiled programs (programs.bin/json) first, forcing every model to recompile from scratch"
-        required: false
-        type: boolean
-        default: false
       full_run:
         description: "Run the full model_auto_test.py registry instead of the two Gemma4 E2B image cases"
         required: false
         type: boolean
         default: false
+      models:
+        description: "Registered model names, space-separated (model_auto_test.py --list-names); overrides full_run. Empty: full_run / the default subset"
+        required: false
+        type: string
+        default: ""
+      board:
+        description: "kintex7 (p620), alveo_u50 (p2 xdma0, over SSH) or both (the nightly)"
+        required: false
+        type: choice
+        options: [kintex7, alveo_u50, both]
+        default: kintex7
+      engines:
+        description: "Model round engine count: max (every core the board reports) or 1..8; above the board's cores is an error. user_hw_test.py is not affected"
+        required: false
+        type: string
+        default: "max"
       pi05_first:
         description: "Run the model round BEFORE user_hw_test.py, with pi05 hoisted to the front (fast pi05 verdict)"
-        required: false
-        type: boolean
-        default: false
-      alveo_u50:
-        description: "Also run the suite on p2's Alveo U50 (xdma0, 8 engines) over SSH, in parallel with this runner's kintex7 (the nightly sets it)"
         required: false
         type: boolean
         default: false
@@ -90,15 +96,88 @@ jobs:
           git reset --hard HEAD
           git clean -ffdx -e models
 
+      - name: Resolve run config
+        # One set of run_ci.sh args for both boards. push / pull_request carry no
+        # inputs: kintex7, every core, the branch's default model subset.
+        id: cfg
+        env:
+          IN_BOARD: ${{ inputs.board || 'kintex7' }}
+          IN_ENGINES: ${{ inputs.engines || 'max' }}
+          IN_MODELS: ${{ inputs.models }}
+          IN_FULL: ${{ inputs.full_run }}
+          IN_PI05_FIRST: ${{ inputs.pi05_first }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          case "$IN_BOARD" in
+            kintex7|alveo_u50|both) ;;
+            *) echo "::error::board must be kintex7, alveo_u50 or both (got '$IN_BOARD')"; exit 1 ;;
+          esac
+          if [[ "$IN_ENGINES" != max && ! "$IN_ENGINES" =~ ^[1-8]$ ]]; then
+            echo "::error::engines must be max or 1..8 (got '$IN_ENGINES')"; exit 1
+          fi
+          read -r -a MODELS <<< "$IN_MODELS"
+          for m in "${MODELS[@]}"; do
+            [[ "$m" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "::error::bad model name '$m'"; exit 1; }
+          done
+
+          ARGS=(--engines "$IN_ENGINES")
+          # Must precede --only: run_ci.sh takes the rest of the line as names.
+          [[ "$IN_PI05_FIRST" == "true" ]] && ARGS+=(--pi05-first)
+          if [[ ${#MODELS[@]} -gt 0 ]]; then
+            # A chosen list: shuffled like the full run, every listed model runs.
+            ARGS+=(--shuffle --only "${MODELS[@]}")
+            SCOPE="${MODELS[*]}"
+          elif [[ "$IN_FULL" == "true" ]]; then
+            # No --only: the whole model_auto_test.py registry, one round, in a
+            # date-seeded shuffled order so each night covers different
+            # (previous -> model) pairs for cross-model NaN / contamination.
+            ARGS+=(--shuffle)
+            SCOPE="all registered models"
+          elif [[ "$BRANCH" == "model/verapulse" ]]; then
+            # verapulse bring-up branch: run ONLY verapulse. Same reasoning as pi05
+            # below -- the Gemma4 cases add ~15 min of shared-board time and cannot
+            # regress from changes confined to models/verapulse.
+            ARGS+=(--only verapulse); SCOPE="verapulse"
+          elif [[ "$BRANCH" == "alpamayo2-edge" ]]; then
+            # Alpamayo 2 Edge bring-up branch: run ONLY alpamayo2_edge (8 engines, 8 GiB;
+            # the harness skips it on a smaller board).
+            ARGS+=(--only alpamayo2_edge); SCOPE="alpamayo2_edge"
+          elif [[ "$BRANCH" == "model/pi05_libero" ]]; then
+            # pi05 bring-up branch: run ONLY pi05.
+            ARGS+=(--only pi05); SCOPE="pi05"
+          else
+            # Default subset elsewhere. --only filters but preserves registry order,
+            # and pi05 is first in TESTS, so it runs before the Gemma4 cases; the
+            # harness stops on the first failure, so a verdict lands in ~2 min.
+            # The two Gemma4 cases stay in ONE model_auto_test.py invocation, so the
+            # run-from-bin Vette case replays the image the first case just compiled.
+            ARGS+=(--only pi05 gemma4_e2b gemma4_e2b_run_from_bin)
+            SCOPE="pi05 + gemma4_e2b + gemma4_e2b_run_from_bin"
+          fi
+
+          KINTEX7=false; ALVEO=false
+          [[ "$IN_BOARD" != alveo_u50 ]] && KINTEX7=true
+          [[ "$IN_BOARD" != kintex7 ]] && ALVEO=true
+          echo "[ci] board=$IN_BOARD engines=$IN_ENGINES scope: $SCOPE"
+          echo "[ci] ./run_ci.sh ${ARGS[*]}"
+          {
+            echo "kintex7=$KINTEX7"
+            echo "alveo_u50=$ALVEO"
+            echo "args=${ARGS[*]}"
+            echo "scope=$SCOPE (board $IN_BOARD, engines $IN_ENGINES)"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Start the Alveo U50 leg on p2
         # The same suite on p2's U50 (xdma0), run by github@p2 over SSH from this
         # runner (one runner on p620, so a second job would wait ~2 h for this one).
         # It runs in the background while this runner tests the kintex7 below; the
         # "Collect" step waits for it. See .github/scripts/alveo_u50_remote.sh.
         # Never fails itself: a failure is written to alveo_u50/rc for Collect.
-        if: ${{ inputs.alveo_u50 == true }}
+        if: ${{ steps.cfg.outputs.alveo_u50 == 'true' }}
         env:
           P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
+          # Validated tokens (Resolve run config), so the remote shell may split them.
+          RUN_ARGS: ${{ steps.cfg.outputs.args }}
         run: |
           mkdir -p alveo_u50
           if ! ssh -o BatchMode=yes -o ConnectTimeout=15 "$P2_SSH" true; then
@@ -108,59 +187,20 @@ jobs:
           fi
           nohup bash -c 'ssh -o BatchMode=yes -o ServerAliveInterval=60 "$0" "bash -s -- $1" \
                            < .github/scripts/alveo_u50_remote.sh > alveo_u50/run.log 2>&1
-                         echo $? > alveo_u50/rc' "$P2_SSH" "$GITHUB_SHA" > /dev/null 2>&1 &
-          echo "Alveo U50 leg started on $P2_SSH for $GITHUB_SHA (pid $!)"
+                         echo $? > alveo_u50/rc' "$P2_SSH" "$GITHUB_SHA $RUN_ARGS" > /dev/null 2>&1 &
+          echo "Alveo U50 leg started on $P2_SSH for $GITHUB_SHA: run_ci.sh $RUN_ARGS (pid $!)"
 
       - name: Run CI suite
         id: ci
+        if: ${{ steps.cfg.outputs.kintex7 == 'true' }}
+        env:
+          RUN_ARGS: ${{ steps.cfg.outputs.args }}
         run: |
-          ARGS=()
-          if [[ "${{ inputs.clean_bins }}" == "true" ]]; then
-            ARGS+=(--clean-bins)
-          fi
-          # Must precede --only: run_ci.sh parses its flags positionally.
-          if [[ "${{ inputs.pi05_first }}" == "true" ]]; then
-            ARGS+=(--pi05-first)
-          fi
-          # Which branch is this? head_ref is set on pull_request, ref_name on push
-          # and workflow_dispatch.
-          BRANCH="${{ github.head_ref || github.ref_name }}"
-
-          if [[ "${{ inputs.full_run }}" == "true" ]]; then
-            # No --only: the whole model_auto_test.py registry, one round, in a
-            # date-seeded shuffled order so each night covers different
-            # (previous -> model) pairs for cross-model NaN / contamination.
-            ARGS+=(--shuffle)
-          elif [[ "$BRANCH" == "model/verapulse" ]]; then
-            # verapulse bring-up branch: run ONLY verapulse. Same reasoning as pi05
-            # below -- the Gemma4 cases add ~15 min of shared-board time and cannot
-            # regress from changes confined to models/verapulse.
-            echo "[ci] branch $BRANCH -> verapulse only"
-            ARGS+=(--only verapulse)
-          elif [[ "$BRANCH" == "alpamayo2-edge" ]]; then
-            # Alpamayo 2 Edge bring-up branch: run ONLY alpamayo2_edge (8 engines, 8 GiB;
-            # the harness skips it on a smaller board). Changes there are confined to
-            # models/alpamayo2_edge, so the default subset would add board time for nothing.
-            echo "[ci] branch $BRANCH -> alpamayo2_edge only"
-            ARGS+=(--only alpamayo2_edge)
-          elif [[ "$BRANCH" == "model/pi05_libero" ]]; then
-            # pi05 bring-up branch: run ONLY pi05. The Gemma4 cases add ~15 min of
-            # shared-board time and cannot regress from pi05-only changes.
-            echo "[ci] branch $BRANCH -> pi05 only"
-            ARGS+=(--only pi05)
-          else
-            # Default subset elsewhere. --only filters but preserves registry order,
-            # and pi05 is first in TESTS, so it runs before the Gemma4 cases; the
-            # harness stops on the first failure, so a verdict lands in ~2 min.
-            # The two Gemma4 cases stay in ONE model_auto_test.py invocation: the
-            # first run creates/loads programs.bin; no clean or bin removal occurs
-            # before the run-from-bin Vette case.
-            ARGS+=(--only pi05 gemma4_e2b gemma4_e2b_run_from_bin)
-          fi
+          read -r -a ARGS <<< "$RUN_ARGS"
           ./run_ci.sh "${ARGS[@]}"
 
       - name: Collect the Alveo U50 leg
-        if: ${{ always() && inputs.alveo_u50 == true }}
+        if: ${{ always() && steps.cfg.outputs.alveo_u50 == 'true' }}
         env:
           P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
         run: |
@@ -257,8 +297,9 @@ jobs:
             const path = require('path');
 
             const ws = process.env.GITHUB_WORKSPACE || '.';
-            const ciOutcome = `${{ steps.ci.outcome }}`;
-            const fullRun = `${{ inputs.full_run }}` === 'true';
+            // The whole job, so an Alveo U50 failure (or an alveo_u50-only run,
+            // where the kintex7 step is skipped) is reflected too.
+            const ciOutcome = `${{ job.status }}`;
             const MAX_MODEL_CHARS = 40000;
             const MAX_HW_CHARS = 15000;
 
@@ -325,19 +366,19 @@ jobs:
               return [...head, ...bridge, ...tail].join('\n');
             }
 
+            // An alveo_u50-only run has no kintex7 results; report the U50 leg's.
+            const dir = `${{ steps.cfg.outputs.kintex7 }}` === 'false' ? 'alveo_u50/' : '';
             const modelResults = clipMiddle(
-              readResult('model_auto_test_results.txt'), MAX_MODEL_CHARS);
+              readResult(`${dir}model_auto_test_results.txt`), MAX_MODEL_CHARS);
             const hwResults = clipMiddle(
-              readResult('user_hw_test_summary.md'), MAX_HW_CHARS);
+              readResult(`${dir}user_hw_test_summary.md`), MAX_HW_CHARS);
 
             const status = ciOutcome === 'success'
               ? '✅ PASSED'
               : ciOutcome === 'failure'
                 ? '❌ FAILED'
                 : `⚠️ ${ciOutcome.toUpperCase()}`;
-            const modelScope = fullRun
-              ? 'all registered models'
-              : 'gemma4_e2b + gemma4_e2b_run_from_bin';
+            const modelScope = `${{ steps.cfg.outputs.scope }}`;
             const comment = [
               '**Unified Engine HW CI Report**',
               `- **Status:** ${status}`,
