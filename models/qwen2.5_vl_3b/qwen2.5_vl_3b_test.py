@@ -746,6 +746,12 @@ qwen2.5_vl_3b_numeric.py.""")
                         help="Reuse a cached program image instead of compiling. Not supported: "
                              "this script compiles every program in-process each run and keeps "
                              "no program image on disk, so the flag exits with an error.")
+    parser.add_argument("--no-strassen", action="store_true",
+                        help="Turn off the Strassen prefill MLP (on by default: gate/up "
+                             "stored as two input-column slabs, a prefill of >= 128 rows "
+                             "runs them as Strassen lanes, and with --multi-core down "
+                             "too, as K lanes). Off = the original weight "
+                             "layout and programs, for A/B timing.")
     add_engine_args(parser)
     return parser
 
@@ -814,6 +820,8 @@ def summary_filename(args, cores: int) -> str:
         tags.append(f"multi-core_{cores}")
     if args.profile:
         tags.append("profile")
+    if getattr(args, "no_strassen", False):
+        tags.append("no-strassen")
     return "qwen2.5_vl_3b_test_" + "_".join(tags) + ".md"
 
 
@@ -889,6 +897,7 @@ def main():
 
     print(f"\n--- Building engine ---")
     ue = Qwen25VL_UnifiedEngine(**engine_kwargs)
+    ue.strassen_mlp = not args.no_strassen      # read by lm_weight_init
     print(ue.describe_dram_map())
 
     def _run_lm(image_embeddings=None, prefill_tokens=None, positions=None):
