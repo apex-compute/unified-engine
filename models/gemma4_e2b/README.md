@@ -162,6 +162,19 @@ of engines; bare `--multi-core` selects two. Multicore runs select the
 `--vision-kernel` expose the supported `streaming` or `matmatmul` choices,
 subject to hardware validation. Use `--help` for all options.
 
+At 8 or more engines on the tiled map the prefill MLP lanes at least 1024 wide
+on both sides (E2B's 1536 x 1536 lanes on the wide layers, every E4B lane of
+2560 x 1280) run on level-1 Strassen (`nn_lib.py` section 10) in prefill
+programs of 128 rows or more. Those weights are stored once as two
+input-column slabs: decode and shorter programs run one matmul per slab. The
+workers make each layer's weight sums (every engine's gate, up and down) while
+engine 0 runs the previous layer's per-layer injection alone, so the sums stay
+off the critical path. `--no-strassen` turns this off and restores the plain
+kernel and layout. On it adds per engine: E2B 16.9 MiB of sum buffers + 8.6 MiB
+of scratch (inside the existing private reserve) and 16 MiB of program space;
+E4B 23.4 + 14.4 MiB (the reserve grows by one 32 MiB step) and 32 MiB of
+program space.
+
 The checked-in configuration sets `max_prefill_seq_len` and
 `prefill_max_seq_len` to 512 and `max_context_size` to 8192. Prefill processes
 all prompt tokens except the final one, which starts decoding. Its runtime

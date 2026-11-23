@@ -62,6 +62,16 @@ Measured on xdma1 (198.3 MHz, one engine, 25.4 GFLOPS peak), `vette.jpg` +
 `apex.wav`, 407-token prompt: prefill 141.5 s (23.0 model GFLOPS, 91% of peak),
 decode first token 1.90 tok/s, coherent text to the stop token.
 
+At 8 engines every MLP lane (gate/up 2560 -> 1280, down 1280 -> 2560) runs on
+level-1 Strassen in prefill programs of 128 rows or more, from weights stored
+once as two input-column slabs (decode reads the same slabs, one matmul per
+slab). The weight sums of a layer are made by the 7 workers while engine 0
+runs the previous layer's per-layer injection alone, so they cost no prefill
+time. It costs 23.4 MiB of sum buffers (gate, up and down) + 14.4 MiB of
+scratch per engine (the private reserve grows by one 32 MiB step) and 32 MiB
+more program space per engine. `--no-strassen` restores the plain kernel and
+layout.
+
 ## Files
 
 - **gemma4_e4b_test.py** -- the launcher.

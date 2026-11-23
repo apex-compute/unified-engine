@@ -30,7 +30,66 @@ from user_dma_core import (
     UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
     URAM_NEAR_FULL_SIZE, URAM_START_ADDR, URAM_SECTION, set_dma_device,
     ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES, UE_MODE)
+from nn_lib import (strassen_if4_slab_cells, strassen_levels, strassen_matmul_core_dram,
+                    strassen_online_items, strassen_online_sum_count, strassen_online_sums_core,
+                    strassen_online_tree, strassen_scratch_elements)
 from transformers import AutoTokenizer
+
+# PREFILL MLP ON STRASSEN (nn_lib section 10, online leaves; --no-strassen turns it off).
+# At ST_MIN_ENGINES+ engines the prefill MLP runs as lanes with EVERY row on every engine:
+# gate/up hidden -> mlp/ne and down mlp/ne -> hidden. A lane whose two widths are both at
+# least ST_MIN_WIDTH (E4B 2560 x 1280, E2B's wide layers 1536 x 1536; E2B's narrow 768-wide
+# lanes stay as they are) is stored ONCE as ST_LEVEL input-column slabs. A prefill program
+# of ST_MIN_ROWS+ rows runs it on Strassen over the slabs' cells; decode and shorter
+# programs run one matmul per slab, chained through the full-matrix bias. Level 1: the
+# nearest measured shapes gain the same at level 2, which costs 4 slabs on the plain path
+# and 2.2x the sum-buffer bytes. Every engine owns a different lane, so the weight sums
+# cannot be shared, and no other split of the MLP shrinks them: any even deal leaves each
+# engine 1/ne of all the sums. They are taken off the critical path instead: the workers
+# make the next layer's sums of EVERY lane (engine 0's too), dealt over them, outside any
+# round while engine 0 alone runs the per-layer injection (layer 0's during the per-layer
+# input preparation). So each engine keeps one fp16 sum set per ST_SUM_TAGS entry,
+# written by the workers; the scratch stays private per engine.
+ST_LEVEL = 1
+ST_SUM_TAGS = ("gate", "up", "down")
+ST_MIN_ENGINES = 8
+ST_MIN_ROWS = 128
+ST_MIN_WIDTH = 1024
+# Program space one Strassen call adds per engine (planning figure, from Alpamayo's ~0.23 MB).
+ST_ISA_BYTES_PER_CALL = 256 * 2**10
+
+
+def strassen_lane_level(hidden: int, mlp: int, ne: int) -> int:
+    """Strassen level of one layer's MLP lanes at ne engines; 0 = today's plain layout."""
+    if ne < ST_MIN_ENGINES or mlp % ne or min(hidden, mlp // ne) < ST_MIN_WIDTH:
+        return 0
+    return ST_LEVEL if strassen_levels(hidden, mlp // ne, ST_LEVEL) == ST_LEVEL else 0
+
+
+def strassen_lane_shapes(hidden: int, mlps, ne: int) -> list[tuple[int, int]]:
+    """(K, N) of every Strassen lane matmul: gate/up and down of each lane width in use."""
+    return sorted({(K, N) for mlp in set(mlps) if strassen_lane_level(hidden, mlp, ne)
+                   for K, N in ((hidden, mlp // ne), (mlp // ne, hidden))})
+
+
+def strassen_lane_sizes(rows: int, hidden: int, mlps, ne: int) -> tuple[int, list[int]]:
+    """Per engine, in 16-bit elements: (the sum buffers, [x0, p0, x1, p1, ...] scratch for
+    `rows` rows). One sum set per ST_SUM_TAGS entry serves that matmul of every layer: the
+    workers fill all three for a layer before the layer starts (_st_emit_sums)."""
+    shapes = strassen_lane_shapes(hidden, mlps, ne)
+    if not shapes:
+        return 0, []
+    L = ST_LEVEL
+    sums = len(ST_SUM_TAGS) * strassen_online_sum_count(L) * max((N >> L) * (K >> L) for K, N in shapes)
+    scratch = [max(strassen_scratch_elements(rows, K, N, L)[d][i] for K, N in shapes)
+               for d in range(L) for i in (0, 1)]
+    return sums, scratch
+
+
+def strassen_lane_bytes(rows: int, hidden: int, mlps, ne: int) -> int:
+    """Private bytes per engine of the sum buffers + scratch (+128 B alignment slack each)."""
+    sums, scratch = strassen_lane_sizes(rows, hidden, mlps, ne)
+    return 2 * (sums + sum(scratch)) + 128 * (1 + len(scratch)) if sums else 0
 
 
 class Gemma4LMMixin:
@@ -128,11 +187,20 @@ class Gemma4LMMixin:
         scales = np.frombuffer(self.weight_bin, dtype=np.uint8,
                                count=N * (K // 64) * 2,
                                offset=self.weight_defs[s_key] + bin_off).reshape(N, (K // 64) * 2)
+        name = f"{tag}_proj_L{layer_idx}" if keys is None else tag
+        st = keys is None and tag in ("gate", "up") and self._st_lane_level(layer_idx)
         shards = []
         for e in range(ne):
             sl = slice(e * rows, (e + 1) * rows)
             d_blob = np.ascontiguousarray(data[sl]).tobytes()
             s_blob = np.ascontiguousarray(scales[sl]).tobytes()
+            if st:          # Strassen lane: the same bytes as input-column slabs (weight_addr = slab 0)
+                d_addr, s_addr = self._st_store_slabs(e, name, (tag, layer_idx), d_blob, s_blob, rows, K)
+                shards.append(mes.WeightShard(
+                    engine_idx=e, col_offset=e * rows, cols=rows,
+                    weight_addr=d_addr, scale_addr=s_addr,
+                    layer_stride=0, scale_layer_stride=0))
+                continue
             s_addr = self.mc_arena.alloc_weights(e, len(s_blob), f"{tag}_L{layer_idx}.scale")
             if self.dma_write(DMA_DEVICE_H2C, s_addr, s_blob, len(s_blob)) != len(s_blob):
                 raise IOError(f"{tag} L{layer_idx} e{e}: short scale DMA")
@@ -143,7 +211,6 @@ class Gemma4LMMixin:
                 engine_idx=e, col_offset=e * rows, cols=rows,
                 weight_addr=d_addr, scale_addr=s_addr,
                 layer_stride=0, scale_layer_stride=0))
-        name = f"{tag}_proj_L{layer_idx}" if keys is None else tag
         return mes.ShardedWeight(name=name, K=K, N=N,
                                  layers=1, data_type=TYPE.IF4, shards=shards)
 
@@ -170,8 +237,11 @@ class Gemma4LMMixin:
         lane_max = max(self.mlp_elements, self.mlp_elements_wide) // ne
         lane_bytes = rows * lane_max * self.bytes_per_element
         part_bytes = rows * self.vector_length * self.bytes_per_element
+        # Strassen writes its output quarters with strided writes of whole 128-byte lines.
+        pad = 64 if self._st_on() else 0
         lanes = {
-            name: [self.mc_arena.alloc_tensor(e, nbytes, f"prefill.mlp.{name}")
+            name: [(self.mc_arena.alloc_tensor(e, nbytes + pad, f"prefill.mlp.{name}") + pad) & ~(2 * pad - 1)
+                   if pad else self.mc_arena.alloc_tensor(e, nbytes, f"prefill.mlp.{name}")
                    for e in range(ne)]
             for name, nbytes in (("gate", lane_bytes), ("up", lane_bytes),
                                  ("mul", lane_bytes), ("down", part_bytes))
@@ -242,12 +312,17 @@ class Gemma4LMMixin:
         scales = np.frombuffer(
             self.weight_bin, dtype=np.uint8, count=N * (K // 64) * 2,
             offset=self.weight_defs[scale_key] + bin_off).reshape(N, (K // 64) * 2)
+        st = tag == "down" and self._st_lane_level(layer_idx)
         per_engine = []
         for e in range(ne):
             d_lo, d_hi = e * (lane // 2), (e + 1) * (lane // 2)
             s_lo, s_hi = e * (lane // 64) * 2, (e + 1) * (lane // 64) * 2
             d_blob = np.ascontiguousarray(data[:, d_lo:d_hi]).tobytes()
             s_blob = np.ascontiguousarray(scales[:, s_lo:s_hi]).tobytes()
+            if st:          # Strassen lane: the same bytes as input-column slabs (slab 0 returned)
+                per_engine.append(self._st_store_slabs(
+                    e, f"{tag}_k_L{layer_idx}", (tag, layer_idx), d_blob, s_blob, N, lane))
+                continue
             s_addr = self.mc_arena.alloc_weights(
                 e, len(s_blob), f"{tag}_k_L{layer_idx}.scale")
             if self.dma_write(DMA_DEVICE_H2C, s_addr, s_blob, len(s_blob)) != len(s_blob):
@@ -258,6 +333,165 @@ class Gemma4LMMixin:
                 raise IOError(f"{tag}_k L{layer_idx} e{e}: short data DMA")
             per_engine.append((d_addr, s_addr))
         return per_engine
+
+    # ---------------------------------------------------------------- Strassen MLP lanes
+
+    def _st_on(self) -> bool:
+        """Strassen prefill MLP in use (the switch, ST_MIN_ENGINES+ engines, tiled map)."""
+        return bool(getattr(self, "strassen", False) and self._tiled_map
+                    and int(self.multi_core) >= ST_MIN_ENGINES)
+
+    def _st_lane_level(self, layer_idx: int) -> int:
+        """Level of this layer's MLP lanes; 0 = plain layout (and today's code)."""
+        if not self._st_on():
+            return 0
+        return strassen_lane_level(self.vector_length, self._get_mlp_elements(layer_idx),
+                                   int(self.multi_core))
+
+    def _st_store_slabs(self, e: int, name: str, key: tuple, d_blob: bytes, s_blob: bytes,
+                        N: int, K: int) -> tuple[int, int]:
+        """Store engine e's IF4 lane [N, K] ONCE as ST_LEVEL input-column slabs and record
+        its Strassen cells (row ranges of the slabs). -> slab 0's (data, scale) address."""
+        def store_pack(d, s, n, k, t=None):
+            s_addr = self.mc_arena.alloc_weights(e, len(s), f"{name}.slab.scale")
+            if self.dma_write(DMA_DEVICE_H2C, s_addr, s, len(s)) != len(s):
+                raise IOError(f"{name} e{e}: short scale DMA")
+            d_addr = self.mc_arena.alloc_weights(e, len(d), f"{name}.slab.data")
+            if self.dma_write(DMA_DEVICE_H2C, d_addr, d, len(d)) != len(d):
+                raise IOError(f"{name} e{e}: short data DMA")
+            return d_addr, s_addr
+        slabs, cells = strassen_if4_slab_cells(d_blob, s_blob, N, K, ST_LEVEL, store_pack)
+        self.__dict__.setdefault("_st_slabs", {})[(name, e)] = slabs
+        self.__dict__.setdefault("_st_nodes", {})[(*key, e)] = {
+            "cells": cells, "slabs": slabs, "K": K, "N": N, "n": N >> ST_LEVEL, "k": K >> ST_LEVEL}
+        return slabs[0]
+
+    def _st_prepare(self) -> None:
+        """Once: every engine's private fp16 sum buffers and zero-filled scratch, sized for
+        the longest prefill program (in the private weight reserve, which the constructor
+        grew by strassen_lane_bytes). Then the online tree of every lane staged so far."""
+        nodes = getattr(self, "_st_nodes", None)
+        if not nodes:
+            return
+        ne = int(self.multi_core)
+        if getattr(self, "_st_bufs", None) is None:
+            rows = max(self.max_prefill_seq_len, 1)
+            rows -= rows % (1 << ST_LEVEL)
+            mlps = [self._get_mlp_elements(i) for i in range(self.LAYER_SIZE)]
+            sums_el, scratch_el = strassen_lane_sizes(rows, self.vector_length, mlps, ne)
+
+            def room(e, elements, what):        # 128-byte aligned: the scratch takes strided line writes
+                return (self.mc_arena.alloc_weights(e, elements * 2 + 64, what) + 64) & ~127
+            bufs = []
+            for e in range(ne):
+                sums = room(e, sums_el, "strassen sums")
+                scr = [room(e, n, f"strassen scratch {i}") for i, n in enumerate(scratch_el)]
+                for addr, n in zip(scr, scratch_el):      # fresh private DRAM holds NaN patterns
+                    zero = bytes(n * 2)
+                    if self.dma_write(DMA_DEVICE_H2C, addr, zero, len(zero)) != len(zero):
+                        raise IOError(f"strassen scratch e{e}: short zero-fill DMA")
+                # The plain path over slabs borrows depth 0's buffers: x for a slab's input
+                # columns, p for the running sum (both far larger than either needs).
+                bufs.append({"rows": rows, "sums": sums, "sum_set": sums_el // len(ST_SUM_TAGS) * 2,
+                             "x": scr[0], "part": scr[1],
+                             "scratch": [(scr[2 * d], scr[2 * d + 1]) for d in range(ST_LEVEL)]})
+            self._st_bufs = bufs
+            print(f"[strassen] prefill MLP lanes, level {ST_LEVEL}: "
+                  f"{2 * sums_el / 2**20:.1f} MiB sums + {2 * sum(scratch_el) / 2**20:.1f} MiB "
+                  f"scratch per engine ({ne} engines, private weight arena, up to {rows} rows)")
+        for (tag, _, e), nd in nodes.items():
+            if "tree" not in nd:
+                cell, buf = nd["n"] * nd["k"], self._st_bufs[e]
+                base = buf["sums"] + ST_SUM_TAGS.index(tag) * buf["sum_set"]
+                nd["sums"] = [base + i * cell * 2 for i in range(strassen_online_sum_count(ST_LEVEL))]
+                nd["tree"] = strassen_online_tree(nd["cells"], nd["sums"], ST_LEVEL)
+
+    def _st_strassen(self, ue, e: int, M: int, nd: dict, A: int, OUT: int, gelu: bool = False) -> int:
+        """THE Strassen call; every one goes through here. OUT [M, N] = act(A [M, K] . W^T)
+        over this lane's weight sums, which _st_emit_sums had the workers make before the
+        layer's first round. -> executed FLOPs."""
+        L, buf = ST_LEVEL, self._st_bufs[e]
+        assert M % (1 << L) == 0 and M <= buf["rows"], \
+            f"Strassen: {M} rows (scratch holds {buf['rows']}, need a multiple of {1 << L})"
+        strassen_matmul_core_dram(ue, M, nd["K"], nd["N"], A, nd["tree"], OUT, buf["scratch"],
+                                  activation={"gelu_enable": True} if gelu else None,
+                                  identity_addr=self.IDENTITY_DRAM_ADDR if gelu else None)
+        return 7 ** L * 2 * (M >> L) * (nd["K"] >> L) * (nd["N"] >> L)
+
+    def _st_emit_sums(self, sched, layer_idx: int, M: int) -> None:
+        """The weight sums of every Strassen lane of `layer_idx` (gate, up and down of every
+        engine), dealt piece by piece over the WORKERS and emitted on their streams outside
+        any round. Call it where engine 0 works alone, after the last round that reads the
+        previous layer's sums: the next region opens with a full fence (the scheduler fences
+        workers that moved data between rounds), so the sums are made before any engine
+        reads them. No-op when Strassen is off or this program runs the lanes as slab chains
+        (under ST_MIN_ROWS rows)."""
+        if sched is None or M < ST_MIN_ROWS:
+            return
+        jobs = [nd for tag in ST_SUM_TAGS for e in range(int(self.multi_core))
+                if (nd := self._st_lane_node(tag, layer_idx, e)) is not None]
+        work = [(j, item) for j, nd in enumerate(jobs)
+                for item in strassen_online_items(nd["n"], nd["k"], ST_LEVEL)]
+        workers = sched.workers
+        for w, ue in enumerate(workers):
+            mine = work[w::len(workers)]
+            for j, nd in enumerate(jobs):
+                items = [item for jj, item in mine if jj == j]
+                if items:
+                    strassen_online_sums_core(ue, nd["cells"], nd["n"], nd["k"], nd["sums"], ST_LEVEL, items)
+
+    def _st_gather_cols(self, ue, src: int, pitch: int, cols: int, rows: int, dst: int) -> None:
+        """`cols` lanes of each of `rows` rows at row pitch `pitch` -> contiguous [rows, cols]."""
+        bpe = self.bytes_per_element
+        step = max(1, 131072 // cols)
+        for r0 in range(0, rows, step):
+            take = min(step, rows - r0)
+            stride = dict(stride_bytes_per_chunk=cols * bpe, stride_jump_bytes=pitch * bpe) if take > 1 else {}
+            ue.accelerator_memory_to_sram(accelerator_dram_address=src + r0 * pitch * bpe,
+                                          sram_address=0x00000, element_size=take * cols, **stride)
+            ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=dst + r0 * cols * bpe,
+                                          element_size=take * cols)
+
+    def _st_slab_matmul(self, ue, e: int, M: int, K: int, N: int, A: int, slabs: list, OUT: int,
+                        gelu: bool = False, m_reg: int | None = None) -> int:
+        """Plain matmul against a weight stored as input-column slabs: one product per slab,
+        each taking the sum so far as a full-matrix bias (ping-pong between OUT and engine
+        e's partial buffer, ending in OUT), the activation on the last. M == 1 (decode):
+        the streaming kernel straight off the input vector. M > 1 (a prefill program under
+        ST_MIN_ROWS rows): each slab's input columns are gathered contiguous first."""
+        buf, bpe = self._st_bufs[e], self.bytes_per_element
+        g = len(slabs)
+        k = K // g
+        flops = 0
+        for j, (wd, ws) in enumerate(slabs):
+            dst, prev = (OUT, buf["part"]) if (g - 1 - j) % 2 == 0 else (buf["part"], OUT)
+            kw = dict(C_DRAM_ADDR=prev, bias_mode="full_matrix") if j else {}
+            if gelu and j == g - 1:
+                kw["gelu_enable"] = True
+            if M == 1:
+                flops += ue.quantized_matmat_core(
+                    M=1, K=k, N=N, A_DRAM_ADDR=A + j * k * bpe, B_DRAM_ADDR=wd,
+                    OUTPUT_DRAM_ADDR=dst, SCALE_DRAM_ADDR=ws, data_type=TYPE.IF4, **kw) or 0
+            else:
+                self._st_gather_cols(ue, A + j * k * bpe, K, k, M, buf["x"])
+                ue.generate_instruction_add_set(m_reg, M)
+                flops += ue.matmat_mul_core(
+                    M=M, K=k, N=N, A_DRAM_ADDR=buf["x"], B_DRAM_ADDR=wd, OUTPUT_DRAM_ADDR=dst,
+                    is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=ws,
+                    gpr_M_reg=m_reg, **kw) or 0
+        return flops
+
+    def _st_lane_node(self, tag: str, layer_idx: int, e: int):
+        """This engine's Strassen lane of (tag, layer), or None (plain layout)."""
+        return getattr(self, "_st_nodes", {}).get((tag, layer_idx, e))
+
+    def _st_lane_matmul(self, ue, e: int, M: int, nd: dict, A: int, OUT: int,
+                        gelu: bool = False, m_reg: int | None = None) -> int:
+        """A prefill lane matmul over slabs: Strassen when this program's rows meet the
+        rule (rows are a compile-time constant per program), the slab chain otherwise."""
+        if M >= ST_MIN_ROWS:
+            return self._st_strassen(ue, e, M, nd, A, OUT, gelu)
+        return self._st_slab_matmul(ue, e, M, nd["K"], nd["N"], A, nd["slabs"], OUT, gelu, m_reg)
 
     def _ensure_decode_qkv_shards(self, sched, layer_size: int) -> dict:
         """Copy each engine's column block of the Q/K/V weights into that engine's
@@ -1196,6 +1430,7 @@ class Gemma4LMMixin:
             down_k_shards = self._ensure_prefill_down_k_shards(
                 prefill_scheduler, layer_size)
             mlp_lanes = self._ensure_prefill_mlp_lane_buffers()
+            self._st_prepare()      # Strassen lanes: sum buffers, scratch, trees (no-op when off)
 
         # Multi-core attention shards the group heads across engines; each engine
         # needs PRIVATE flash scratch. Carve one slot per engine out of the big
@@ -1379,6 +1614,8 @@ class Gemma4LMMixin:
             ue.release_isa_reg()
             return flops
         prefill_t0 = time.perf_counter()
+        # Strassen: the workers make layer 0's weight sums while engine 0 prepares below.
+        self._st_emit_sums(prefill_scheduler, 0, seq_len)
 
         # Per-layer input preparation (prefill): project each token to all 35 layer slices, then normalize, add its per-layer embedding, and scale. The projection uses template M; the row-wise stages use live seq_len.
         per_layer_dim = self.per_layer_input_dim
@@ -1919,9 +2156,20 @@ class Gemma4LMMixin:
                                 f"down K-lane is derived from the shard, so they "
                                 f"must be the same split")
                         m_reg = shard_m_regs[e]
-                        ctx.ue.generate_instruction_add_set(m_reg, seq_len)
-                        shard_flops[0] += ctx.ue.matmat_mul_core(M=seq_len, K=self.vector_length, N=g.cols, A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=g.weight_addr, OUTPUT_DRAM_ADDR=mlp_lanes["gate"][e], is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=g.scale_addr, gelu_enable=True, gpr_M_reg=m_reg)
-                        shard_flops[0] += ctx.ue.matmat_mul_core(M=seq_len, K=self.vector_length, N=u.cols, A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=u.weight_addr, OUTPUT_DRAM_ADDR=mlp_lanes["up"][e], is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=u.scale_addr, gpr_M_reg=m_reg)
+                        g_st = self._st_lane_node("gate", layer_idx, e)
+                        u_st = self._st_lane_node("up", layer_idx, e)
+                        if g_st is not None and u_st is not None:
+                            # Stored as slabs (Strassen switch on): Strassen at
+                            # ST_MIN_ROWS+ rows, the slab chain below that.
+                            # unsafe_ue: the gathers are refused inside a sharded region
+                            # by default, but every engine only writes its own lane and
+                            # scratch buffers here (the workers made the sums earlier).
+                            shard_flops[0] += self._st_lane_matmul(ctx.unsafe_ue, e, seq_len, g_st, self.LAYER0_PRE_MLP_NORM_DRAM, mlp_lanes["gate"][e], gelu=True, m_reg=m_reg)
+                            shard_flops[0] += self._st_lane_matmul(ctx.unsafe_ue, e, seq_len, u_st, self.LAYER0_PRE_MLP_NORM_DRAM, mlp_lanes["up"][e], m_reg=m_reg)
+                        else:
+                            ctx.ue.generate_instruction_add_set(m_reg, seq_len)
+                            shard_flops[0] += ctx.ue.matmat_mul_core(M=seq_len, K=self.vector_length, N=g.cols, A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=g.weight_addr, OUTPUT_DRAM_ADDR=mlp_lanes["gate"][e], is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=g.scale_addr, gelu_enable=True, gpr_M_reg=m_reg)
+                            shard_flops[0] += ctx.ue.matmat_mul_core(M=seq_len, K=self.vector_length, N=u.cols, A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=u.weight_addr, OUTPUT_DRAM_ADDR=mlp_lanes["up"][e], is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=u.scale_addr, gpr_M_reg=m_reg)
                         ctx.ue.generate_instruction_add_set(m_reg, seq_len)
                         ctx.ue.eltwise_core_dram(M=seq_len, N=g.cols, dram_a=mlp_lanes["gate"][e], dram_b=mlp_lanes["up"][e], dram_out=mlp_lanes["mul"][e], mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m_reg)
                     prefill_scheduler.col_sharded_region(cur_mlp, _emit_mlp_lane, join=False)
@@ -1945,6 +2193,10 @@ class Gemma4LMMixin:
                                 f"{ctx.k_cols} disagrees with the staged lane "
                                 f"{cur_mlp // int(self.multi_core)}")
                         m_reg = shard_m_regs[e]
+                        d_st = self._st_lane_node("down", layer_idx, e)
+                        if d_st is not None:
+                            shard_flops[0] += self._st_lane_matmul(ctx.unsafe_ue, e, seq_len, d_st, mlp_lanes["mul"][e], mlp_lanes["down"][e], m_reg=m_reg)  # own lane buffers only
+                            return
                         ctx.ue.generate_instruction_add_set(m_reg, seq_len)
                         shard_flops[0] += ctx.ue.matmat_mul_core(M=seq_len, K=ctx.k_cols, N=self.vector_length, A_DRAM_ADDR=mlp_lanes["mul"][e], B_DRAM_ADDR=d_addr, OUTPUT_DRAM_ADDR=mlp_lanes["down"][e], is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=s_addr, gpr_M_reg=m_reg)
                     # join=True, against k_sharded_region's default: that
@@ -1994,6 +2246,10 @@ class Gemma4LMMixin:
                     prefill_scheduler.sharded_region(seq_len, _emit_prefill_post_attention_shard)
                     total_flops += shard_flops[0]
             _checkpoint(f"L{layer_idx}_mlp")
+            # Strassen: the workers make the next layer's weight sums while engine 0
+            # injects below (down, this layer's last sum reader, is behind a fence).
+            if layer_idx + 1 < layer_size:
+                self._st_emit_sums(prefill_scheduler, layer_idx + 1, seq_len)
 
             # Per-layer input injection (NEW for Gemma4 E2B) — seq_len-agnostic
             # (gpr_seq_len-driven) prefill variant; decode uses the seq_len=1 one.
@@ -2579,6 +2835,9 @@ class Gemma4LMMixin:
                 f"directly on each engine")
         _shards = (self._ensure_decode_qkv_shards(_dec_sched, layer_size)
                    if _dec_sched is not None else {})
+        # Strassen lanes (switch on): decode reads the same slabs, one product per slab.
+        self._st_prepare()
+        _st_slabs = getattr(self, "_st_slabs", {})
         # M-SHARDED V TRANSPOSE. V^T is 75% of decode attention and scales linearly in the
         # KV length, so it is split by INPUT ROWS across the workers while engine 0 runs
         # Q@K^T concurrently (the two are independent; they meet only at P@V^T).
@@ -2625,6 +2884,10 @@ class Gemma4LMMixin:
             # a fault.
             assert out_off % 128 == 0, (
                 f"shard output offset {out_off} is not a whole 128 B SRAM row")
+            slabs = _st_slabs.get((sw.name, e))
+            if slabs is not None:       # a Strassen lane, stored as input-column slabs
+                return self._st_slab_matmul(ue, e, 1, sw.K, sh.cols, a_addr, slabs,
+                                            out_base + out_off, gelu=gelu)
             return ue.quantized_matmat_core(
                 M=1, K=sw.K, N=sh.cols,
                 A_DRAM_ADDR=a_addr,
@@ -3192,11 +3455,18 @@ class Gemma4LMMixin:
                             _dec_sched.begin_worker_round(_e)
                         _ue = _dec_sched.engines[_e]
                         _d_addr, _s_addr = _down_k[layer_idx][_e]
-                        _ue.quantized_matmat_core(
-                            M=1, K=_lane, N=self.vector_length,
-                            A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM + _e * _lane * self.bytes_per_element,
-                            B_DRAM_ADDR=_d_addr, OUTPUT_DRAM_ADDR=_down_partials[_e],
-                            SCALE_DRAM_ADDR=_s_addr, data_type=TYPE.IF4)
+                        _d_slabs = _st_slabs.get((f"down_k_L{layer_idx}", _e))
+                        if _d_slabs is not None:    # a Strassen lane, stored as input-column slabs
+                            self._st_slab_matmul(
+                                _ue, _e, 1, _lane, self.vector_length,
+                                self.LAYER0_MLP_MULT_DRAM + _e * _lane * self.bytes_per_element,
+                                _d_slabs, _down_partials[_e])
+                        else:
+                            _ue.quantized_matmat_core(
+                                M=1, K=_lane, N=self.vector_length,
+                                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM + _e * _lane * self.bytes_per_element,
+                                B_DRAM_ADDR=_d_addr, OUTPUT_DRAM_ADDR=_down_partials[_e],
+                                SCALE_DRAM_ADDR=_s_addr, data_type=TYPE.IF4)
                         if _e:
                             _dec_sched.end_worker_round(_e)
                     _dec_sched.join()
