@@ -175,7 +175,9 @@ jobs:
         # Never fails itself: a failure is written to alveo_u50/rc for Collect.
         if: ${{ steps.cfg.outputs.alveo_u50 == 'true' }}
         env:
-          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
+          # An SSH alias on the runner host (p620's ~/.ssh/config), so no user or address
+          # is in this repo; the UE_ALVEO_SSH variable overrides it.
+          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'ue-p2' }}
           # Validated tokens (Resolve run config), so the remote shell may split them.
           RUN_ARGS: ${{ steps.cfg.outputs.args }}
         run: |
@@ -205,7 +207,9 @@ jobs:
       - name: Collect the Alveo U50 leg
         if: ${{ always() && steps.cfg.outputs.alveo_u50 == 'true' }}
         env:
-          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
+          # An SSH alias on the runner host (p620's ~/.ssh/config), so no user or address
+          # is in this repo; the UE_ALVEO_SSH variable overrides it.
+          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'ue-p2' }}
         run: |
           while [ ! -f alveo_u50/rc ]; do sleep 30; done
           RC=$(cat alveo_u50/rc)
