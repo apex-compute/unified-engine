@@ -34,8 +34,9 @@ permissions:
 jobs:
   run-model-ci:
     name: Run and collect full model CI
-    runs-on: ubuntu-latest
-    timeout-minutes: 310
+    # bootcamp, like the hardware job it waits on: no GitHub-hosted 6 h limit.
+    runs-on: [bootcamp, unified-engine]
+    timeout-minutes: 7200
     outputs:
       slack-message: ${{ steps.run.outputs.slack-message }}
     steps:
@@ -209,13 +210,14 @@ jobs:
     name: Send result to Slack
     if: always()
     needs: run-model-ci
-    runs-on: ubuntu-latest
+    runs-on: [bootcamp, unified-engine]
+    # Read by the step's `if` below.
+    env:
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
     steps:
       - name: Post nightly result
         # Skip rather than fail the run while the Slack secrets are unset.
         if: ${{ env.SLACK_BOT_TOKEN != '' }}
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         uses: slackapi/slack-github-action@v3.0.3
         with:
           method: chat.postMessage

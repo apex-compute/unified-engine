@@ -19,6 +19,9 @@ LOCK=/tmp/pcie_ci_hw_p2.lock   # the lock andromeda's p2 hardware steps take
 
 echo "[alveo_u50] $(hostname) as $(whoami), $(date -Is), commit $SHA"
 rm -rf "$OUT" && mkdir -p "$OUT"
+# While this runs, the CI monitor (ci.apexcompute.com) names the suite's processes
+# unified-engine-<run#>: it reads this file and checks the pid is alive.
+echo "$$ ${UE_CI_RUN_NUMBER:-}" > "$OUT/.ci_run"
 
 # Never share the board with andromeda's p2 jobs: wait for its lock (2 h at most).
 exec 9>"$LOCK"

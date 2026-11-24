@@ -14,21 +14,24 @@ on:
         type: boolean
         default: false
 
+# The job only runs a script on p620 over SSH: no GITHUB_TOKEN access needed.
+permissions: {}
+
 concurrency:
   group: model-hw-ci
   cancel-in-progress: false  # never race with a live CI/HW run
 
 jobs:
   clean:
-    runs-on: self-hosted
+    # bootcamp's runners; the caches are in p620's checkout, cleaned there over SSH.
+    runs-on: [bootcamp, unified-engine]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Clean model bin dirs
+      - name: Clean model bin dirs on p620
+        env:
+          P620_SSH: ${{ vars.UE_KINTEX7_SSH || 'ue-p620' }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          ARGS=()
-          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
-            ARGS+=(--dry-run)
-          fi
-          ./clean_model_bin_dirs.sh "${ARGS[@]}"
+          ARG=""
+          [[ "$DRY_RUN" == "true" ]] && ARG=--dry-run
+          ssh -o BatchMode=yes "$P620_SSH" \
+            "cd \"\${UE_P620_DIR:-\$HOME/actions-runner/_work/unified-engine/unified-engine}\" && ./clean_model_bin_dirs.sh $ARG"

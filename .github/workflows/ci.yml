@@ -16,8 +16,11 @@ name: Model HW CI
 # runner's env. The checkout step preserves models/, so this is a one-time cost.
 # Models compile from scratch and run from their cached bins, with DRAM randomized
 # (poisoned) before every single pass. Stops on first failure.
-# Requires the FPGA device, so this must run on a self-hosted runner with the
-# board attached.
+# Requires the FPGA devices: bootcamp's runners (labels bootcamp, unified-engine) drive
+# p620's kintex7 over SSH (.github/scripts/kintex7_remote.sh, in the checkout and
+# model caches the p620 runner used) and p2's U50 the same way.
+# The hosts are SSH aliases in the runner host's ~/.ssh/config (ue-p620, ue-p2), so no
+# user or address is in this repo; the UE_KINTEX7_SSH / UE_ALVEO_SSH variables override.
 
 on:
   workflow_dispatch:
@@ -73,28 +76,17 @@ jobs:
     # head_ref is empty outside pull_request events, so the push to main on merge
     # still runs normally.
     if: ${{ !startsWith(github.head_ref, 'sync_pcie_only_') }}
-    runs-on: self-hosted
-    # Leave the nightly scheduler (310 min) ten minutes to collect and report this
-    # job's terminal result if the hardware suite reaches its time limit. The kintex7
-    # suite takes ~2 h; the Alveo U50 leg runs alongside it.
-    timeout-minutes: 300
+    # Not "self-hosted": these runners are registered without the default labels, so
+    # branches whose ci.yml still says runs-on: self-hosted keep going to p620's runner.
+    runs-on: [bootcamp, unified-engine]
+    # No practical limit (7200 min is GitHub's maximum for a self-hosted job). The
+    # kintex7 suite takes ~2 h; the Alveo U50 leg runs alongside it.
+    timeout-minutes: 7200
     steps:
       - name: Checkout
-        # Do NOT let checkout run `git clean -ffdx`: its default wipe deletes the
-        # untracked models/*/*_bin caches (model weights + HF snapshots), forcing
-        # every model to re-fetch multi-GB weights every run. We clean the tree
-        # ourselves below and preserve those caches.
+        # Only the scripts and the result files live here: the suites run on p620 and
+        # p2, each in its own checkout that keeps the models/ caches.
         uses: actions/checkout@v4
-        with:
-          clean: false
-
-      - name: Clean workspace
-        run: |
-          # Restore tracked files, then wipe untracked cruft everywhere EXCEPT
-          # models/ (keeps weights + HF cache). Program images need no cleaning:
-          # every model recompiles its program unless run with --run-from-bin.
-          git reset --hard HEAD
-          git clean -ffdx -e models
 
       - name: Resolve run config
         # One set of run_ci.sh args for both boards. push / pull_request carry no
@@ -169,13 +161,12 @@ jobs:
 
       - name: Start the Alveo U50 leg on p2
         # The same suite on p2's U50 (xdma0), run by github@p2 over SSH from this
-        # runner (one runner on p620, so a second job would wait ~2 h for this one).
-        # It runs in the background while this runner tests the kintex7 below; the
-        # "Collect" step waits for it. See .github/scripts/alveo_u50_remote.sh.
+        # runner. It runs in the background while the kintex7 leg below runs on p620;
+        # the "Collect" step waits for it. See .github/scripts/alveo_u50_remote.sh.
         # Never fails itself: a failure is written to alveo_u50/rc for Collect.
         if: ${{ steps.cfg.outputs.alveo_u50 == 'true' }}
         env:
-          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
+          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'ue-p2' }}
           # Validated tokens (Resolve run config), so the remote shell may split them.
           RUN_ARGS: ${{ steps.cfg.outputs.args }}
         run: |
@@ -185,27 +176,35 @@ jobs:
             echo 255 > alveo_u50/rc
             exit 0
           fi
-          nohup bash -c 'ssh -o BatchMode=yes -o ServerAliveInterval=60 "$0" "bash -s -- $1" \
+          # UE_CI_RUN_NUMBER: the CI monitor (ci.apexcompute.com) names the job unified-engine-<run#>.
+          nohup bash -c 'ssh -o BatchMode=yes -o ServerAliveInterval=60 "$0" "UE_CI_RUN_NUMBER=$2 bash -s -- $1" \
                            < .github/scripts/alveo_u50_remote.sh > alveo_u50/run.log 2>&1
-                         echo $? > alveo_u50/rc' "$P2_SSH" "$GITHUB_SHA $RUN_ARGS" > /dev/null 2>&1 &
+                         echo $? > alveo_u50/rc' "$P2_SSH" "$GITHUB_SHA $RUN_ARGS" "$GITHUB_RUN_NUMBER" > /dev/null 2>&1 &
           echo "Alveo U50 leg started on $P2_SSH for $GITHUB_SHA: run_ci.sh $RUN_ARGS (pid $!)"
 
-      - name: Run CI suite
+      - name: Run CI suite on p620
+        # run_ci.sh on p620's kintex7, by github@p620 over SSH, in the checkout and
+        # conda env the p620 runner used (.github/scripts/kintex7_remote.sh). Its
+        # result files come back here for the summary, the artifact and the PR comment.
+        # run_ci.log: the conv model verdicts (user_hw_test.py prints them, its
+        # summary file has no pass/fail column) for the model table in the summary.
         id: ci
         if: ${{ steps.cfg.outputs.kintex7 == 'true' }}
         env:
+          P620_SSH: ${{ vars.UE_KINTEX7_SSH || 'ue-p620' }}
+          # Validated tokens (Resolve run config), so the remote shell may split them.
           RUN_ARGS: ${{ steps.cfg.outputs.args }}
         run: |
-          read -r -a ARGS <<< "$RUN_ARGS"
-          # run_ci.log: the conv model verdicts (user_hw_test.py prints them, its
-          # summary file has no pass/fail column) for the model table in the summary.
-          set -o pipefail
-          ./run_ci.sh "${ARGS[@]}" 2>&1 | tee run_ci.log
+          ssh -o BatchMode=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=30 "$P620_SSH" \
+            "UE_CI_RUN_NUMBER=$GITHUB_RUN_NUMBER bash -s -- $GITHUB_SHA $RUN_ARGS" < .github/scripts/kintex7_remote.sh 2>&1 | tee run_ci.log
+          RC=${PIPESTATUS[0]}
+          scp -q -o BatchMode=yes "$P620_SSH:ue_ci_kintex7/*" . || echo "::warning::no result files copied from $P620_SSH"
+          exit "$RC"
 
       - name: Collect the Alveo U50 leg
         if: ${{ always() && steps.cfg.outputs.alveo_u50 == 'true' }}
         env:
-          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'github@192.168.1.132' }}
+          P2_SSH: ${{ vars.UE_ALVEO_SSH || 'ue-p2' }}
         run: |
           while [ ! -f alveo_u50/rc ]; do sleep 30; done
           RC=$(cat alveo_u50/rc)
