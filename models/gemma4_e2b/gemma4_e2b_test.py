@@ -1013,7 +1013,8 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
 # from this module, so the 3-file split has no import cycle.
 from gemma4_e2b_vision import (Gemma4VisionMixin, VISION_QUANT_PRECISION,
                                VISION_CANONICAL_SIZE, VISION_FIXED_NUM_PATCHES)
-from gemma4_e2b_lm import Gemma4LMMixin
+from gemma4_e2b_lm import (Gemma4LMMixin, ST_ISA_BYTES_PER_CALL, strassen_lane_bytes,
+                           strassen_lane_level)
 from gemma4_e2b_audio import (Gemma4AudioMixin, AUDIO_FIXED_SOFT_TOKENS,
                               build_audio_weight_section)
 
@@ -1224,7 +1225,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return scheduler
 
     @classmethod
-    def _private_weight_bytes(cls, script_dir, multi_core: int) -> int:
+    def _private_weight_bytes(cls, script_dir, multi_core: int, strassen: bool = False) -> int:
         """Per-engine bytes of the private IF4 projection slices, from the config.
 
         Every projection at its layer's real shape -- Q/O over all query heads,
@@ -1253,12 +1254,33 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                       + 2 * if4(hd * num_kv, hidden)             # k, v
                       + 3 * if4(mlp, hidden))                    # gate, up, down
         per_engine = int(total / max(int(multi_core), 1) * 1.05)
+        if strassen:        # the Strassen lanes' sum buffers + scratch (gemma4_e2b_lm._st_prepare)
+            per_engine += cls._strassen_extra_bytes(script_dir, multi_core)[0]
         return (per_engine + (32 << 20) - 1) & ~((32 << 20) - 1)
+
+    @classmethod
+    def _strassen_extra_bytes(cls, script_dir, multi_core: int) -> tuple[int, int]:
+        """(private weight bytes, ISA bytes) per engine that the Strassen prefill MLP adds:
+        the sum buffers (one set each for gate, up and down) + scratch for the longest
+        prefill program, and program
+        space for 3 Strassen calls per Strassen layer (ST_ISA_BYTES_PER_CALL each,
+        rounded up to whole PRIVATE_ALIGN). Zero below ST_MIN_ENGINES engines."""
+        cfg = cls.load_config(script_dir=script_dir or SCRIPT_DIR)
+        fi, model = cfg["file_info"], cfg["model"]
+        hidden = int(fi["hidden_size"])
+        wide_from = int(model.get("double_wide_mlp_first_layer", fi["num_layers"]))
+        mlps = [int(fi["mlp_elements_wide"] if layer >= wide_from else fi["mlp_elements"])
+                for layer in range(int(fi["num_layers"]))]
+        rows = int(model.get("max_prefill_seq_len", model["max_context_size"]))
+        rows -= rows % 2
+        calls = 3 * sum(1 for mlp in mlps if strassen_lane_level(hidden, mlp, int(multi_core)))
+        isa = -(-calls * ST_ISA_BYTES_PER_CALL // PRIVATE_ALIGN) * PRIVATE_ALIGN
+        return strassen_lane_bytes(rows, hidden, mlps, int(multi_core)), isa
 
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
                  decode_kernel: str = "streaming", multi_core: int = 1,
-                 bin_reuse: bool = False):
+                 bin_reuse: bool = False, strassen: bool = True):
         for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
                               ("decode", decode_kernel)):
             if kernel not in ("streaming", "matmatmul"):
@@ -1311,6 +1333,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # run_from_bin (set by main() for --run-from-bin) makes a cache miss fatal.
         self.bin_reuse = bin_reuse
         self.run_from_bin = False
+        # Prefill MLP lanes on Strassen (gemma4_e2b_lm, ST_*): only at ST_MIN_ENGINES+
+        # engines on the tiled map. --no-strassen: exactly the plain code and layout.
+        self.strassen = bool(strassen)
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
@@ -1336,11 +1361,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._tile_isa_bytes = (KINTEX_ISA_BYTES if (self._kintex_tiled_map
                                                      or multi_core < TILED_MAP_MIN_ENGINES)
                                 else TILED_ISA_BYTES)
+        if self.strassen:   # every Strassen call adds program on every engine
+            self._tile_isa_bytes += self._strassen_extra_bytes(script_dir, multi_core)[1]
         # The floor per map, raised to what this model's slices need (E4B).
         self._tile_private_reserve_bytes = max(
             KINTEX_PRIVATE_RESERVE_BYTES if self._kintex_tiled_map
             else TILED_PRIVATE_RESERVE_BYTES,
-            self._private_weight_bytes(script_dir, multi_core))
+            self._private_weight_bytes(script_dir, multi_core, self.strassen))
         # THE TILED MAP IS SELECTED BY ENGINE COUNT AND BOARD. Kintex uses
         # its two 2 GiB controller windows. At 8 engines on a characterised
         # Alveo board, the windows become 1 GiB and
@@ -2015,6 +2042,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 and _lm_meta.get("decode_kernel") == self.decode_kernel
                 and _lm_meta.get("multi_core", 1) == self.multi_core
                 and _lm_meta.get("dram_layout", "legacy") == self.dram_layout
+                and bool(_lm_meta.get("strassen", False)) == self._st_on()
                 and all(meta is not None
                         and meta.get("prefill_seq_len") == prefill_flops_seq_len
                         and meta.get("prefill_kernel") == self.prefill_kernel
@@ -2164,6 +2192,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "multi_core": self.multi_core,
             "dram_layout": self.dram_layout,
             "decode_kernel": self.decode_kernel,
+            # Strassen lanes change the weight layout (slabs) the image reads.
+            "strassen": self._st_on(),
             # Register indices the M-sharded V^T workers read their per-token slice from.
             # Allocated during compile; a run that only LOADS the image would otherwise
             # have no idea which registers its preamble must prime.
@@ -3540,6 +3570,10 @@ def add_engine_args(parser) -> None:
                         help="Skip compiling and load the matching cached program image "
                              "(programs.bin / programs_profile.bin); a missing or mismatched "
                              "section is an error. Default: OFF (fresh compile every run).")
+    parser.add_argument("--no-strassen", action="store_true",
+                        help="Turn off the Strassen prefill MLP (8+ engines: the MLP lanes of "
+                             "2560x1280 / 1536x1536 run Strassen at 128+ prefill rows, stored "
+                             "as input-column slabs). Off = the plain kernel and weight layout.")
 
 
 def resolve_engine_config(parser, args) -> dict:
@@ -3616,6 +3650,8 @@ def resolve_engine_config(parser, args) -> dict:
           f"engines={args.multi_core}, decode={args.decode_kernel}")
     print(f"Program image: {'reuse cached' if args.bin_reuse else 'fresh compile every run'}"
           f" (--bin-reuse {'on' if args.bin_reuse else 'off'})")
+    strassen = not getattr(args, "no_strassen", False)
+    print(f"Strassen prefill MLP: {'on' if strassen else 'off'} (--no-strassen turns it off)")
 
     return dict(
         vision_kernel=args.vision_kernel,
@@ -3623,6 +3659,7 @@ def resolve_engine_config(parser, args) -> dict:
         decode_kernel=args.decode_kernel,
         multi_core=args.multi_core,
         bin_reuse=args.bin_reuse,
+        strassen=strassen,
     )
 
 

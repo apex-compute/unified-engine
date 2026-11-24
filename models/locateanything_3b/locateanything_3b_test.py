@@ -39,6 +39,8 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, UE_MODE, set_dma_device
 from nn_lib import eltwise_add_core_dram, eltwise_mul_core_dram, rms_norm_core_dram_post_add
 from nn_lib import store_weight, store_quantized_weight, smart_bf16_permute_core, layer_norm_core_dram_post_add
+from nn_lib import (strassen_bf16_cells, strassen_if4_cells, strassen_if4_slab_cells, strassen_matmul_core_dram, strassen_online_sum_count,
+                    strassen_online_sums_core, strassen_online_tree, strassen_scratch_elements)
 from quant_lib import quantize_q4_64
 from user_dma_core import UnifiedEngine, DRAM_INSTRUCTION_ADDR, MEMCPY_TYPE
 from user_dma_core import ue_35bit_addr_shifter
@@ -302,14 +304,35 @@ def _program_cache_fail(why):
     sys.exit(1)
 
 
-def _program_cache_load(script_dir, key):
-    """(prog_bytes, meta) for `key` with --run-from-bin (error if absent), else None."""
+def _program_cache_load(script_dir, key, layout=None):
+    """(prog_bytes, meta) for `key` with --run-from-bin (error if absent, or if it was compiled
+    under another DRAM layout than `layout`), else None."""
     if not RUN_FROM_BIN:
         return None
     cached = programs_bin_load(script_dir, key)
     if cached is None:
         _program_cache_fail(f"programs.bin has no program {key!r}")
+    if layout is not None and not program_layout_ok(cached[1], layout, key):
+        _program_cache_fail(f"program {key!r} was compiled for another DRAM layout")
     return cached
+
+def program_layout(ue):
+    """The DRAM layout a program is compiled / loaded under: its own address plus the params and
+    tensor ends. A captured program bakes in absolute weight / tensor addresses and jump targets,
+    so a cached one is reused only when all three match (store this dict in its meta)."""
+    return {"program_addr": ue.get_program_dram_addr(), "params_end": ue.get_params_dram_addr(),
+            "tensor_end": ue.get_tensor_dram_addr()}
+
+
+def program_layout_ok(meta, layout, key):
+    """True when a cached program's meta was compiled under `layout`; else say what differs."""
+    bad = [k for k, v in layout.items() if meta.get(k) != v]
+    if bad:
+        _original_print(f"  Cached {key} was compiled for another DRAM layout ("
+                        + ", ".join(f"{k} {meta.get(k) if meta.get(k) is None else hex(meta[k])} != 0x{layout[k]:X}"
+                                    for k in bad) + ")")
+    return not bad
+
 
 def store_identity_matrix(ue):
     """Store identity matrix in DRAM once. Returns DRAM address."""
@@ -1023,6 +1046,187 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._next_params_dram_addr += size_bytes
         return params_dram_addr
 
+    # ---------------------------------------------------------------- Strassen (LM prefill)
+    # See the comment above STRASSEN. Every Strassen matmul goes through _strassen_call.
+
+    def _lm_st_on(self, op: str) -> bool:
+        return STRASSEN and LM_STRASSEN and op in LM_ST_OPS
+
+    def _lm_st_shape(self, op: str) -> tuple[int, int]:
+        """(N, K) of an LM projection."""
+        d, q, f = self.vector_length, self.head_dim * self.group_size, self.mlp_elements
+        return {"q": (q, d), "o": (d, q), "gate": (f, d), "up": (f, d), "down": (d, f)}[op]
+
+    def _lm_st_store(self, la: dict, op: str, raw) -> None:
+        """Store an IF4 pack ONCE as input-column slabs (la[op_slabs], what the plain paths read)
+        whose row ranges are the Strassen cells (la[op_st], one node per input-column lane)."""
+        N, K = self._lm_st_shape(op)
+        L, lanes = LM_ST_LEVEL, (LM_ST_DOWN_LANES if op == "down" else 1)
+        raw = raw.tobytes() if hasattr(raw, "tobytes") else bytes(raw)
+        nb = N * K // 64
+        assert len(raw) == nb * 34, f"{op}: IF4 pack of {N} x {K} is {len(raw)} bytes, expected {nb * 34}"
+        sc = np.frombuffer(raw, dtype=np.uint8, count=nb * 2).reshape(N, K // 32)    # bf16 scale per 64 weights
+        d = np.frombuffer(raw, dtype=np.uint8, offset=nb * 2).reshape(N, K // 2)    # two weights per byte
+        kl = K // lanes
+        la[f'{op}_slabs'], la[f'{op}_st'] = [], []
+        for j in range(lanes):
+            slabs, cells = strassen_if4_slab_cells(d[:, j * kl // 2:(j + 1) * kl // 2].tobytes(),
+                                                   sc[:, j * kl // 32:(j + 1) * kl // 32].tobytes(), N, kl, L,
+                                                   lambda dd, ss, n, k, t=None: _mv_store_pack(self, dd, ss))
+            la[f'{op}_slabs'] += slabs
+            la[f'{op}_st'].append({"L": L, "cells": cells, "n": N >> L, "k": kl >> L})
+
+    def _lm_st_trees(self) -> None:
+        """One set of fp16 sum buffers (params region) shared by every LM Strassen call: each call
+        refills them right before it runs. Then each node's online tree."""
+        nodes = [(la, op, nd) for la in self.lm_layer_addrs for op in LM_ST_OPS for nd in la.get(f'{op}_st', ())]
+        self._lm_st = bool(nodes)
+        if not nodes:
+            return
+        L, t0 = LM_ST_LEVEL, self.get_params_dram_addr()
+        cell = max(nd["n"] * nd["k"] for _, _, nd in nodes)
+        sums = []
+        for _ in range(strassen_online_sum_count(L)):
+            _mv_palign(self)
+            sums.append(self.allocate_params_dram(cell * 2))
+        for la, op, nd in nodes:
+            nd["sums"] = sums
+            nd["tree"] = strassen_online_tree(nd["cells"], sums, L, la.get('q_bias_host') if op == 'q' else None,
+                                              lambda t: _mv_store_raw(self, t))
+        print(f"  LM Strassen L{L} on {', '.join(op for op in LM_ST_OPS if self._lm_st_on(op))}: sum buffers + leaf "
+              f"biases {(self.get_params_dram_addr() - t0) / 1048576:.1f} MB at params 0x{t0:X}")
+
+    def _lm_st_tensors(self) -> None:
+        """Strassen-on tensors, allocated after every existing buffer so none of those moves."""
+        bpe, cap, ctx, t0 = self.bytes_per_element, self.PREFILL_MAX_SEQ_LEN, self.MAX_CONTEXT_SIZE, self.get_tensor_dram_addr()
+
+        def buf(elems, zero=False):
+            a = self.allocate_tensor_dram(elems * bpe, align_bytes=128)
+            if zero:
+                self.dma_to_accelerator_memory(a, torch.zeros(elems, dtype=torch.bfloat16))
+            return a
+        self.LM_SLAB_A = buf(cap * self.mlp_elements, zero=True)     # a matmul input as column blocks
+        self.LM_SLAB_PART = buf(cap * self.mlp_elements)             # slab partial sums (ping-pong)
+        rows = self.LM_ST_ROWS = max(LM_ST_BUCKETS)
+        assert ST_MIN_ROWS <= rows <= cap and rows % (1 << LM_ST_LEVEL) == 0, f"LM_ST_BUCKETS: {LM_ST_BUCKETS}"
+        calls = [(N, K // (LM_ST_DOWN_LANES if op == "down" else 1))
+                 for op in LM_ST_OPS if self._lm_st_on(op) for N, K in [self._lm_st_shape(op)]]
+        per = [strassen_scratch_elements(rows, K, N, LM_ST_LEVEL) for N, K in calls]
+        self.LM_ST_SCR = [(buf(max(p[d][0] for p in per), True), buf(max(p[d][1] for p in per), True))
+                          for d in range(LM_ST_LEVEL)]
+        self.LM_ST_PART = buf(rows * self.vector_length)             # down_proj lane 1
+        # A bucket program's Strassen calls read `rows` rows: past the prompt the inputs must be
+        # finite (fresh DRAM holds NaN). Only PBI ops at the real length write them, so zero once.
+        for a, elems in ((self.LAYER0_PRE_NORM_DRAM, ctx * self.vector_length),
+                         (self.LAYER0_FLASH_OUTPUT_DRAM, ctx * self.head_dim * self.group_size),
+                         (self.LAYER0_PRE_MLP_NORM_DRAM, ctx * self.vector_length)):
+            self.dma_to_accelerator_memory(a, torch.zeros(elems, dtype=torch.bfloat16))
+        # Strassen outputs must be 128-byte aligned (its strided writes cover whole lines).
+        for attr, elems in (("LAYER0_Q_DRAM", ctx * self.head_dim * self.group_size),
+                            ("LAYER0_ATTN_PROJ_OUTPUT_DRAM", ctx * self.vector_length),
+                            ("LAYER0_MLP_GATE_DRAM", ctx * self.mlp_elements), ("LAYER0_MLP_UP_DRAM", ctx * self.mlp_elements),
+                            ("LAYER0_MLP_DOWN_DRAM", ctx * self.vector_length)):
+            if getattr(self, attr) % 128:
+                setattr(self, attr, buf(elems))
+        print(f"  LM Strassen tensors (slab gather/partials, scratch for {rows} rows): "
+              f"{(self.get_tensor_dram_addr() - t0) / 1048576:.1f} MB at tensor 0x{t0:X}")
+        assert self.get_tensor_dram_addr() < self._program_dram_base, \
+            f"tensor end 0x{self.get_tensor_dram_addr():X} overruns the program base 0x{self._program_dram_base:X}"
+
+    def _lm_gather_cols(self, A: int, K: int, parts: int, seq_len: int) -> list[int]:
+        """A [rows, K] -> `parts` contiguous [rows, K / parts] column blocks in LM_SLAB_A (block j
+        at j * PREFILL_MAX_SEQ_LEN rows), over the runtime row count gf_seq_len."""
+        k, bpe, cap = K // parts, self.bytes_per_element, self.PREFILL_MAX_SEQ_LEN
+        dsts = [self.LM_SLAB_A + j * cap * k * bpe for j in range(parts)]
+        for j, dst in enumerate(dsts):
+            self._emit_pbi_scatter_per_token(read_base=A + j * k * bpe, read_stride_bytes=K * bpe,
+                                             write_specs=[(dst, k * bpe)], sram_byte_addr=0x10000, element_count=k,
+                                             gf_seq_len=self.gf_seq_len, template_seq_len=seq_len)
+        return dsts
+
+    def _lm_mm(self, op: str, la: dict, M: int, K: int, N: int, A: int, OUT: int,
+               bias: int | None = None, act: dict | None = None, st_rows: int | None = None) -> int:
+        """Prefill: an LM projection whose weight is stored as slabs. st_rows: the fixed row count
+        of a Strassen bucket program; None = the plain path at the runtime length gf_seq_len, one
+        matmul per slab, each taking the sum so far as a full-matrix bias (ping-pong ending in
+        OUT), `bias` on the first and `act` (matmat_mul_core activation kwargs) on the last."""
+        if st_rows is not None:
+            nodes = la[f'{op}_st']
+            assert len(nodes) <= 2 and (len(nodes) == 1 or act is None), f"{op}: {len(nodes)} lanes"
+            kl = K // len(nodes)
+            srcs = [A] if len(nodes) == 1 else self._lm_gather_cols(A, K, len(nodes), M)
+            for nd, src, dst in zip(nodes, srcs, (OUT, self.LM_ST_PART)):
+                _strassen_call(self, st_rows, kl, N, src, nd, dst, self.LM_ST_SCR, self.LM_ST_ROWS, act)
+            if len(nodes) > 1:                   # input-column lanes: sum the partials
+                self.eltwise_core_dram(M=M, N=N, dram_a=OUT, dram_b=self.LM_ST_PART, dram_out=OUT,
+                                       mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gf_seq_len)
+            return 2 * st_rows * K * N
+        slabs = la[f'{op}_slabs']
+        g = len(slabs)
+        srcs = self._lm_gather_cols(A, K, g, M)
+        for j, (wd, ws) in enumerate(slabs):
+            dst, prev = (OUT, self.LM_SLAB_PART) if (g - 1 - j) % 2 == 0 else (self.LM_SLAB_PART, OUT)
+            c = dict(C_DRAM_ADDR=bias, bias_mode="broadcast_N") if j == 0 else dict(C_DRAM_ADDR=prev, bias_mode="full_matrix")
+            self.matmat_mul_core(is_B_quantized=True, M=M, K=K // g, N=N, A_DRAM_ADDR=srcs[j], B_DRAM_ADDR=wd,
+                                 OUTPUT_DRAM_ADDR=dst, SCALE_DRAM_ADDR=ws, data_type=TYPE.IF4,
+                                 gpr_M_reg=self.gf_seq_len, **c, **(act if act and j == g - 1 else {}))
+        return 2 * M * K * N
+
+    def _lm_mv(self, op: str, la: dict, K: int, N: int, A: int, OUT: int,
+               bias: int | None = None, act: dict | None = None) -> int:
+        """Decode (M = 1): an LM projection whose weight is stored as slabs: one 1-pass quantized
+        GEMV per slab (its input is a contiguous piece of the row), chained as in _lm_mm."""
+        slabs = la[f'{op}_slabs']
+        g, k, bpe = len(slabs), K // len(slabs), self.bytes_per_element
+        for j, (wd, ws) in enumerate(slabs):
+            dst, prev = (OUT, self.LM_SLAB_PART) if (g - 1 - j) % 2 == 0 else (self.LM_SLAB_PART, OUT)
+            c = dict(C_DRAM_ADDR=bias, bias_mode="broadcast_N") if j == 0 else dict(C_DRAM_ADDR=prev, bias_mode="full_matrix")
+            self.quantized_matmat_core(M=1, K=k, N=N, A_DRAM_ADDR=A + j * k * bpe, B_DRAM_ADDR=wd,
+                                       OUTPUT_DRAM_ADDR=dst, SCALE_DRAM_ADDR=ws, data_type=TYPE.IF4,
+                                       **c, **(act if act and j == g - 1 else {}))
+        return 2 * K * N
+
+    def _decoder_key(self) -> str:
+        return "decoder_slab" if getattr(self, "_lm_st", False) else "decoder"
+
+    def _compile_prefill_st(self, template_seq_len: int, layer_size: int, base_addr: int) -> None:
+        """Compile (or load) the fixed-row Strassen prefill programs, one per LM_ST_BUCKETS entry,
+        right after the any-length program. Their Strassen code holds absolute jumps, so a cached
+        program is reused only when it lands at the address it was compiled for."""
+        global _SILENT_MODE
+        self._prefill_st_programs, self._prefill_st_base = {}, base_addr     # used in place of base_addr only
+        if not getattr(self, "_lm_st", False) or layer_size != self.LAYER_SIZE:
+            return
+        for rows in sorted(LM_ST_BUCKETS):
+            key = f"prefill_st{LM_ST_LEVEL}_b{rows}_s{template_seq_len}"
+            addr, layout = self.get_program_dram_addr(), program_layout(self)
+            cached = _program_cache_load(self.script_dir, key, layout)
+            if cached is not None:
+                prog_bytes = cached[0]
+                _original_print(f"  Loading cached Strassen prefill program ({key}) from programs.bin ...")
+            else:
+                _SILENT_MODE = True
+                _original_print(f"  Compiling Strassen prefill ({rows} rows, level {LM_ST_LEVEL}, {layer_size} layers)...")
+                self.clear_inst_id()
+                self.start_capture()
+                self._emit_prefill_program(seq_len=template_seq_len, layer_size=layer_size, st_rows=rows)
+                self.stop_capture()
+                prog_bytes = bytearray()
+                for inst in self.capture_buffer:
+                    prog_bytes.extend(inst.get_bytes())
+                self.clear_capture_buffer()
+                _SILENT_MODE = False
+                _original_print()
+                assert self.get_program_dram_addr() == addr
+                programs_bin_store(self.script_dir, key, prog_bytes, meta={**layout, "rows": rows,
+                                                                         "layer_size": layer_size})
+            self.dma_write(DMA_DEVICE_H2C, addr, prog_bytes, len(prog_bytes))
+            self.allocate_program_dram(len(prog_bytes))
+            self._prefill_st_programs[rows] = addr
+            print(f"    Strassen prefill ({rows} rows) at 0x{addr:X}, {len(prog_bytes) / 1048576:.1f} MB")
+        assert self.get_program_dram_addr() <= 0x100000000, \
+            f"program end 0x{self.get_program_dram_addr():X} is past the 4 GB DRAM"
+
     def decoder_attention_core(self, head_dim: int, seq_len: int, Q_DRAM_ADDR: int, K_DRAM_ADDR: int, V_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, SCRATCH_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, BIAS_DRAM_ADDR: int = None,
                             debug_mode: bool = False, SM_OUTPUT_DRAM_ADDR: int = None) -> None:
 
@@ -1457,17 +1661,26 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # Q, K, gate, up: precision.lm-quantized from binary
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj')]:
+                if self._lm_st_on(proj):
+                    self._lm_st_store(la, proj, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
+                    continue
                 la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
             # V stays BF16 (small, attention-value sensitive); O + down_proj if4-quantized.
             la['v_weight'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[f'{prefix}.self_attn.v_proj.weight'], torch.bfloat16))
-            la['o_scale'], la['o_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.self_attn.o_proj.weight.{lm_prec}'])
-            la['down_scale'], la['down_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.mlp.down_proj.weight.{lm_prec}'])
+            for proj in ('o', 'down'):
+                hf_sub = 'self_attn.o_proj' if proj == 'o' else 'mlp.down_proj'
+                if self._lm_st_on(proj):
+                    self._lm_st_store(la, proj, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
+                else:
+                    la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
             # Biases from binary
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('v', 'self_attn.v_proj')]:
                 bias_key = f'{prefix}.{hf_sub}.bias'
                 if bias_key in lm_cache:
                     la[f'{proj}_bias'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[bias_key], torch.bfloat16))
+                    if proj == 'q' and 'q_st' in la:     # the Strassen tree folds the bias into its leaves
+                        la['q_bias_host'] = user_dma_core.tensor_from_le_bytes(lm_cache[bias_key], torch.bfloat16)
                 else:
                     bias_size = self.vector_length if proj == 'q' else self.head_dim
                     la[f'{proj}_bias'] = store_weight(self, torch.zeros(bias_size, dtype=torch.bfloat16))
@@ -1475,6 +1688,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             la['ln1_gamma'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[f'{prefix}.input_layernorm.weight'], torch.bfloat16))
             la['ln2_gamma'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[f'{prefix}.post_attention_layernorm.weight'], torch.bfloat16))
             self.lm_layer_addrs.append(la)
+        self._lm_st_trees()
 
         # NOTE: hf_model kept alive for vision MLP BF16 weight extraction below
 
@@ -1723,6 +1937,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.PENALTY_BIAS_DRAM = self.allocate_tensor_dram(1 * self.EMBEDDING_ELEMENTS * bpe)
         self.dma_to_accelerator_memory(self.PENALTY_BIAS_DRAM,
                                        torch.zeros(1, self.EMBEDDING_ELEMENTS, dtype=torch.bfloat16))
+        if getattr(self, "_lm_st", False):
+            self._lm_st_tensors()
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
         # Pre-allocate the identity matrix used by attention cores.
@@ -1822,7 +2038,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             cache_suffix += "_bf16"
         enc_prog_key = f"encoder{cache_suffix}_unified_attention"
 
-        _cached = _program_cache_load(self.script_dir, enc_prog_key)
+        layout = program_layout(self)
+        _cached = _program_cache_load(self.script_dir, enc_prog_key, layout)
         if _cached is not None:
             prog_bytes, _ = _cached
             _original_print(f"  Loading cached encoder program ({enc_prog_key}) from programs.bin ...")
@@ -2159,7 +2376,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         # Save compiled program to consolidated programs.bin for fast reload next time
         programs_bin_store(self.script_dir, enc_prog_key, prog_bytes,
-                           meta={"total_layers": total_layers, "bf16_mode": _bf16_mode})
+                           meta={**layout, "total_layers": total_layers, "bf16_mode": _bf16_mode})
         _original_print(f"    Vision encoder compiled: {total_bytes} total bytes, {total_layers} layers + merger (single program)")
         _original_print(f"    Program addr: 0x{program_addr:X}, cached to programs.bin[{enc_prog_key}]")
         return program_addr
@@ -2351,8 +2568,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._image_grid_thw = image_grid_thw  # store for mRoPE computation
         print(f"    Vision encoder output: {self._vis_num_tokens} tokens at 0x{self.VIS_ENCODER_OUT_DRAM:X}")
 
-    def _emit_prefill_program(self, seq_len: int, layer_size: int) -> int:
+    def _emit_prefill_program(self, seq_len: int, layer_size: int, st_rows: int | None = None) -> int:
         """Emit ONE seq_len-agnostic prefill program (PBI single-bin pattern).
+
+        st_rows: a Strassen bucket program -- the projections stored as slabs (Strassen on) run
+        Strassen on a fixed st_rows rows (the prompt's rows plus finite filler past it); every
+        other op still runs at the runtime length. None: the any-length program.
 
         Caller wraps in start_capture()/stop_capture(). Program ends with a halt
         so it can be jumped to via a runtime preamble that primes
@@ -2404,7 +2625,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                               gpr_M_reg=self.gf_seq_len) or 0)
 
             # Q, K, V projections with bias
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd * qpkv,
+            if 'q_slabs' in la:
+                total_flops += self._lm_mm('q', la, seq_len, self.vector_length, hd * qpkv, self.LAYER0_PRE_NORM_DRAM,
+                                           self.LAYER0_Q_DRAM, bias=la['q_bias'], st_rows=st_rows)
+            else:
+                total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['q_bias'], gpr_M_reg=self.gf_seq_len) or 0)
@@ -2510,7 +2735,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 )
 
             # o_proj (if4-quantized)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=hd * qpkv, N=self.vector_length,
+            if 'o_slabs' in la:
+                total_flops += self._lm_mm('o', la, seq_len, hd * qpkv, self.vector_length, self.LAYER0_FLASH_OUTPUT_DRAM,
+                                           self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, st_rows=st_rows)
+            else:
+                total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=hd * qpkv, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=self.gf_seq_len) or 0)
@@ -2531,11 +2760,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                               gpr_M_reg=self.gf_seq_len) or 0)
 
             # MLP gate (with SiLU), up, gate × up, down.
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            if 'gate_slabs' in la:
+                total_flops += self._lm_mm('gate', la, seq_len, self.vector_length, self.mlp_elements, self.LAYER0_PRE_MLP_NORM_DRAM,
+                                           self.LAYER0_MLP_GATE_DRAM, act={"silu_enable": True}, st_rows=st_rows)
+            else:
+                total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                 SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True,
                 gpr_M_reg=self.gf_seq_len) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            if 'up_slabs' in la:
+                total_flops += self._lm_mm('up', la, seq_len, self.vector_length, self.mlp_elements, self.LAYER0_PRE_MLP_NORM_DRAM,
+                                           self.LAYER0_MLP_UP_DRAM, st_rows=st_rows)
+            else:
+                total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=self.gf_seq_len) or 0)
@@ -2549,7 +2786,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 gpr_M_reg=self.gf_seq_len,
             )
 
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.mlp_elements, N=self.vector_length,
+            if 'down_slabs' in la:
+                total_flops += self._lm_mm('down', la, seq_len, self.mlp_elements, self.vector_length, self.LAYER0_MLP_MULT_DRAM,
+                                           self.LAYER0_MLP_DOWN_DRAM, st_rows=st_rows)
+            else:
+                total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=self.gf_seq_len) or 0)
@@ -2578,9 +2819,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             layer_size = self.LAYER_SIZE
 
         template_seq_len = self.PREFILL_MAX_SEQ_LEN
-        prefill_key = f"prefill_pbi_s{template_seq_len}"
+        prefill_key = f"prefill_pbi_s{template_seq_len}" + ("_slab" if getattr(self, "_lm_st", False) else "")
 
-        _cached = _program_cache_load(self.script_dir, prefill_key)
+        layout = program_layout(self)
+        _cached = _program_cache_load(self.script_dir, prefill_key, layout)
         if _cached is not None:
             prog_bytes, meta = _cached
             _original_print(f"  Loading cached PBI prefill program ({prefill_key}) from programs.bin ...")
@@ -2588,6 +2830,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.dma_write(DMA_DEVICE_H2C, program_addr, prog_bytes, len(prog_bytes))
             self.allocate_program_dram(len(prog_bytes))
             preamble_addr = self.allocate_program_dram(256)
+            self._compile_prefill_st(template_seq_len, layer_size, program_addr)
             return program_addr, preamble_addr, meta["total_flops"]
 
         global _SILENT_MODE
@@ -2610,9 +2853,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         _original_print()
 
         programs_bin_store(self.script_dir, prefill_key, prog_bytes,
-                           meta={"total_flops": total_flops, "template_seq_len": template_seq_len, "layer_size": layer_size})
+                           meta={**layout, "total_flops": total_flops, "template_seq_len": template_seq_len,
+                                 "layer_size": layer_size})
         print(f"    PBI prefill cached to programs.bin[{prefill_key}] ({len(prog_bytes)} bytes)")
         print(f"    Prefill program at 0x{program_addr:X}, preamble slot at 0x{preamble_addr:X}")
+        self._compile_prefill_st(template_seq_len, layer_size, program_addr)
         return program_addr, preamble_addr, total_flops
 
     def prefill_theoretical_flops(self, seq_len: int, layer_size: int | None = None) -> int:
@@ -2688,6 +2933,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         bias_one_group.masked_fill_(valid_mask, 0.0)
         bias_one_group[:, q_seq_len:] = NEG_MASK
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
+
+        # Strassen bucket: the smallest fixed-row program that holds the prompt, from ST_MIN_ROWS
+        # rows on. Same registers; its Strassen calls also read the finite rows past the prompt.
+        buckets = [r for r in sorted(getattr(self, "_prefill_st_programs", {})) if r >= actual_seq_len]
+        if buckets and actual_seq_len >= ST_MIN_ROWS and prefill_program_addr == getattr(self, "_prefill_st_base", None):
+            prefill_program_addr = self._prefill_st_programs[buckets[0]]
+            print(f"    Prefill: Strassen program for {buckets[0]} rows ({actual_seq_len} real)")
 
         # Emit runtime preamble: ADD_SETs for the 3 GPRs + JUMP_ABS into prefill.
         self.clear_inst_id()
@@ -2958,7 +3210,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
             # Q, K, V projections with bias
             # Q/K (IF4, K=2048<8192) use quantized_matmat_core M=1 GEMV (fused dequant+dot ~2×)
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd * qpkv,
+            if 'q_slabs' in la:
+                total_flops += self._lm_mv('q', la, self.vector_length, hd * qpkv, self.LAYER0_PRE_NORM_DRAM,
+                                           self.LAYER0_Q_DRAM, bias=la['q_bias'])
+            else:
+                total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
                 C_DRAM_ADDR=la['q_bias']) or 0)
@@ -3068,7 +3324,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
 
             # o_proj (IF4, K=hd*qpkv=2048<8192 → quantized_matmat_core M=1 GEMV)
-            total_flops += (self.quantized_matmat_core(M=1, K=hd * qpkv, N=self.vector_length,
+            if 'o_slabs' in la:
+                total_flops += self._lm_mv('o', la, hd * qpkv, self.vector_length, self.LAYER0_FLASH_OUTPUT_DRAM,
+                                           self.LAYER0_ATTN_PROJ_OUTPUT_DRAM)
+            else:
+                total_flops += (self.quantized_matmat_core(M=1, K=hd * qpkv, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4) or 0)
 
@@ -3084,10 +3344,18 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                           gpr_M_reg=gf_one) or 0)
 
             # MLP: SwiGLU (gate/up IF4, K=2048<8192 → quantized_matmat_core M=1 GEMV)
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+            if 'gate_slabs' in la:
+                total_flops += self._lm_mv('gate', la, self.vector_length, self.mlp_elements, self.LAYER0_PRE_MLP_NORM_DRAM,
+                                           self.LAYER0_MLP_GATE_DRAM, act={"silu_enable": True})
+            else:
+                total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                 SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True) or 0)
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+            if 'up_slabs' in la:
+                total_flops += self._lm_mv('up', la, self.vector_length, self.mlp_elements, self.LAYER0_PRE_MLP_NORM_DRAM,
+                                           self.LAYER0_MLP_UP_DRAM)
+            else:
+                total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4) or 0)
 
@@ -3098,7 +3366,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
             # down_proj (if4-quantized)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.mlp_elements, N=self.vector_length,
+            if 'down_slabs' in la:              # slabs of K = 2752 fit the 1-pass GEMV (K < 8192)
+                total_flops += self._lm_mv('down', la, self.mlp_elements, self.vector_length, self.LAYER0_MLP_MULT_DRAM,
+                                           self.LAYER0_MLP_DOWN_DRAM)
+            else:
+                total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=gf_one) or 0)
@@ -3151,7 +3423,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         cache_hit = False
         prog_bytes = None
         meta = {}
-        _cached = _program_cache_load(self.script_dir, "decoder")
+        layout = program_layout(self)
+        _cached = _program_cache_load(self.script_dir, self._decoder_key(), layout)
         if _cached is not None:
             prog_bytes, meta = _cached
             if "program_size" in meta and isinstance(meta.get("total_flops"), int) \
@@ -3187,8 +3460,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self.allocate_program_dram(self.get_capture_instruction_size_bytes())
             self.clear_capture_buffer()
 
-            programs_bin_store(self.script_dir, "decoder", prog_bytes,
-                               meta={"program_size": len(prog_bytes), "total_flops": total_flops,
+            programs_bin_store(self.script_dir, self._decoder_key(), prog_bytes,
+                               meta={**layout, "program_size": len(prog_bytes), "total_flops": total_flops,
                                      "lm_head_sig": lm_head_sig})
             print(f"  Decoder program: 0x{decoder_program_addr:X} – 0x{self.get_program_dram_addr():X} "
                   f"({len(prog_bytes)} bytes), total_flops={total_flops}")
@@ -3847,7 +4120,7 @@ def _run_decode_only():
     t0 = time.perf_counter()
     da, gpt = ue.compile_decoder()
     t_dc = time.perf_counter() - t0
-    _dec_cached = programs_bin_load(LA_DIR, "decoder")
+    _dec_cached = programs_bin_load(LA_DIR, ue._decoder_key())
     _dec_kb = (len(_dec_cached[0]) / 1024) if _dec_cached else 0
     print(f"  {t_dc:.2f}s  (decoder size: {_dec_kb:.0f} KB)")
 
@@ -3896,6 +4169,16 @@ def main():
     ap.add_argument("--vision-no-mask", action="store_true",
                     help="with --vision-debug: run flash WITHOUT the pad-key mask bias "
                          "(isolation: output will be wrong but should be NaN-free)")
+    ap.add_argument("--no-strassen", action="store_true",
+                    help="plain matmuls and the original weight layout everywhere: no Strassen on the "
+                         "MoonViT o / fc0 / fc1 and no fixed-row Strassen prefill program (for A/B timing)")
+    ap.add_argument("--lm-strassen", action="store_true",
+                    help="also run the LM prefill through Strassen: the LM weights stored as input-column "
+                         "slabs (prefill and decode read them) plus the fixed-row Strassen prefill program. "
+                         "Off by default: one engine builds every call's weight sums, so it measured slower")
+    ap.add_argument("--strassen-only", choices=("vision", "lm"), default=None,
+                    help="diagnostic: Strassen (and the LM slab weight layout) on one side only -- "
+                         "vision = MoonViT only (the default), lm = LM prefill/decode only")
     ap.add_argument("--silent", action="store_true",
                     help="suppress compile/engine chatter (URAM usage, captured-instruction "
                          "dumps, etc.); timing summary + output still print")
@@ -3928,8 +4211,11 @@ def main():
     FORCE_DEBUG_LOGITS = True        # dump final_norm + lm_head NaN breakdown on first decode step
     # ==================================================================
 
-    global _SILENT_MODE
+    global _SILENT_MODE, STRASSEN, LM_STRASSEN
     _SILENT_MODE = args.silent
+    STRASSEN = not args.no_strassen          # read by weight_init / tensor_init: set before the engine exists
+    # LM off unless asked: no LM op stored as slabs, today's LM layout and programs
+    LM_STRASSEN = args.strassen_only == "lm" or (args.lm_strassen and args.strassen_only != "vision")
 
     if args.decode_only:
         _run_decode_only()
@@ -4015,7 +4301,8 @@ def main():
             conn_key = f"connector_N{N}"
             cache_hit = False
             prog_bytes = None
-            _cached = _program_cache_load(self.script_dir, conn_key)
+            layout = program_layout(self)
+            _cached = _program_cache_load(self.script_dir, conn_key, layout)
             if _cached is not None:
                 prog_bytes, meta = _cached
                 if meta.get("num_tokens") == N and meta.get("conn_in") == Cin:
@@ -4062,7 +4349,7 @@ def main():
                 self._connector_compiled_N = N
 
                 programs_bin_store(self.script_dir, conn_key, prog_bytes,
-                                   meta={"num_tokens": N, "conn_in": Cin, "program_size": len(prog_bytes),
+                                   meta={**layout, "num_tokens": N, "conn_in": Cin, "program_size": len(prog_bytes),
                                          "flops": self._connector_flops})
                 _original_print(f"  Connector compiled ({len(prog_bytes)} bytes) at 0x{self._connector_program_addr:X}")
 
@@ -4105,7 +4392,8 @@ def main():
         print("\n=== FPGA MoonViT encoder (stitched op flow) ===")
         model = prep["model"]
         N = prep["grid_hw"][0] * prep["grid_hw"][1]
-        moonvit_load_weights(ue, model, vis_cfg, precision=args.vision_precision)
+        moonvit_load_weights(ue, model, vis_cfg, precision=args.vision_precision,
+                             strassen=STRASSEN and args.strassen_only != "lm", rows=N)
         moonvit_setup_dram(ue, N, vis_cfg)
         moonvit_prepare_input(ue, model, prep["pixel_values"], prep["grid_hw"], vis_cfg)
         if args.vision_debug:
@@ -4417,6 +4705,139 @@ def _col_pad(W, target_cols):
 
 _BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locateanything_3b_bin")
 
+# Strassen matmul (nn_lib section 10) on the MoonViT o / fc0 (+GELU) / fc1 matmuls, online
+# leaves: each weight is stored ONCE as its 4^L cells and the board forms the weight sums into
+# buffers shared by all 27 layers, right before each matmul. Level 1 only: 1152 = 9 x 128 is
+# not a 256-multiple. q/k/v stay plain: their strip write-back puts each 72-lane head (q/k: each
+# 36-lane rotate_half half) in its own 128- (64-) lane slot. out_pitch= cannot do that (one
+# contiguous [M, N] block per call, slices on 64-lane columns), N = 72 is no Strassen width,
+# padding the weight to the 2048 slot lanes is 1.78x the work for a 12.5% saving, and a fused
+# q/k/v (N = 3456) plus a re-pad copy has no cheap copy: 72 / 144-byte strided chunks break the
+# 32-byte read rule, and the only pad-inserting copy (an identity strip matmul) costs a full q
+# projection. The encoder M is the padded token count (a 128-multiple), so every call has >= 128
+# rows and no plain leftover. On one engine each call rebuilds its weight sums (a fixed cost
+# ~ the weight size), so an op runs Strassen only from MV_ST_MIN_ROWS rows on (see there).
+# LM prefill (Qwen2BlockLM, IF4), off by default (--lm-strassen; board, one engine: 256-row
+# program 3.1% slower at 235 rows, any-length program over slabs no gain): q / o / gate (+SiLU) / up / down at level 1 in extra prefill
+# programs compiled for a FIXED row count (LM_ST_BUCKETS). Their weights are stored ONCE as
+# input-column slabs (strassen_if4_slab_cells); the any-length prefill program and decode read
+# the same slabs, one matmul per slab chained through the full-matrix bias. down_proj
+# (K = 11008, over the kernel's 8192) runs as LM_ST_DOWN_LANES input-column lanes, partials
+# summed. --no-strassen: plain matmuls and today's weight layout everywhere.
+STRASSEN = True
+LM_STRASSEN = False         # --lm-strassen: the LM ops below (and their slab layout) too
+ST_MIN_ROWS = 128           # measured floor: fewer rows per call and Strassen is slower
+MV_ST_LEVEL = 1
+# Fewest (padded) encoder rows at which each MoonViT op runs Strassen. Fit to the board's
+# vision totals (all three on, one engine): 256 rows saved 37.9 ms, 896 rows 645.5 ms, i.e.
+# 7.6 ms per layer fixed (the weight sums, ~0.67 ms per M weights) and 35 us per row saved.
+# Split by op (sums ~ weights; per row 1/8 of the MACs minus ~2.8 ns per (K + N) of fp16
+# passes, minus the GELU pass on half of fc0's output): break-even o ~300, fc0 ~270, fc1 ~170
+# rows, so at 256 rows o and fc0 are slower than plain and fc1 alone pays.
+MV_ST_MIN_ROWS = {"o": 384, "fc0": 384, "fc1": ST_MIN_ROWS}
+LM_ST_LEVEL = 1            # 2048 -> 2048 measured L1 0.92 / L2 0.91: L1, fewer slabs for decode
+LM_ST_OPS = ("q", "o", "gate", "up", "down")
+LM_ST_BUCKETS = (256,)      # at most 2; a prompt of ST_MIN_ROWS..bucket rows runs that program
+LM_ST_DOWN_LANES = 2
+
+
+def _mv_st_shapes(cfg, ops):
+    """(N, K) of the Strassen layers `ops` (ue.mv_st_ops)."""
+    d = _vis_dims(cfg)
+    pad = ((d["VI"] + 63) // 64) * 64
+    shapes = {"o": (d["VH"], d["VN"] * d["VD"]), "fc0": (pad, d["VH"]), "fc1": (d["VH"], pad)}
+    return {op: s for op, s in shapes.items() if op in ops}
+
+
+def _mv_st_ops(rows):
+    """The MoonViT ops that run Strassen for `rows` patch tokens (padded as moonvit_setup_dram does)."""
+    M = ((rows + 127) // 128) * 128
+    return tuple(op for op, m in MV_ST_MIN_ROWS.items() if M >= m)
+
+
+def _mv_palign(ue, align=128):
+    """Bump the params pointer to `align` (this port's allocate_params_dram does not align)."""
+    pad = (-ue.get_params_dram_addr()) % align
+    if pad:
+        ue.allocate_params_dram(pad)
+
+
+def _mv_store_raw(ue, t):
+    """Upload a bf16 or fp16 tensor as it is (no cast: Strassen sum-leaf biases are fp16)."""
+    t = t.contiguous().flatten()
+    addr = ue.get_params_dram_addr()
+    ue.dma_to_accelerator_memory(addr, t)
+    ue.allocate_params_dram(t.numel() * 2)
+    return addr
+
+
+def _mv_store_pack(ue, data, scales):
+    """One IF4 cell -> (data_addr, scale_addr), each 128-byte aligned."""
+    out = []
+    for raw in (data, scales):
+        _mv_palign(ue)
+        addr = ue.get_params_dram_addr()
+        ue.dma_write(DMA_DEVICE_H2C, addr, torch.frombuffer(bytearray(raw), dtype=torch.uint8), len(raw))
+        ue.allocate_params_dram(len(raw))
+        out.append(addr)
+    return tuple(out)
+
+
+def _mv_st_cells(ue, payload, N, K):
+    """A prepared matmul weight cut into its Strassen cells (same bytes, nothing re-quantized).
+    if4 payload: quantize_q4_64's [bf16 scales | packed nibbles], both row-major with K % 64 == 0,
+    i.e. the IF4 pack layout strassen_if4_cells expects."""
+    if ue.mv_precision == "if4":
+        raw = payload.tobytes() if hasattr(payload, "tobytes") else bytes(payload)
+        nb = N * K // 64
+        assert len(raw) == nb * 34, f"q4 pack of {N} x {K}: {len(raw)} bytes, expected {nb * 34}"
+        return strassen_if4_cells(raw[nb * 2:], raw[:nb * 2], N, K, MV_ST_LEVEL,
+                                  lambda d, s, n, k, t=None: _mv_store_pack(ue, d, s))
+    return strassen_bf16_cells(payload, MV_ST_LEVEL, lambda t: _mv_store_raw(ue, t))
+
+
+def _mv_st_trees(ue, shapes, biases):
+    """Allocate the shared fp16 sum buffers (params region, next to the weights) and build each
+    layer's online tree. biases: {(layer, op): host bias}."""
+    L, t0 = MV_ST_LEVEL, ue.get_params_dram_addr()
+    ue.mv_st_sums = {}
+    for name, (N, K) in shapes.items():
+        bufs = []
+        for _ in range(strassen_online_sum_count(L)):
+            _mv_palign(ue)
+            bufs.append(ue.allocate_params_dram((N >> L) * (K >> L) * 2))
+        ue.mv_st_sums[name] = bufs
+    for li, la in enumerate(ue.mv_layer_addrs):
+        for name, (N, K) in shapes.items():
+            cells = la.pop(f'{name}_cells')
+            la[f'{name}_st'] = {"L": L, "cells": cells, "sums": ue.mv_st_sums[name], "n": N >> L, "k": K >> L,
+                                "tree": strassen_online_tree(cells, ue.mv_st_sums[name], L, biases[(li, name)],
+                                                             lambda t: _mv_store_raw(ue, t))}
+    print(f"  MoonViT Strassen L{L} on {', '.join(shapes)}: sum buffers + leaf biases "
+          f"{(ue.get_params_dram_addr() - t0) / 1048576:.1f} MB at params 0x{t0:X}")
+
+
+def _strassen_call(ue, M, K, N, A, node, OUT, scratch, rows_cap, act=None):
+    """The ONE place this port emits Strassen: the layer's online weight sums, then the matmul.
+    node: {"L", "cells", "sums", "n", "k", "tree"}. rows_cap: rows the scratch was sized for.
+    act: matmat_mul_core activation kwargs (e.g. {"gelu_enable": True}) or None."""
+    L = node["L"]
+    assert ST_MIN_ROWS <= M <= rows_cap and M % (1 << L) == 0, \
+        f"Strassen: {M} rows (scratch holds {rows_cap}, needs a multiple of {1 << L} >= {ST_MIN_ROWS})"
+    assert OUT % 128 == 0, f"Strassen: output 0x{OUT:X} not 128-byte aligned"
+    strassen_online_sums_core(ue, node["cells"], node["n"], node["k"], node["sums"], L)
+    strassen_matmul_core_dram(ue, M, K, N, A, node["tree"], OUT, scratch,
+                              activation=act, identity_addr=ue.IDENTITY_DRAM_ADDR if act else None)
+
+
+def _mv_st_emit(ue, M, K, Nn, A, name, la, OUT, gelu=False):
+    """One MoonViT layer through Strassen; False if the layer is plain."""
+    node = la.get(f'{name}_st')
+    if node is None:
+        return False
+    _strassen_call(ue, M, K, Nn, A, node, OUT, ue.MV_ST_SCR, ue.MV_ST_ROWS, {"gelu_enable": True} if gelu else None)
+    return True
+
 
 def _prepare_moonvit_weights(model, cfg, precision):
     """Model-dependent prep (pad/reorder/quantize), independent of DRAM placement.
@@ -4475,7 +4896,14 @@ def _store_moonvit_weights(ue, prepared, cfg):
     depth = _vis_dims(cfg)["depth"]
     ue.mv_layer_addrs = [{} for _ in range(depth)]
     import numpy as np
+    shapes = _mv_st_shapes(cfg, ue.mv_st_ops) if getattr(ue, "mv_strassen", False) else {}
+    st_bias = {}
     for scope, name, kind, payload in prepared:
+        if kind == 'mat' and name in shapes:     # Strassen layer: stored as its cells only
+            ue.mv_layer_addrs[scope][f'{name}_cells'] = _mv_st_cells(ue, payload, *shapes[name])
+            continue
+        if name.endswith('_bias') and name[:-5] in shapes:
+            st_bias[(scope, name[:-5])] = payload
         if kind == 'mat' and ue.mv_precision == "if4":
             arr = payload if isinstance(payload, np.ndarray) else np.frombuffer(payload, dtype=np.uint8)
             sa, da = store_quantized_weight(ue, arr)
@@ -4487,13 +4915,21 @@ def _store_moonvit_weights(ue, prepared, cfg):
             setattr(ue, f'mv_final_{name}', store_weight(ue, payload))
         else:                                    # per-layer bf16 bias/norm
             ue.mv_layer_addrs[scope][name] = store_weight(ue, payload)
+    if shapes:
+        _mv_st_trees(ue, shapes, st_bias)
+    assert ue.get_params_dram_addr() < ue._tensor_dram_base, \
+        f"params end 0x{ue.get_params_dram_addr():X} overruns the tensor base 0x{ue._tensor_dram_base:X}"
 
 
-def moonvit_load_weights(ue, model, cfg, precision="if4"):
+def moonvit_load_weights(ue, model, cfg, precision="if4", strassen=True, rows=None):
     """Prepare (or load cached) MoonViT weights, then store to params DRAM. The prepared
     blobs are cached to disk so repeat runs skip padding/reorder/quantization (and don't
-    need `model` for weights). Big matmuls are if4 by default; biases/norms stay bf16."""
+    need `model` for weights). Big matmuls are if4 by default; biases/norms stay bf16.
+    strassen: the o / fc0 / fc1 that pay at `rows` patch tokens (MV_ST_MIN_ROWS) stored as
+    Strassen cells (see MV_ST_LEVEL); rows None = all three."""
     ue.mv_precision = precision
+    ue.mv_st_ops = (_mv_st_ops(rows) if rows is not None else tuple(MV_ST_MIN_ROWS)) if strassen else ()
+    ue.mv_strassen = bool(ue.mv_st_ops)
     os.makedirs(_BIN_DIR, exist_ok=True)
     cache = os.path.join(_BIN_DIR, f"moonvit_weights_{precision}_compact.pt")
     if os.path.exists(cache):
@@ -4597,6 +5033,30 @@ def moonvit_setup_dram(ue, N, cfg):
     # merged output [N_merged, 4608] -> overwrite VIS_MERGED_DRAM so run_connector picks it up
     ue.MV_MERGED = ue.allocate_tensor_dram(N_merged * merge_dim * bpe)
     ue.VIS_MERGED_DRAM = ue.MV_MERGED
+    if getattr(ue, "mv_strassen", False):
+        # Strassen: private scratch per depth, sized for M = N rows of the largest layer and
+        # zero-filled once (fresh DRAM holds NaN patterns). Allocated LAST so every buffer
+        # above keeps its address (the cached connector program bakes in MV_MERGED).
+        assert N % (1 << MV_ST_LEVEL) == 0 and N >= ST_MIN_ROWS, f"Strassen needs >= {ST_MIN_ROWS} even rows, got {N}"
+        t0 = ue.get_tensor_dram_addr()
+        per = [strassen_scratch_elements(N, K, Nn, MV_ST_LEVEL) for Nn, K in _mv_st_shapes(cfg, ue.mv_st_ops).values()]
+        ue.MV_ST_SCR, ue.MV_ST_ROWS = [], N
+        for dep in range(MV_ST_LEVEL):
+            pair = []
+            for which in (0, 1):
+                elems = max(p[dep][which] for p in per)
+                addr = ue.allocate_tensor_dram(elems * bpe, align_bytes=128)
+                ue.dma_to_accelerator_memory(addr, torch.zeros(elems, dtype=torch.bfloat16))
+                pair.append(addr)
+            ue.MV_ST_SCR.append(tuple(pair))
+        # Strassen outputs need 128-byte alignment (its strided writes cover whole lines).
+        for op, attr, elems in (("o", "MV_O_PROJ", N * VH), ("fc0", "MV_MLP_INTER", N * VIS_MLP_PAD),
+                                ("fc1", "MV_MLP_OUT", N * VH)):
+            if op in ue.mv_st_ops and getattr(ue, attr) % 128:
+                setattr(ue, attr, ue.allocate_tensor_dram(elems * bpe, align_bytes=128))
+        print(f"  MoonViT Strassen scratch: {(ue.get_tensor_dram_addr() - t0) / 1048576:.1f} MB at tensor 0x{t0:X}")
+    assert ue.get_tensor_dram_addr() < ue._program_dram_base, \
+        f"tensor end 0x{ue.get_tensor_dram_addr():X} overruns the program base 0x{ue._program_dram_base:X}"
     print(f"  MoonViT DRAM allocated for N={N} (N_merged={N_merged}, merge_dim={merge_dim})")
 
 
@@ -4755,8 +5215,10 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     # weight/tensor addresses + absolute jumps, so reload is valid only when load_weights/
     # setup_dram ran first and the program lands at the same addr (deterministic alloc order). ---
     os.makedirs(_BIN_DIR, exist_ok=True)
-    moonvit_key = f"moonvit_encoder_N{N}_{prec}_split_hd"
-    _cached = _program_cache_load(os.path.dirname(_BIN_DIR), moonvit_key)
+    moonvit_key = f"moonvit_encoder_N{N}_{prec}_split_hd" + (f"_st{MV_ST_LEVEL}-" + "-".join(ue.mv_st_ops)
+                                                             if getattr(ue, "mv_strassen", False) else "")
+    layout = program_layout(ue)
+    _cached = _program_cache_load(os.path.dirname(_BIN_DIR), moonvit_key, layout)
     if _cached is not None:
         prog, _cached_meta = _cached
         # Compile-time FLOP count stored with the cached program (absent in older bins).
@@ -4783,7 +5245,10 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         instead of unrolling ~M/M_chunk static tiles. This is the dominant program-
         size win (6 big matmuls/layer x 27 layers). Mirrors the LM prefill matmuls
         (locateanything_3b_test.py: q/k/v/o/gate/up all pass gpr_M_reg=gf_seq_len).
-        Flash/permute/norm stay static (flash can't be PBI - back-to-back bug)."""
+        Flash/permute/norm stay static (flash can't be PBI - back-to-back bug).
+        o / fc0 / fc1 go through Strassen when their weights were stored as cells."""
+        if _mv_st_emit(ue, M, K, Nn, A, name, la, OUT, gelu=gelu):
+            return
         strip = dict(strip_cols=strip_cols, strip_out_stride=strip_out_stride,
                      gpr_out_row_stride_reg=out_stride_reg)
         # Returns the core's compile-time FLOP count (accounting only).
@@ -4904,7 +5369,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     ue.allocate_program_dram(len(prog))
     ue.clear_capture_buffer()
     programs_bin_store(os.path.dirname(_BIN_DIR), moonvit_key, bytes(prog),
-                       meta={"N": N, "precision": prec, "depth": depth, "flops": ue._moonvit_flops})
+                       meta={**layout, "N": N, "precision": prec, "depth": depth, "flops": ue._moonvit_flops})
     _original_print(f"  MoonViT encoder compiled: {len(prog)//1024//1024}MB "
                     f"({len(prog)//32} instructions, {depth} layers) -> cached programs.bin[{moonvit_key}]")
     return program_addr
@@ -4982,6 +5447,10 @@ def moonvit_run_staged(ue, cfg, grid_hw, stop_after=None, check=True, timeout_s=
     def _mm_emit(M, K, Nn, A, name, la, OUT, bias=None, gelu=False,
                  strip_cols=None, strip_out_stride=None):
         def f():
+            if la.get(f'{name}_st') is not None:     # Strassen layer (allocates its own regs)
+                ue.reset_isa_reg_counter()
+                _mv_st_emit(ue, M, K, Nn, A, name, la, OUT, gelu=gelu)
+                return
             strip = {}
             if strip_cols is not None:
                 ue.reset_isa_reg_counter()

@@ -45,6 +45,8 @@ from nn_lib import (
     store_weight, store_quantized_weight, load_weight_cache, store_identity_matrix,
     eltwise_add_core_dram, eltwise_mul_core_dram, silu_core_dram,
     rms_norm_core_dram_post_add, layer_norm_core_dram_post_add,
+    strassen_if4_cells, strassen_levels, strassen_matmul_core_dram, strassen_online_sum_count,
+    strassen_online_sums_core, strassen_online_tree, strassen_scratch_elements,
 )
 from pi05_attn_kernels import attention_split_hd
 from quant_lib import (
@@ -817,17 +819,45 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             lanes, _ = self._prefix_mlp_lanes()
             lane_split = self._prefix_mlp_lane_split(lanes)
             assert sum(w for _, w in lane_split) == gate_2d.shape[0]
+            st_plan = self._prefix_st_plan()
             # gate/up cut along N (axis 0 of the (N,K) matrix -- whole output rows),
             # down cuts along K (axis 1 of ITS (N,K) = the 16384 side). Do NOT swap.
             for i, (c0, w) in enumerate(lane_split):
-                la[f"gate_l{i}_scale"], la[f"gate_l{i}_data"] = self._quant_store(gate_2d[c0:c0 + w].contiguous())
+                self._prefix_mlp_store(la, f"gate_l{i}", gate_2d[c0:c0 + w].contiguous(), st_plan[i]["gate"])
             for i, (c0, w) in enumerate(lane_split):
-                la[f"up_l{i}_scale"], la[f"up_l{i}_data"] = self._quant_store(up_2d[c0:c0 + w].contiguous())
+                self._prefix_mlp_store(la, f"up_l{i}", up_2d[c0:c0 + w].contiguous(), st_plan[i]["up"])
             for i, (c0, w) in enumerate(lane_split):
-                la[f"down_l{i}_scale"], la[f"down_l{i}_data"] = self._quant_store(down_2d[:, c0:c0 + w].contiguous())
+                self._prefix_mlp_store(la, f"down_l{i}", down_2d[:, c0:c0 + w].contiguous(), st_plan[i]["down"])
 
             self.lm_layer_addrs.append(la)
-        print(f"_weight_init_lm_prefix: {self.NUM_LAYERS} layers loaded")
+        st_note = f", MLP Strassen levels per lane {st_plan}" if any(any(p.values()) for p in st_plan) else ""
+        print(f"_weight_init_lm_prefix: {self.NUM_LAYERS} layers loaded{st_note}")
+
+    def _prefix_mlp_store(self, la, proj, w2d, L):
+        """One prefix MLP lane weight. L == 0: the IF4 q4_64 pack as it is
+        (la[proj_scale] / la[proj_data]). L > 0: the same pack cut into its 4^L
+        Strassen cells (nn_lib strassen_if4_cells, the same bytes, nothing
+        re-quantized) in la[st_proj]; the board makes the sum leaves per call."""
+        if not L:
+            la[f"{proj}_scale"], la[f"{proj}_data"] = self._quant_store(w2d)
+            return
+        N, K = w2d.shape
+        packed, n_blocks = _mlc_quantize_q4_64(w2d.to(torch.bfloat16).contiguous())
+        raw = packed.tobytes()          # [bf16 scale per 64-block][32 B per block], row-major
+        scales, data = raw[:n_blocks * 2], raw[n_blocks * 2:n_blocks * 34]
+        la[f"st_{proj}"] = {"L": L, "K": K, "N": N,
+                            "cells": strassen_if4_cells(data, scales, N, K, L, self._st_store_pack)}
+
+    def _st_store_pack(self, data, scales, n, k, t=None):
+        """Strassen cell upload, the store_quantized_weight way (scales, then data).
+        -> (data_addr, scale_addr), the order nn_lib's cells expect."""
+        s_addr = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, s_addr, scales, len(scales))
+        self.allocate_params_dram(len(scales))
+        d_addr = self.get_params_dram_addr()
+        self.dma_write(DMA_DEVICE_H2C, d_addr, torch.frombuffer(bytearray(data), dtype=torch.uint8), len(data))
+        self.allocate_params_dram(len(data))
+        return (d_addr, s_addr)
 
     # ---- tensors -----------------------------------------------------------
     def tensor_init(self, max_seq_len=512):
@@ -916,6 +946,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # it is reused as-is by the flash kernel regardless of head_dim/head_dim_pad.
             self.identity_addr = store_identity_matrix(self)
             self._tensor_init_vision()
+        self._tensor_init_prefix_strassen()     # LAST: nothing above moves (no-op when off)
         print(f"tensor_init done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
         self.dram_region_map("after tensor_init")
 
@@ -2107,24 +2138,33 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 else:
                     lane_ids, lane_M, lane_row, lane_Mreg = range(lanes), rows, RH, prefix_R_reg
 
+                # Strassen lanes (see PREFIX_STRASSEN_LEVEL): the cells weight_init stored
+                # must be what the plan says for the rows compiled here -- a cell-stored
+                # lane has no plain pack to fall back on.
+                st_plan = self._prefix_st_plan(lane_M)
+                for i in lane_ids:
+                    for kind in ("gate", "up", "down"):
+                        stored = la.get(f"st_{kind}_l{i}", {}).get("L", 0)
+                        assert stored == st_plan[i][kind], (
+                            f"prefix {kind}_l{i}: weight stored for Strassen level {stored}, the plan "
+                            f"at {lane_M} rows wants {st_plan[i][kind]}")
+
                 for i in lane_ids:
                     w = widths[i]           # THIS lane's width; NOT uniform in general
                     LF = 0 if mlp_col_split else row_offset * w * bpe
-                    self._matmul(M=lane_M, K=H, N=w, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
-                                 proj=f"gate_l{i}", la=la,
-                                 OUT=self.LAYER0_MLP_GATE_DRAM[i] + LF, gelu_enable=True,
-                                 gpr_M_reg=lane_Mreg, ue=ue)
-                    self._matmul(M=lane_M, K=H, N=w, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
-                                 proj=f"up_l{i}", la=la,
-                                 OUT=self.LAYER0_MLP_UP_DRAM[i] + LF, gpr_M_reg=lane_Mreg, ue=ue)
+                    self._prefix_mlp_mm(ue, engine_idx, la, f"gate_l{i}", lane_M, H, w,
+                                        self.LAYER0_PRE_NORM_DRAM + lane_row,
+                                        self.LAYER0_MLP_GATE_DRAM[i] + LF, lane_Mreg, gelu=True)
+                    self._prefix_mlp_mm(ue, engine_idx, la, f"up_l{i}", lane_M, H, w,
+                                        self.LAYER0_PRE_NORM_DRAM + lane_row,
+                                        self.LAYER0_MLP_UP_DRAM[i] + LF, lane_Mreg)
                     eltwise_mul_core_dram(ue, lane_M * w,
                                           self.LAYER0_MLP_GATE_DRAM[i] + LF,
                                           self.LAYER0_MLP_UP_DRAM[i] + LF,
                                           self.LAYER0_MLP_MULT_DRAM[i] + LF)
-                    self._matmul(M=lane_M, K=w, N=H, A=self.LAYER0_MLP_MULT_DRAM[i] + LF,
-                                 proj=f"down_l{i}", la=la,
-                                 OUT=self.LAYER0_MLP_PARTIAL_DRAM[i] + lane_row,
-                                 gpr_M_reg=lane_Mreg, ue=ue)
+                    self._prefix_mlp_mm(ue, engine_idx, la, f"down_l{i}", lane_M, w, H,
+                                        self.LAYER0_MLP_MULT_DRAM[i] + LF,
+                                        self.LAYER0_MLP_PARTIAL_DRAM[i] + lane_row, lane_Mreg)
                     self._debug_op(f"layer{layer_idx}_mlp_l{i}", self.LAYER0_MLP_PARTIAL_DRAM[i],
                                    S * H, shape=(S, H), ue=ue)
                     if layer_idx == 0 and self._prefix_snap and i < 2:
@@ -2612,6 +2652,163 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         return self._col_split(self.INTERMEDIATE_SIZE, lanes)
 
+    # ---- PREFIX MLP STRASSEN (nn_lib section 10) ---------------------------
+    # The gate (GELU fused), up and down lane matmuls run as Strassen with online
+    # leaves: the lane's IF4 weight is stored ONCE as its 4^L cells (same bytes,
+    # no plain pack -- the prefix has no M = 1 reader and always runs at one row
+    # count), and before each call the engine makes the sum leaves itself into
+    # its PRIVATE sum buffers, then runs the matmul through its PRIVATE scratch.
+    # Private because in the column-split MLP every engine works a different lane
+    # at the same time; in its own instruction stream the sums need no barrier.
+    # One sum set and one scratch per engine serve gate, up and down in turn and
+    # every layer.
+    #
+    # Levels (_prefix_st_level), rows = the prefix length (832):
+    #   engines 1, 2  lanes 8192: gate/up 2048->8192 level 2; down K = 8192 plain
+    #                 (the kernel takes K below 8192)
+    #   engines 4     lanes 4096: all three level 1 (level 2 would add ~0.2 MB of
+    #                 sum-making program per call, 54 calls per worker, on top of a
+    #                 ~38 MB three-stage worker program in a 60 MB arena)
+    #   engines 8     lanes 2048: all three level 1 (measured L1 0.92x / L2 0.91x of
+    #                 plain on this shape, and L2 costs 2.2x the sum bytes)
+    #   engines 12    1408 lanes level 1; 1344 lanes plain (not a 128-multiple)
+    # DRAM, tensor region, appended at the end of tensor_init: sum buffers 2.5*N*K B
+    # per engine at level 1, 5.6*N*K at level 2; scratch per strassen_scratch_elements.
+    # --strassen-level 0 turns it off (byte-identical to the plain port).
+    PREFIX_STRASSEN_LEVEL = 2           # highest level allowed; 0 = off
+    PREFIX_ST_L2_MAX_ENGINES = 2        # level 2 only when the prefix runs on <= this many engines
+    PREFIX_ST_PROGRAM_BYTES = {1: 300 << 10, 2: 460 << 10}   # ESTIMATED program per call (matmul + sums)
+
+    def _prefix_st_max_rows(self):
+        """Most prefix rows one lane call can take: every image slot + the text budget."""
+        return int(_CFG["vision"]["num_image_slots"]) * int(self.VIS_S) + int(self.PREFIX_TEXT_BUDGET)
+
+    def _prefix_st_level(self, rows, K, N):
+        """Strassen level for one lane matmul of rows x K -> N; 0 = the plain kernel."""
+        cap = int(self.PREFIX_STRASSEN_LEVEL)
+        if cap <= 0 or rows < 128 or min(K, N) < 1024 or K >= 8192:
+            return 0
+        want = 1
+        if (max(K, N) >= 4096 and rows >= 256
+                and self._num_engines("PREFIX") <= self.PREFIX_ST_L2_MAX_ENGINES):
+            want = 2
+        return strassen_levels(K, N, min(cap, want))
+
+    def _prefix_st_plan(self, rows=None):
+        """[{"gate": L, "up": L, "down": L}] per MLP lane -- THE single decision of
+        which lane matmuls are Strassen and at what level. weight_init stores cells
+        for exactly these, tensor_init sizes the buffers from it and _emit_prefix_body
+        asserts the stored layout still matches it at the row count it compiles.
+
+        rows: rows per lane call (None = _prefix_st_max_rows). A lane runs at full S
+        on one engine (column split) or on the single engine; only a multi-engine
+        prefix whose lane count is NOT the engine count walks lanes over row shards,
+        and that layout gets no Strassen at all (the decision must not depend on S)."""
+        lanes, _ = self._prefix_mlp_lanes()
+        ne = self._num_engines("PREFIX")
+        H = self.HIDDEN_SIZE
+        rows = self._prefix_st_max_rows() if rows is None else int(rows)
+        if ne > 1 and lanes != ne:
+            rows = 0
+        return [{"gate": self._prefix_st_level(rows, H, w), "up": self._prefix_st_level(rows, H, w),
+                 "down": self._prefix_st_level(rows, w, H)}
+                for _, w in self._prefix_mlp_lane_split(lanes)]
+
+    def _prefix_st_shapes(self, plan, lane_ids):
+        """[(K, N, L)] of the Strassen lane matmuls among lane_ids."""
+        H = self.HIDDEN_SIZE
+        lanes, _ = self._prefix_mlp_lanes()
+        widths = [w for _, w in self._prefix_mlp_lane_split(lanes)]
+        out = []
+        for i in lane_ids:
+            for kind, (K, N) in (("gate", (H, widths[i])), ("up", (H, widths[i])), ("down", (widths[i], H))):
+                if plan[i][kind]:
+                    out.append((K, N, plan[i][kind]))
+        return out
+
+    def _prefix_st_engine_lanes(self, e):
+        """Lanes engine e may run: engine 0 all of them (it also takes the
+        single-engine fallback), worker e only lane e (column split)."""
+        lanes, _ = self._prefix_mlp_lanes()
+        return range(lanes) if e == 0 else [e]
+
+    def _prefix_st_program_bytes(self):
+        """Estimated Strassen program bytes of the busiest WORKER's prefix program."""
+        plan = self._prefix_st_plan()
+        ne = self._num_engines("PREFIX")
+        per = [sum(self.PREFIX_ST_PROGRAM_BYTES[L] for _, _, L in self._prefix_st_shapes(plan, [e]))
+               for e in range(1, min(ne, len(plan)))]
+        return self.NUM_LAYERS * max(per, default=0)
+
+    def _tensor_init_prefix_strassen(self):
+        """Per-engine Strassen sum buffers + zero-filled scratch for the prefix MLP
+        (see PREFIX_STRASSEN_LEVEL). Allocated LAST in tensor_init, so nothing else
+        moves, and run by the bin replay too (same tensor_init), so the scratch is
+        zeroed there as well. Nothing is allocated when the plan has no Strassen."""
+        bpe = 2
+        plan = self._prefix_st_plan()
+        self.PREFIX_ST_PLAN_RESOLVED = plan
+        self.PREFIX_ST_ROWS = self._prefix_st_max_rows()
+        self.PREFIX_ST_SUMS, self.PREFIX_ST_SCRATCH = [], []
+        self.PREFIX_ST_CELL = []
+        if not any(any(p.values()) for p in plan):
+            return
+        M = self.PREFIX_ST_ROWS
+        zeros = torch.zeros(self.DMA_CHUNK_BYTES // bpe, dtype=torch.bfloat16)
+        sum_bytes = scr_bytes = 0
+        for e in range(max(1, self._num_engines("PREFIX"))):
+            uses = self._prefix_st_shapes(plan, self._prefix_st_engine_lanes(e)) if e < len(plan) else []
+            if not uses:
+                self.PREFIX_ST_SUMS.append(None)
+                self.PREFIX_ST_SCRATCH.append(None)
+                self.PREFIX_ST_CELL.append(0)
+                continue
+            cell = max((N >> L) * (K >> L) for K, N, L in uses)
+            count = max(strassen_online_sum_count(L) for _, _, L in uses)
+            sums = [self.allocate_tensor_dram(cell * bpe, align_bytes=128) for _ in range(count)]
+            scratch = []
+            for d in range(max(L for _, _, L in uses)):
+                el = [strassen_scratch_elements(M, K, N, L)[d] for K, N, L in uses if L > d]
+                x = self.allocate_tensor_dram(max(a for a, _ in el) * bpe, align_bytes=128)
+                p = self.allocate_tensor_dram(max(b for _, b in el) * bpe, align_bytes=128)
+                scratch.append((x, p))
+                for addr, n in ((x, max(a for a, _ in el) * bpe), (p, max(b for _, b in el) * bpe)):
+                    for off in range(0, n, self.DMA_CHUNK_BYTES):   # fresh DRAM holds NaN patterns
+                        self._dma_write_retry(DMA_DEVICE_H2C, addr + off, zeros, min(self.DMA_CHUNK_BYTES, n - off))
+                    scr_bytes += n
+            sum_bytes += count * cell * bpe
+            self.PREFIX_ST_SUMS.append(sums)
+            self.PREFIX_ST_SCRATCH.append(scratch)
+            self.PREFIX_ST_CELL.append(cell)
+        print(f"    prefix MLP Strassen: levels {plan}; {sum_bytes / (1 << 20):.1f} MB sum buffers + "
+              f"{scr_bytes / (1 << 20):.1f} MB scratch (tensor DRAM, {M} rows), "
+              f"~{self._prefix_st_program_bytes() / (1 << 20):.1f} MB more worker program (estimate)")
+
+    def _prefix_mlp_mm(self, ue, engine_idx, la, proj, M, K, N, A, OUT, gpr_M_reg, gelu=False):
+        """One prefix MLP lane matmul: Strassen when weight_init stored it as cells
+        (la["st_" + proj]), else the plain IF4 matmul. EVERY prefix Strassen call goes
+        through here. A and OUT are contiguous [M, K] / [M, N] blocks (lane-private
+        gate/up/mult buffers, a row block of the down partial)."""
+        st = la.get(f"st_{proj}")
+        if st is None:
+            kw = {"gelu_enable": True} if gelu else {}
+            return self._matmul(M=M, K=K, N=N, A=A, proj=proj, la=la, OUT=OUT,
+                                gpr_M_reg=gpr_M_reg, ue=ue, **kw)
+        L = st["L"]
+        assert (st["K"], st["N"]) == (K, N), f"{proj}: cells are {st['N']} x {st['K']}, call wants {N} x {K}"
+        assert M % (1 << L) == 0 and M <= self.PREFIX_ST_ROWS, (
+            f"{proj}: Strassen level {L} on {M} rows (scratch holds {self.PREFIX_ST_ROWS}, rows must be a "
+            f"multiple of {1 << L})")
+        sums, scratch = self.PREFIX_ST_SUMS[engine_idx], self.PREFIX_ST_SCRATCH[engine_idx]
+        n, k = N >> L, K >> L
+        assert sums is not None and len(sums) >= strassen_online_sum_count(L) and len(scratch) >= L \
+            and n * k <= self.PREFIX_ST_CELL[engine_idx], f"{proj}: engine {engine_idx} has no room for level {L}"
+        sums = sums[:strassen_online_sum_count(L)]
+        strassen_online_sums_core(ue, st["cells"], n, k, sums, L)
+        strassen_matmul_core_dram(ue, M, K, N, A, strassen_online_tree(st["cells"], sums, L), OUT, scratch[:L],
+                                  activation={"gelu_enable": True} if gelu else None,
+                                  identity_addr=self.identity_addr if gelu else None)
+
     def _num_engines(self, stage="VIS"):
         override = getattr(self, f"{stage}_NUM_ENGINES", None)
         return int(override if override is not None else self.NUM_ENGINES)
@@ -2741,7 +2938,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # o proj, gated MLP) -- not attention, adaRMS, or the eltwise residuals --
         # so it is a small fraction of the primary's 12.15 MB. Estimated, and
         # _assert_worker_programs_fit is the exact check at compile time.
-        est = {"VIS": 6 << 20, "PREFIX": 14 << 20, "DENOISE": 4 << 20}
+        est = {"VIS": 6 << 20, "PREFIX": (14 << 20) + self._prefix_st_program_bytes(), "DENOISE": 4 << 20}
         sharded = [s for s in ("VIS", "PREFIX", "DENOISE") if self._num_engines(s) > 1]
         need = self.VIS_WORKER_PROGRAM_OFFSET + sum(est[s] for s in sharded)
         assert per >= need, (
@@ -3000,7 +3197,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                        - self.VIS_WEIGHT_COPY_PARAMS_MARGIN)
         # <=3 workers keep the fixed 48 MB arena layout (no resize), so hold that
         # back per worker instead of the smaller resized floor.
-        arena_floor = max(self.VIS_WEIGHT_COPY_ARENA_FLOOR,
+        arena_floor = max(self.VIS_WEIGHT_COPY_ARENA_FLOOR + self._prefix_st_program_bytes(),
                           self.VIS_WORKER_ARENA_BYTES if workers <= 3 else 0)
         tensor_free = (self._program_dram_base - self._tensor_dram_addr
                        - self.VIS_WORKER_AE_TENSOR_RESERVE
@@ -7752,6 +7949,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             "prefix_seq_len": int(self.PREFIX_SEQ_LEN),
             "denoise_steps": int(self.AE_NUM_DENOISE_STEPS),
             "keep_masked_slots": bool(self.KEEP_MASKED_SLOTS),
+            # Prefix MLP Strassen: changes the params layout (cells), the tensor layout
+            # (sum buffers + scratch) and the prefix program.
+            "prefix_strassen_level": int(self.PREFIX_STRASSEN_LEVEL),
             "vis_layout": self.VIS_LAYOUT,
             # Rendezvous shape baked into the multi-engine programs (see
             # multi_engine_shard.RENDEZVOUS_SIG): a set without it carries the removed
@@ -8053,6 +8253,9 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         self._sig_check("keep_masked_slots", bool(self.KEEP_MASKED_SLOTS),
                         bool(self.sig["keep_masked_slots"]),
                         "toggle --keep-masked-slots to match, or regenerate the bins")
+        self._sig_check("prefix_strassen_level", int(self.PREFIX_STRASSEN_LEVEL),
+                        int(self.sig.get("prefix_strassen_level", 0)),
+                        "pass --strassen-level to match, or regenerate the bins")
         self._sig_check("rendezvous", _mes_rendezvous_sig(), self.sig.get("rendezvous"),
                         "the bins carry the removed symmetric barrier; regenerate them")
         self._sig_check("vis_layout", self.VIS_LAYOUT, self.sig.get("vis_layout"),
@@ -8629,13 +8832,14 @@ def _mes_rendezvous_sig():
     return multi_engine_shard.RENDEZVOUS_SIG
 
 
-def _bins_rendezvous(meta_path):
-    """The rendezvous a dumped programs json was compiled with (None if absent)."""
+def _bins_rendezvous(meta_path, key="rendezvous", default=None):
+    """The rendezvous (or another sig `key`) a dumped programs json was compiled
+    with (`default` if absent)."""
     try:
         with open(meta_path) as f:
-            return json.load(f).get("sig", {}).get("rendezvous")
+            return json.load(f).get("sig", {}).get(key, default)
     except (OSError, ValueError):
-        return None
+        return default
 
 
 def main():
@@ -8835,7 +9039,13 @@ def main():
                           "IMAGE SLOT, which is exactly 4 blocks of 64, so 64-row alignment "
                           "makes 8 impossible (split_rows asserts). At 4 it is a perfect even "
                           "split -- 64 rows each, 100%% balanced.")
-    ap.add_argument("--cond-table-on-device", action=argparse.BooleanOptionalAction, default=True,
+    ap.add_argument("--strassen-level", type=int, choices=(0, 1, 2), default=None,
+                     help="Highest Strassen level for the PREFIX MLP lane matmuls (nn_lib section "
+                          "10, online leaves; see PREFIX_STRASSEN_LEVEL for the per-engine-count "
+                          "levels). Default 2 (on). 0 = plain kernel everywhere, for A/B timing. "
+                          "Must be set before weight_init: the lane weights are stored as "
+                          "Strassen cells there.")
+    ap.add_argument("--cond-table-on-device",action=argparse.BooleanOptionalAction, default=True,
                      help="Run the action-expert timestep-embedding MLP (2x 1024x1024 IF4 "
                           "matmul + 2x composed SiLU) on the accelerator (default). "
                           "--no-cond-table-on-device falls back to the host constant-fold.")
@@ -8916,6 +9126,11 @@ def main():
         Pi05Libero_UnifiedEngine.VIS_WEIGHT_COPIES = "auto" if _v == "auto" else int(_v)
         print(f"[main] vision weight sets: {Pi05Libero_UnifiedEngine.VIS_WEIGHT_COPIES}")
 
+    if args.strassen_level is not None:
+        Pi05Libero_UnifiedEngine.PREFIX_STRASSEN_LEVEL = args.strassen_level
+    print(f"[main] prefix MLP Strassen: max level {Pi05Libero_UnifiedEngine.PREFIX_STRASSEN_LEVEL}"
+          f"{' (off)' if not Pi05Libero_UnifiedEngine.PREFIX_STRASSEN_LEVEL else ''}")
+
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
 
     if args.steps is not None:
@@ -8994,6 +9209,11 @@ def main():
         if _bins_rendezvous(os.path.join(BIN_DIR, _stem + ".json")) != _mes_rendezvous_sig():
             print(f"[main] ERROR: --run-from-bin but {_stem} predates the master/worker "
                   f"rendezvous (run once without --run-from-bin to recompile)")
+            sys.exit(2)
+        if _bins_rendezvous(os.path.join(BIN_DIR, _stem + ".json"), "prefix_strassen_level", 0) \
+                != int(Pi05Libero_UnifiedEngine.PREFIX_STRASSEN_LEVEL):
+            print(f"[main] ERROR: --run-from-bin but {_stem} was compiled with another "
+                  f"--strassen-level (run once without --run-from-bin to recompile)")
             sys.exit(2)
         bins_exist = True
 

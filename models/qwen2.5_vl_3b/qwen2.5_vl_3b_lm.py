@@ -35,8 +35,59 @@ import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
     ue_35bit_addr_shifter)
+from nn_lib import (
+    URAM_A_BASE, strassen_if4_slab_cells, strassen_matmul_core_dram,
+    strassen_online_sum_count, strassen_online_sums_core, strassen_online_tree,
+    strassen_scratch_elements)
 
 LM_QUANT_PRECISION = "if4"
+
+# STRASSEN PREFILL MLP (nn_lib section 10, online leaves, level 1). Switch:
+# ``strassen_mlp`` on the engine (--no-strassen turns it off; off = today's code
+# and weight layout exactly). With it on, gate/up are stored ONCE as two
+# input-column slabs [MLP, H/2] (strassen_if4_slab_cells); every plain reader
+# (decode, a short prefill) runs one matmul per slab chained through the
+# full-matrix bias. A prefill program with >= ST_MIN_ROWS rows runs gate/up as
+# ST_LANES output-column lanes of all rows each (one lane per engine at 8), each
+# lane a Strassen call.
+# DOWN (multi-engine only): the same lanes are its input-column (K) lanes, so
+# each engine feeds its own SiLU(gate) * up block straight into a Strassen down
+# of [rows, lane] x [lane, H] -> a full-width partial, and reduce_add sums the
+# engines' partials. down is loaded in today's layout (decode's private column
+# shards are copied out of it), then rewritten in place, once, before the first
+# Strassen prefill runs, as 2 input-column slabs per lane (_st_relayout_down):
+# decode never reads the shared image at multi-core, so it keeps one GEMV per
+# engine. A plain prefill cannot read the rewritten image (it refuses).
+ST_LEVEL = 1
+ST_MIN_ROWS = 128           # rows per call below which Strassen loses (measured rule)
+ST_LANES = 8                # MLP 11008 = 86 x 128: 6 lanes of 1408 + 2 of 1280
+# Program space a Strassen prefill must leave for the decoder compiled after it
+# (one-engine master, multi-engine master, each worker; twice that with
+# --profile). Past it the prefill is recompiled with less Strassen. The
+# one-engine decoder was 7.5 MiB; at 8 engines the master decoder is 0.98 MiB
+# and a worker's 0.25-0.39 MiB (board log), so a worker keeps 1 MiB.
+ST_DECODER_ISA_RESERVE = (10 << 20, 5 << 20, 1 << 20)
+
+
+class _SlabChain:
+    """Decode column shards of a weight stored as input-column slabs: one
+    ShardedWeight per slab, all with the same column split. Looks like the
+    first slab's ShardedWeight to the round bookkeeping (shards, K = all of K)."""
+
+    def __init__(self, slabs, tmp_base):
+        self.slabs, self.tmp_base = list(slabs), tmp_base
+        self.shards = self.slabs[0].shards
+        self.K = sum(s.K for s in self.slabs)
+        self.N = self.slabs[0].N
+        self.data_type = self.slabs[0].data_type
+
+    def shard(self, e):
+        return self.slabs[0].shard(e)
+
+    def shard_or_none(self, e):
+        return self.slabs[0].shard_or_none(e)
+
+
 def _weight_gen():
     """The sibling weight-bin generator, loaded by path ("2.5" is not an
     identifier). Imported lazily: it pulls in transformers and huggingface_hub,
@@ -257,6 +308,317 @@ class Qwen25VLLMMixin:
             f"{K // lanes} across {len(self.lm_layer_addrs)} layers "
             f"({time.perf_counter() - t0:.1f}s)")
 
+    # ---- Strassen prefill MLP (see ST_LEVEL at the top) -----------------------
+
+    strassen_mlp = True     # the switch; read once, by lm_weight_init
+
+    def _st_wanted(self) -> bool:
+        """Whether lm_weight_init stores gate/up as Strassen slabs."""
+        q = self._lm_quantized_projections()
+        d = self._lm_dims()
+        return (bool(getattr(self, "strassen_mlp", False))
+                and {"gate", "up"} <= q
+                and not any(self._lm_projection_is_private(t) for t in ("gate", "up"))
+                and not self._prefill_mlp_tp_engines()
+                and self._prefill_mlp_k_lanes() == 1
+                and d["MLP"] % 128 == 0 and d["H"] % 128 == 0
+                and min(w for _, w in self._st_lane_plan()) >= 1024)
+
+    def _st_down_wanted(self) -> bool:
+        """Whether down also goes through Strassen (as K lanes; see ST_LEVEL).
+        Multi-engine only: there decode reads its own private column shards,
+        never the shared down image that _st_relayout_down rewrites."""
+        return (getattr(self, "_st_layout", False)
+                and getattr(self, "multi_core", 1) > 1
+                and "down" in self._lm_quantized_projections()
+                and self._decode_projection_is_quantized("down")
+                and not self._lm_projection_is_private("down"))
+
+    def _st_down_cells(self, la: dict, r0: int, nl: int) -> dict:
+        """The level-1 cells of down's K lane [r0, r0 + nl) after
+        _st_relayout_down: the lane is 2 slabs [H, nl / 2] (K order, end to
+        end over the original allocation), a cell a row range of one."""
+        H = self._lm_dims()["H"]
+        w, n = nl >> ST_LEVEL, H >> ST_LEVEL
+        cells = {}
+        for j in range(1 << ST_LEVEL):
+            c0 = r0 + j * w                     # the slab's first input column
+            for i in range(1 << ST_LEVEL):
+                cells[(i, j)] = (la["down_data"] + H * c0 // 2 + i * n * w // 2,
+                                 la["down_scale"] + H * (c0 // UE_VECTOR_SIZE) * 2
+                                 + i * n * (w // UE_VECTOR_SIZE) * 2)
+        return cells
+
+    def _st_down_part(self, lane: int) -> int:
+        """Lane `lane`'s full-width [rows, H] down partial (shared tensor region)."""
+        return (self.LM_ST_DOWN_PARTS
+                + lane * self.PREFILL_MAX_SEQ_LEN * self._lm_dims()["H"] * self.bytes_per_element)
+
+    def _st_relayout_down(self) -> None:
+        """Rewrite every layer's down image in place as the Strassen K-lane
+        slabs _st_down_cells reads: lane by lane, 2 input-column slabs
+        [H, lane / 2] each, end to end (same bytes, same allocations). The
+        bytes come from params.bin again, not back from the card.
+
+        ONE WAY, like repack_down_to_k_lanes: decode's private column shards
+        must already be copied out of the full-width image (compile_decoder),
+        and every decode layer must read down from them, never from here."""
+        if getattr(self, "_st_down_packed", False):
+            return
+        d = self._lm_dims()
+        H, MLP = d["H"], d["MLP"]
+        shards = getattr(self, "_decode_shards", None) or {}
+        missing = [li for li in range(len(self.lm_layer_addrs)) if shards.get(("down", li)) is None]
+        if missing:
+            raise RuntimeError(
+                f"Strassen down: decode has no private down shard for layer(s) {missing[:4]}..., "
+                f"so it would read the shared image this rewrites; compile the decoder first "
+                f"or run with --no-strassen")
+        cuts = [(r0 + j * (nl >> ST_LEVEL), nl >> ST_LEVEL)
+                for r0, nl in self._st_lane_plan() for j in range(1 << ST_LEVEL)]
+        n_blocks = H * MLP // UE_VECTOR_SIZE
+        t0 = time.perf_counter()
+        bin_path, base, sections = self._st_down_src
+        with open(bin_path, "rb") as f:
+            for la, sec in zip(self.lm_layer_addrs, sections):
+                f.seek(base + sec["offset"])
+                blob = f.read(sec["size"])
+                if len(blob) != n_blocks * 34:  # 2 scale + 32 data bytes per 64 weights
+                    raise ValueError(f"down relayout: {len(blob)} bytes, expected an IF4 [{H}, {MLP}]")
+                # scales: 2 bytes per 64 columns (1 per 32); data: 1 byte per 2 columns
+                for addr, raw, per in ((la["down_scale"], blob[:n_blocks * 2], 32),
+                                       (la["down_data"], blob[n_blocks * 2:], 2)):
+                    plane = np.frombuffer(raw, dtype=np.uint8).reshape(H, MLP // per)
+                    packed = b"".join(np.ascontiguousarray(plane[:, c0 // per:(c0 + w) // per]).tobytes()
+                                      for c0, w in cuts)
+                    written = self.dma_write(DMA_DEVICE_H2C, addr, packed, len(packed))
+                    if written != len(packed):
+                        raise IOError(f"down relayout wrote {written} of {len(packed)} bytes")
+        self._st_down_packed = True
+        self._loud(f"  [LM] down rewritten as {len(cuts)} Strassen K-lane slabs "
+                   f"({[w for _, w in cuts][:2]}...) across {len(self.lm_layer_addrs)} layers "
+                   f"({time.perf_counter() - t0:.1f}s)")
+
+    def _st_lane_plan(self) -> list:
+        """[(first output column, width)] of the gate/up lanes: whole 128-column
+        blocks (a level-1 half stays whole 64-lane blocks), widest first."""
+        blocks = self._lm_dims()["MLP"] // 128
+        widths = [128 * (blocks // ST_LANES + (i < blocks % ST_LANES))
+                  for i in range(ST_LANES)]
+        return [(sum(widths[:i]), w) for i, w in enumerate(widths)]
+
+    def _st_rows_cap(self) -> int:
+        """Most rows a Strassen call may take: what the scratch is sized for."""
+        return self.PREFILL_MAX_SEQ_LEN & ~((1 << ST_LEVEL) - 1)
+
+    def _dma_if4_slabs(self, f, section: dict, base_offset: int, what: str,
+                       N: int, K: int) -> list:
+        """One IF4 [N, K] weight from params.bin stored as 2^ST_LEVEL
+        input-column slabs [N, K / 2^ST_LEVEL] (same bytes, nothing
+        re-quantized). -> [(data_addr, scale_addr)] per slab."""
+        f.seek(base_offset + section["offset"])
+        blob = f.read(section["size"])
+        n_blocks = N * K // UE_VECTOR_SIZE
+        if len(blob) != n_blocks * 34:          # 2 scale + 32 data bytes per 64 weights
+            raise ValueError(f"{what}: {len(blob)} bytes, expected an IF4 [{N}, {K}] "
+                             f"({n_blocks * 34} bytes)")
+
+        def store_pack(data, scales, n, k, _t):
+            s_addr = self.allocate_params_dram(len(scales), label=f"{what}.scale", align_bytes=128)
+            d_addr = self.allocate_params_dram(len(data), label=f"{what}.data", align_bytes=128)
+            for addr, payload in ((s_addr, scales), (d_addr, data)):
+                written = self.dma_write(DMA_DEVICE_H2C, addr, payload, len(payload))
+                if written != len(payload):
+                    raise IOError(f"{what}: params DMA wrote {written} of {len(payload)} bytes")
+            return d_addr, s_addr
+
+        slabs, _ = strassen_if4_slab_cells(blob[n_blocks * 2:], blob[:n_blocks * 2], N, K,
+                                           ST_LEVEL, store_pack)
+        return slabs
+
+    def _st_cells(self, la: dict, tag: str, r0: int, nl: int) -> dict:
+        """The level-1 cells of lane rows [r0, r0 + nl) of gate/up: row ranges
+        of its slabs. {(N half, K half): (data_addr, scale_addr)}."""
+        slabs = la[f"{tag}_slabs"]
+        k = self._lm_dims()["H"] // len(slabs)
+        n = nl >> ST_LEVEL
+        return {(i, j): (slabs[j][0] + (r0 + i * n) * (k // 2),
+                         slabs[j][1] + (r0 + i * n) * (k // UE_VECTOR_SIZE) * 2)
+                for i in range(1 << ST_LEVEL) for j in range(len(slabs))}
+
+    def _st_matmul(self, ue, M: int, K: int, N: int, A: int, cells: dict, OUT: int,
+                   buf: dict, activation=None) -> int:
+        """EVERY Strassen call of this port goes through here: the weight sums
+        of this call into the engine's sum set not used by its previous call,
+        then strassen_matmul_core_dram. Returns the FLOPs of the plain matmul."""
+        assert M % (1 << ST_LEVEL) == 0 and M <= buf["rows"], \
+            f"Strassen call of {M} rows; the scratch holds {buf['rows']} (even counts only)"
+        sums = buf["sums"][buf["turn"] % 2]
+        buf["turn"] += 1
+        n, k = N >> ST_LEVEL, K >> ST_LEVEL
+        strassen_online_sums_core(ue, cells, n, k, sums, ST_LEVEL)
+        strassen_matmul_core_dram(ue, M, K, N, A, strassen_online_tree(cells, sums, ST_LEVEL),
+                                  OUT, buf["scratch"], activation=activation,
+                                  identity_addr=self.LM_IDENTITY if activation else None)
+        return 2 * M * K * N
+
+    @staticmethod
+    def _st_copy_rows(ue, src: int, src_pitch: int, dst: int, dst_pitch: int,
+                      rows: int, cols: int, hop: int = 131072) -> None:
+        """`cols` lanes of each of `rows` rows from src (row pitch src_pitch) to
+        dst (row pitch dst_pitch), through URAM. A strided write must cover
+        whole 128-byte lines (a mid-line chunk corrupts or hangs)."""
+        if dst_pitch != cols:
+            assert dst % 128 == 0 and (cols * 2) % 128 == 0 and (dst_pitch * 2) % 128 == 0, \
+                f"strided write not line-aligned: 0x{dst:X}, {cols} lanes at pitch {dst_pitch}"
+        step = max(1, hop // cols)
+        for r0 in range(0, rows, step):
+            take = min(step, rows - r0)
+            rd = (dict(stride_bytes_per_chunk=cols * 2, stride_jump_bytes=src_pitch * 2)
+                  if take > 1 and src_pitch != cols else {})
+            wr = (dict(stride_bytes_per_chunk=cols * 2, stride_jump_bytes=dst_pitch * 2)
+                  if take > 1 and dst_pitch != cols else {})
+            ue.accelerator_memory_to_sram(accelerator_dram_address=src + r0 * src_pitch * 2,
+                                          sram_address=URAM_A_BASE, element_size=take * cols, **rd)
+            ue.sram_to_accelerator_memory(sram_address=URAM_A_BASE,
+                                          accelerator_dram_address=dst + r0 * dst_pitch * 2,
+                                          element_size=take * cols, **wr)
+
+    def _st_tmp(self, tag: str) -> int:
+        """Where a slab chain keeps its running sum: a buffer dead at that point
+        (gate: UP, written only after it; up: MULT, written only after it)."""
+        return self.LM_MLP_UP if tag == "gate" else self.LM_MLP_MULT
+
+    def _slab_mm(self, ue, tag: str, la: dict, n: int, A: int, OUT: int, TMP: int,
+                 m_reg: int, silu: bool, xh=None) -> int:
+        """Plain gate/up on the slab layout: one matmul per input-column slab,
+        each taking the sum so far as a full-matrix bias (ping-pong between
+        TMP and OUT, ending in OUT); SiLU goes on the last. xh None: decode
+        (one row, so slab j's input is a contiguous run of A). Else the
+        per-slab inputs, gathered contiguous [n, K / slabs] (_st_gather)."""
+        d = self._lm_dims()
+        slabs = la[f"{tag}_slabs"]
+        g, k = len(slabs), d["H"] // len(slabs)
+        bpe = self.bytes_per_element
+        flops = 0
+        for j, (wd, ws) in enumerate(slabs):
+            dst, prev = (OUT, TMP) if (g - 1 - j) % 2 == 0 else (TMP, OUT)
+            kw = dict(M=n, K=k, N=d["MLP"], B_DRAM_ADDR=wd, SCALE_DRAM_ADDR=ws,
+                      data_type=TYPE.IF4, OUTPUT_DRAM_ADDR=dst)
+            if j:
+                kw.update(C_DRAM_ADDR=prev, bias_mode="full_matrix")
+            if silu and j == g - 1:
+                kw.update(silu_enable=True)
+            if xh is None:
+                flops += ue.quantized_matmat_core(A_DRAM_ADDR=A + j * k * bpe, **kw) or 0
+            else:
+                flops += ue.matmat_mul_core(A_DRAM_ADDR=xh[j], is_B_quantized=True,
+                                            gpr_M_reg=m_reg, **kw) or 0
+        return flops
+
+    def _st_gather(self, ue, A: int, rows: int, r0: int, M: int) -> list:
+        """Rows [r0, r0 + rows) of the [M, H] MLP input split into its slabs'
+        column ranges, each contiguous, in the (dead at MLP time) PRE_NORM
+        plane. -> the per-slab input addresses of those rows."""
+        H = self._lm_dims()["H"]
+        g = 1 << ST_LEVEL
+        k, bpe = H // g, self.bytes_per_element
+        xh = [self.LM_PRE_NORM + (j * M + r0) * k * bpe for j in range(g)]
+        for j in range(g):
+            self._st_copy_rows(ue, A + j * k * bpe, H, xh[j], k, rows, k)
+        return xh
+
+    def _st_mlp_lanes(self, ue, e: int, ne: int, la: dict, M: int, m_reg: int,
+                      down: bool = False) -> int:
+        """Engine e's gate/up lanes (e, e + ne, ...) over all M rows: per lane
+        gate (SiLU fused) and up by Strassen into contiguous [M, width] blocks
+        of GATE / UP, their product in place, then scattered into its columns
+        of the row-major [M, MLP] MULT that down reads. m_reg must hold M.
+        down: instead of the scatter, the lane's block is the input of down's
+        K lane (Strassen) -> a full-width partial; the engine's lanes are
+        summed into the partial of its first lane, e (reduce_add takes it)."""
+        d = self._lm_dims()
+        H, MLP = d["H"], d["MLP"]
+        bpe = self.bytes_per_element
+        buf = self._st_buf[e]
+        flops = 0
+        for t, (r0, nl) in enumerate(self._st_lane_plan()[e::ne]):
+            g_out = self.LM_MLP_GATE + M * r0 * bpe
+            u_out = self.LM_MLP_UP + M * r0 * bpe
+            flops += self._st_matmul(ue, M, H, nl, self.LM_MLP_NORM, self._st_cells(la, "gate", r0, nl),
+                                     g_out, buf, activation={"silu_enable": True})
+            flops += self._st_matmul(ue, M, H, nl, self.LM_MLP_NORM, self._st_cells(la, "up", r0, nl),
+                                     u_out, buf)
+            flops += ue.eltwise_core_dram(M=M, N=nl, dram_a=g_out, dram_b=u_out, dram_out=g_out,
+                                          mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m_reg) or 0
+            if not down:
+                self._st_copy_rows(ue, g_out, nl, self.LM_MLP_MULT + r0 * bpe, MLP, M, nl)
+                continue
+            lane = e + t * ne
+            flops += self._st_matmul(ue, M, nl, H, g_out, self._st_down_cells(la, r0, nl),
+                                     self._st_down_part(lane), buf)
+            if t:
+                flops += ue.eltwise_core_dram(M=M, N=H, dram_a=self._st_down_part(e),
+                                              dram_b=self._st_down_part(lane),
+                                              dram_out=self._st_down_part(e),
+                                              mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m_reg) or 0
+        return flops
+
+    def _st_alloc_buffers(self) -> None:
+        """Per engine: two sets of on-chip weight-sum buffers (fp16, a lane
+        cell each) and the Strassen scratch for _st_rows_cap rows, zero-filled.
+        One engine: in the tensor region. More: in each engine's private
+        weight arena (the shared tensor region has no room for eight)."""
+        d = self._lm_dims()
+        H, bpe = d["H"], self.bytes_per_element
+        # (K, N) of every Strassen call: gate/up lanes, and down's K lanes
+        down = getattr(self, "_st_down_layout", False)
+        shapes = [(H, w) for _, w in self._st_lane_plan()]
+        shapes += [(w, H) for _, w in self._st_lane_plan()] if down else []
+        cell = max((k >> ST_LEVEL) * (n >> ST_LEVEL) for k, n in shapes)
+        rows = self._st_rows_cap()
+        scr = [tuple(max(v) for v in zip(*(strassen_scratch_elements(rows, k, n, ST_LEVEL)[dd]
+                                            for k, n in shapes)))
+               for dd in range(ST_LEVEL)]
+        rnd = lambda elems: (elems * bpe + 127) & ~127
+        nsum = strassen_online_sum_count(ST_LEVEL)
+        total = 2 * nsum * rnd(cell) + sum(rnd(x) + rnd(p) for x, p in scr)
+        ne = max(1, getattr(self, "multi_core", 1))
+        # The tensor region is re-carved on every lm_tensor_init; the private
+        # arenas are bump-allocated for the run, so a second call reuses them.
+        old = getattr(self, "_st_buf", None) if ne > 1 else None
+        assert not old or self._st_bytes == total, "Strassen buffers changed size between calls"
+        self._st_buf = []
+        for e in range(ne):
+            if ne == 1:
+                at = self.allocate_tensor_dram(total, label="lm.strassen", align_bytes=128)
+            elif old:
+                at = old[e]["base"]
+            else:
+                at = (self.mc_arena.alloc_weights(e, total + 128, "lm strassen sums + scratch") + 127) & ~127
+            base = at
+            sums = []
+            for _ in range(2):
+                sums.append([at + i * rnd(cell) for i in range(nsum)])
+                at += nsum * rnd(cell)
+            scratch, zero = [], []
+            for x, p in scr:
+                scratch.append((at, at + rnd(x)))
+                zero += [(at, x), (at + rnd(x), p)]
+                at += rnd(x) + rnd(p)
+            self._st_buf.append(dict(sums=sums, scratch=scratch, rows=rows, turn=0, zero=zero, base=base))
+        self._st_bytes = total
+        self._loud(f"  [LM] Strassen MLP buffers: {total / 2**20:.1f} MiB per engine x {ne} "
+                   f"({'tensor region' if ne == 1 else 'private weight arenas'}), "
+                   f"lanes {[w for _, w in self._st_lane_plan()]}, up to {rows} rows"
+                   f"{', gate/up + down' if down else ''}")
+
+    def _st_zero_scratch(self) -> None:
+        """Strassen scratch must start finite: fresh DRAM is the 0xFF NaN fill."""
+        for buf in getattr(self, "_st_buf", []):
+            for addr, n in buf["zero"]:
+                self.dma_to_accelerator_memory(addr, torch.zeros(n, dtype=torch.bfloat16))
+
     def _lm_dims(self) -> dict:
         fi = self._cfg["file_info"]
         qh = fi["num_kv_heads"] * fi["group_size"]
@@ -322,6 +684,22 @@ class Qwen25VLLMMixin:
                 raise KeyError(f"LM weight {k!r} missing from params.bin")
             return sec[k]
 
+        # Strassen on: gate/up go in as input-column slabs (la["<tag>_slabs"]),
+        # and la has no "<tag>_data" / "<tag>_scale" for them, so a reader that
+        # does not know the layout fails loudly instead of reading wrong bytes.
+        self._st_layout = self._st_wanted()
+        if self._st_layout:
+            self._loud(f"  [LM] gate/up stored as {1 << ST_LEVEL} input-column slabs "
+                       f"(Strassen prefill MLP; --no-strassen keeps the full-width layout)")
+        # Strassen down: loaded full width as always (128-byte aligned), and
+        # where in params.bin each layer's bytes are, for _st_relayout_down.
+        self._st_down_layout = self._st_down_wanted()
+        self._st_down_packed = False
+        self._st_down_src = (region["bin_path"], region["base_offset"], [])
+        if self._st_down_layout:
+            self._loud("  [LM] down: Strassen K lanes in a Strassen prefill (rewritten in place "
+                       "after the decode shards are copied)")
+
         with open(region["bin_path"], "rb") as f:
             base = region["base_offset"]
             self.lm_layer_addrs = []
@@ -342,7 +720,14 @@ class Qwen25VLLMMixin:
                         self._stage_private_lm_projection(
                             f, need(f"{pre}.{key}.weight.{sfx}"), base, la,
                             tag, i, f"{pre}.{key}")
+                    elif self._st_layout and tag in ("gate", "up"):
+                        la[f"{tag}_slabs"] = self._dma_if4_slabs(
+                            f, need(f"{pre}.{key}.weight.{sfx}"), base,
+                            f"{pre}.{key}", d["MLP"], d["H"])
                     elif tag in quantized:
+                        if self._st_down_layout and tag == "down":
+                            self.allocate_params_dram(0, align_bytes=128)   # aligns the cursor only
+                            self._st_down_src[2].append(need(f"{pre}.{key}.weight.{sfx}"))
                         la[f"{tag}_scale"], la[f"{tag}_data"] = self._dma_if4(
                             f, need(f"{pre}.{key}.weight.{sfx}"), base,
                             f"{pre}.{key}")
@@ -682,7 +1067,13 @@ class Qwen25VLLMMixin:
         bpe = self.bytes_per_element
         self.reset_tensor_dram_addr()
 
+        st = getattr(self, "_st_layout", False)
+
         def alloc(n, what):
+            # Strassen on: whole 128-byte lines everywhere (its outputs and the
+            # lane scatter into MULT are strided writes); off: today's map.
+            if st:
+                return self.allocate_tensor_dram(n * bpe, label=what, align_bytes=128)
             return self.allocate_tensor_dram(n * bpe, label=what)
 
         # Double-buffered layer I/O: layer li reads A and writes B when li is
@@ -846,6 +1237,11 @@ class Qwen25VLLMMixin:
         self.KV_STRIDE_LAYER = KVH * self.KV_STRIDE_HEAD
         self.LM_K_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.k_cache")
         self.LM_V_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.v_cache")
+        if st:
+            if getattr(self, "_st_down_layout", False):
+                # One full-width down partial per lane (reduce_add's inputs).
+                self.LM_ST_DOWN_PARTS = alloc(ST_LANES * P * H, "lm.strassen_down_parts")
+            self._st_alloc_buffers()
 
         end = self.get_tensor_dram_addr()
         if end > self.TENSOR_LIMIT:
@@ -859,6 +1255,8 @@ class Qwen25VLLMMixin:
             self.LM_IDENTITY, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
         self.dma_to_accelerator_memory(
             self.PENALTY_BIAS, torch.zeros(d["VOCAB"], dtype=torch.bfloat16))
+        if st:
+            self._st_zero_scratch()
         self._loud(f"  [LM] tensors: {self.get_tensor_dram_usage() / 2**20:.1f} MiB "
                    f"(KV {2 * NL * KVH * aligned_C * AHD * bpe / 2**20:.1f} MiB "
                    f"at logical ctx {C}, padded capacity {aligned_C})")
@@ -907,6 +1305,10 @@ class Qwen25VLLMMixin:
             raise RuntimeError(
                 "decode shards must be built before repack_down_to_k_lanes(); "
                 "the down_proj image is now lane-major")
+        if getattr(self, "_st_down_packed", False) and getattr(self, "_decode_shards", None) is None:
+            raise RuntimeError(
+                "decode shards must be built before _st_relayout_down(); "
+                "the down_proj image is now Strassen K-lane slabs")
         missing = object()
         arena_cursors_before = list(sched.arena._weight_cursor)
         scheduler_weights_before = dict(sched._weights)
@@ -994,7 +1396,18 @@ class Qwen25VLLMMixin:
                 if n_sh < 2:
                     skipped.append((op, li))
                     continue
-                if quant:
+                if f"{op}_slabs" in la:
+                    # Strassen layout: shard each input-column slab the same
+                    # way; the engine chains its blocks of them (_emit_dec_shard).
+                    slabs = la[f"{op}_slabs"]
+                    sw = _SlabChain([
+                        sched.shard_quantized_weight(
+                            name=f"{op}_proj_L{li}_s{j}", main_weight_addr=wd,
+                            main_scale_addr=ws, K=K // len(slabs), N=N, layers=1,
+                            main_layer_stride=0, data_type=TYPE.IF4,
+                            max_engines=n_sh, verbose=False)
+                        for j, (wd, ws) in enumerate(slabs)], self._st_tmp(op))
+                elif quant:
                     sw = sched.shard_quantized_weight(
                         name=f"{op}_proj_L{li}",
                         main_weight_addr=la[f"{op}_data"],
@@ -1042,6 +1455,26 @@ class Qwen25VLLMMixin:
         # offset is a whole 128-byte SRAM row. Asserted, not assumed: a
         # misaligned writeback is finite-but-wrong data, not a fault.
         assert off % 128 == 0, f"shard output offset {off} is not a whole SRAM row"
+        if isinstance(sw, _SlabChain):
+            # One GEMV per slab block, each taking the sum so far as a
+            # full-matrix bias (ping-pong through sw.tmp_base, ending in out).
+            g, flops, k0 = len(sw.slabs), 0, 0
+            assert bias_base is None
+            for j, s in enumerate(sw.slabs):
+                shj = s.shard(e)
+                assert (shj.col_offset, shj.cols) == (sh.col_offset, sh.cols), "slab shards split differently"
+                dst, prev = ((out_base, sw.tmp_base) if (g - 1 - j) % 2 == 0
+                             else (sw.tmp_base, out_base))
+                kw = dict(M=1, K=s.K, N=shj.cols, A_DRAM_ADDR=a_addr + k0 * self.bytes_per_element,
+                          B_DRAM_ADDR=shj.weight_addr, SCALE_DRAM_ADDR=shj.scale_addr,
+                          data_type=TYPE.IF4, OUTPUT_DRAM_ADDR=dst + off)
+                if j:
+                    kw.update(C_DRAM_ADDR=prev + off, bias_mode="full_matrix")
+                if silu and j == g - 1:
+                    kw.update(silu_enable=True)
+                flops += ue.quantized_matmat_core(**kw) or 0
+                k0 += s.K
+            return flops
         kw = dict(M=1, K=sw.K, N=sh.cols, A_DRAM_ADDR=a_addr,
                   B_DRAM_ADDR=sh.weight_addr, OUTPUT_DRAM_ADDR=out_base + off)
         if bias_base is not None:
@@ -1356,6 +1789,10 @@ class Qwen25VLLMMixin:
             to fill and normally stays on the general kernel; compatible
             large-K models may opt a projection into the streaming path.
             """
+            if f"{tag}_slabs" in la:        # Strassen weight layout, plain program
+                xh = None if decode else self._st_gather(self, A, M, 0, M)
+                return self._slab_mm(self, tag, la, M, A, OUT, self._st_tmp(tag),
+                                     m_reg, silu, xh)
             if decode and quant:
                 return self.quantized_matmat_core(
                     M=M, K=K, N=N, A_DRAM_ADDR=A,
@@ -2059,12 +2496,17 @@ class Qwen25VLLMMixin:
                 M=M, N=H, A_DRAM_ADDR=self.LM_RESIDUAL,
                 OUTPUT_DRAM_ADDR=self.LM_MLP_NORM, GAMMA_DRAM_ADDR=la["ln2"],
                 gpr_M_reg=m_reg) or 0
-            flops += mm(H, MLP, self.LM_MLP_NORM, "gate", self.LM_MLP_GATE, silu=True)
-            flops += mm(H, MLP, self.LM_MLP_NORM, "up", self.LM_MLP_UP)
-            flops += self.eltwise_core_dram(
-                M=M, N=MLP, dram_a=self.LM_MLP_GATE, dram_b=self.LM_MLP_UP,
-                dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
-                gpr_M_reg=m_reg) or 0
+            if not decode and getattr(self, "_st_on", False):
+                # Strassen program: the gate/up lanes one after another, each
+                # leaving its product in its columns of MULT (m_reg holds M).
+                flops += self._st_mlp_lanes(self, 0, 1, la, M, m_reg)
+            else:
+                flops += mm(H, MLP, self.LM_MLP_NORM, "gate", self.LM_MLP_GATE, silu=True)
+                flops += mm(H, MLP, self.LM_MLP_NORM, "up", self.LM_MLP_UP)
+                flops += self.eltwise_core_dram(
+                    M=M, N=MLP, dram_a=self.LM_MLP_GATE, dram_b=self.LM_MLP_UP,
+                    dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
+                    gpr_M_reg=m_reg) or 0
             if self._prefill_mlp_k_lanes() > 1:
                 # The lane split lives in the sharded path only; this
                 # single-engine chain would read the repacked down_proj image
@@ -2107,6 +2549,14 @@ class Qwen25VLLMMixin:
                     out = (self.LM_MLP_GATE if step == "gate"
                            else self.LM_MLP_UP) + lane * lane_plane
                     a = ctx.rows_addr(self.LM_MLP_NORM, h_row)
+                    if f"{step}_slabs" in la:   # Strassen weight layout, plain program
+                        assert lanes == 1
+                        xh = self._st_gather(ctx.unsafe_ue, a, ctx.rows, ctx.row_offset, M)
+                        mlp_acc[0] += self._slab_mm(
+                            ctx.ue, step, la, ctx.rows, a, ctx.rows_addr(out, mlp_row),
+                            ctx.rows_addr(self._st_tmp(step), mlp_row), m,
+                            step == "gate", xh)
+                        return
                     # A K-lane of down is an N-slice of gate/up, and N slices
                     # the (N, K) weight by whole rows -- contiguous, so the
                     # lane weight is pure address arithmetic on the unsliced
@@ -2190,7 +2640,35 @@ class Qwen25VLLMMixin:
                               ("multiply", _lane), ("down", _lane)]
             mlp_steps.append("residual2")
             mlp_steps = tuple(mlp_steps)
-            if sched.host_segmented:
+            if getattr(self, "_st_on", False):
+                # Strassen program, three regions: residual + norm row-sharded
+                # (joined: every lane reads every row); gate/up as output-column
+                # lanes of ALL rows, one or more per engine, each scattering its
+                # product into its columns of MULT (joined: down reads every
+                # column); down + residual row-sharded as before.
+                assert lanes == 1 and not sched.host_segmented
+                sched.sharded_region(M, lambda ctx: [_mlp_step(ctx, s) for s in ("residual1", "norm")])
+
+                st_down = getattr(self, "_st_down_on", False)
+
+                def _lanes(ctx):
+                    m = gate_m_regs[ctx.engine_idx]
+                    ctx.unsafe_ue.generate_instruction_add_set(m, M)
+                    mlp_acc[0] += self._st_mlp_lanes(ctx.unsafe_ue, ctx.engine_idx,
+                                                     sched.num_engines, la, M, m, down=st_down)
+
+                if st_down:
+                    # down ran inside the lanes as K lanes: sum the engines'
+                    # full-width partials (reduce_add opens with the barrier,
+                    # so the lanes region need not join), then residual2.
+                    sched.col_sharded_region(MLP, _lanes, join=False)
+                    sched.reduce_add([self._st_down_part(e) for e in range(sched.num_engines)],
+                                     self.LM_MLP_DOWN, M=M, N=H, parallel=True)
+                    sched.sharded_region(M, lambda ctx: _mlp_step(ctx, "residual2"))
+                else:
+                    sched.col_sharded_region(MLP, _lanes, join=True)
+                    sched.sharded_region(M, lambda ctx: [_mlp_step(ctx, s) for s in (("down", 0), "residual2")])
+            elif sched.host_segmented:
                 for step in mlp_steps:
                     sched.sharded_region(
                         M, lambda ctx, step=step: _mlp_step(ctx, step))
@@ -2312,13 +2790,44 @@ class Qwen25VLLMMixin:
 
     def compile_prefill(self, seq_len: int, layer_size: int = None,
                         profile: bool = False) -> int:
+        if self._st_prefill_rows(seq_len):
+            # Strassen when this program has the rows for it; a program that
+            # then leaves no room for the decoder(s) is compiled again with
+            # gate/up only, then plain.
+            sched = self._ensure_stage_scheduler("prefill")
+            downs = ([True] if getattr(self, "_st_down_layout", False)
+                     and sched is not None and sched.num_engines > 1 else []) + [False]
+            for down in downs:
+                try:
+                    return self._run_lm_compile_transaction(
+                        "prefill",
+                        lambda down=down: self._compile_prefill_impl(
+                            seq_len, layer_size, profile, strassen=True, strassen_down=down),
+                    )
+                except MemoryError as exc:
+                    self._loud(f"  [LM] Strassen prefill{' with down' if down else ''} does not "
+                               f"fit the program space, compiling it with less: {exc}")
         return self._run_lm_compile_transaction(
             "prefill",
             lambda: self._compile_prefill_impl(seq_len, layer_size, profile),
         )
 
+    def _st_prefill_rows(self, seq_len: int) -> int:
+        """Rows a Strassen prefill program for seq_len tokens executes (the
+        live rows rounded up to even; run_prefill pads and masks the extra
+        one), or 0 when this program stays plain."""
+        if not getattr(self, "_st_layout", False):
+            return 0
+        rows = int(self._prefill_execution_rows(seq_len))
+        rows += rows % (1 << ST_LEVEL)
+        sched = self._ensure_stage_scheduler("prefill")
+        if sched is not None and sched.host_segmented:
+            return 0
+        return rows if ST_MIN_ROWS <= rows <= self._st_rows_cap() else 0
+
     def _compile_prefill_impl(self, seq_len: int, layer_size: int = None,
-                              profile: bool = False) -> int:
+                              profile: bool = False, strassen: bool = False,
+                              strassen_down: bool = False) -> int:
         """Emit a prefill program for exactly ``seq_len`` tokens.
 
         Compiled per prompt rather than made length-agnostic: the head-major
@@ -2326,11 +2835,23 @@ class Qwen25VLLMMixin:
         second. gemma4_e2b takes the same approach.
         """
         d = self._lm_dims()
+        if getattr(self, "_st_down_packed", False) and not (strassen and strassen_down):
+            raise RuntimeError(
+                "down_proj is already rewritten as Strassen K-lane slabs (a Strassen "
+                "prefill ran); this prefill would read it as full width. Rerun with "
+                "--no-strassen for prompts that need a plain prefill.")
         if seq_len > self.PREFILL_MAX_SEQ_LEN:
             raise ValueError(
                 f"prompt is {seq_len} tokens, PREFILL_MAX_SEQ_LEN is "
                 f"{self.PREFILL_MAX_SEQ_LEN}; tensors are sized for the latter")
         execution_rows = int(self._prefill_execution_rows(seq_len))
+        # Strassen: an even row count (the extra row is padded and masked
+        # like any execution row past the prompt) and the gate/up lanes.
+        self._st_on = bool(strassen)
+        self._st_down_on = bool(strassen and strassen_down)
+        if strassen:
+            execution_rows = self._st_prefill_rows(seq_len)
+            assert execution_rows, "compile_prefill picked Strassen for a plain program"
         if not seq_len <= execution_rows <= self.PREFILL_MAX_SEQ_LEN:
             raise ValueError(
                 f"prefill execution rows must satisfy {seq_len} <= rows <= "
@@ -2419,10 +2940,34 @@ class Qwen25VLLMMixin:
                 f"LM prefill program overruns the ISA region: "
                 f"0x{base + len(blob):X} > 0x{self.DRAM_END:X}. Prefill and "
                 f"decoder share it; shorten the prompt or enlarge the region.")
+        self._st_on = self._st_down_on = False
+        if strassen:
+            # The decoder(s) compile after this and need their room too.
+            times = 2 if profile else 1
+            multi = self.multi_core > 1
+            master_limit = self.WORKER_ISA_BASE if multi else self.DRAM_END
+            keep = times * ST_DECODER_ISA_RESERVE[1 if multi else 0]
+            if base + len(blob) + keep > master_limit:
+                raise MemoryError(
+                    f"master prefill {len(blob) / 2**20:.1f} MiB leaves under "
+                    f"{keep / 2**20:.0f} MiB below 0x{master_limit:X} for the decoder")
+            keep = times * ST_DECODER_ISA_RESERVE[2]
+            for idx, _w, addr, wb in self._prefill_workers:
+                if addr + len(wb) + keep > self.mc_arena.isa_limit(idx):
+                    raise MemoryError(
+                        f"worker {idx} prefill {len(wb) / 2**20:.1f} MiB leaves under "
+                        f"{keep / 2**20:.0f} MiB of its ISA slice for the decoder")
+        self._prefill_strassen = bool(strassen)
+        self._prefill_strassen_down = bool(strassen and strassen_down)
         row_note = (
             f" ({execution_rows} FPGA execution rows)"
             if execution_rows != seq_len else ""
         )
+        if strassen:
+            row_note += (f", Strassen gate/up{'/down' if strassen_down else ''} "
+                         f"(level {ST_LEVEL}, {ST_LANES} lanes)")
+        elif getattr(self, "_st_layout", False):
+            row_note += ", plain gate/up over the Strassen slabs"
         self._loud(f"  [LM] prefill compiled for {seq_len} tokens{row_note}: "
                    f"{len(blob) / 2**20:.2f} MiB at 0x{base:X}, "
                    f"{flops / 1e9:.1f} GFLOP, {time.perf_counter() - t0:.1f}s")
@@ -2608,6 +3153,9 @@ class Qwen25VLLMMixin:
         # execution is the one point both hold; it is a no-op at lanes == 1 and
         # after the first call.
         self.repack_down_to_k_lanes()
+        # Same ordering for the Strassen down slabs (one way, first call only).
+        if getattr(self, "_prefill_strassen_down", False):
+            self._st_relayout_down()
         d = self._lm_dims()
         seq_len = len(tokens)
         compiled_seq_len = getattr(self, "_prefill_seq_len", None)
