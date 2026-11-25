@@ -36,6 +36,8 @@ import threading
 import time
 import traceback
 
+import tp_models
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS = os.path.dirname(HERE)
 ROOT = os.path.dirname(MODELS)
@@ -900,13 +902,20 @@ class QwenBackend:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--model", required=True, choices=("gemma3", "gemma4_e2b", "gemma4_e4b", "qwen2.5_omni_7b"))
+    ap.add_argument("--model", required=True, choices=("gemma3", "gemma4_e2b", "gemma4_e4b", "qwen2.5_omni_7b", *tp_models.MODELS))
     ap.add_argument("--engines", type=int, default=8)
     ap.add_argument("--dev", default="xdma0")
+    ap.add_argument("--tp-devices", default="", help="five comma-separated XDMA names")
     args = ap.parse_args(argv)
     os.chdir(ROOT)
 
     try:
+        if args.model in tp_models.MODELS:
+            def serve(**runtime):
+                stop = threading.Event()
+                backend = tp_models.Chat(args.model, stop, lambda phase: emit("status", text=phase), **runtime)
+                return serve_requests(backend, stop)
+            return tp_models.run(args.model, args.tp_devices, serve) or 0
         if args.model == "gemma3":
             backend = Gemma3Backend(args.engines, args.dev)
         elif args.model == "qwen2.5_omni_7b":
@@ -917,10 +926,13 @@ def main(argv=None) -> int:
         traceback.print_exc()
         emit("fatal", error=f"{type(e).__name__}: {e}")
         return 1
+    return serve_requests(backend, threading.Event())
+
+
+def serve_requests(backend, stop):
     emit("ready", info=backend.info())
 
     requests: "queue.Queue[dict | None]" = queue.Queue()
-    stop = threading.Event()
 
     def reader() -> None:                       # stdin -> requests; "stop" acts at once
         for line in sys.stdin:
@@ -934,7 +946,9 @@ def main(argv=None) -> int:
             if msg.get("cmd") == "stop":
                 stop.set()
             else:
+                stop.clear()
                 requests.put(msg)
+        stop.set()
         requests.put(None)
 
     threading.Thread(target=reader, daemon=True).start()
@@ -942,7 +956,6 @@ def main(argv=None) -> int:
         req = requests.get()
         if req is None:
             break
-        stop.clear()
         rid = req.get("id")
 
         def on_token(token_id, text, rid=rid):
@@ -955,7 +968,10 @@ def main(argv=None) -> int:
             emit("result", id=rid, metrics=metrics)
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
-            emit("error", id=rid, error=f"{type(e).__name__}: {e}")
+            fatal = isinstance(backend, tp_models.Chat) and not isinstance(e, ValueError)
+            emit("error", id=rid, error=f"{type(e).__name__}: {e}", fatal=fatal)
+            if fatal:
+                return 1
     return 0
 
 

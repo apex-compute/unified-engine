@@ -1,0 +1,32 @@
+name: Manual five-card model test
+run-name: Test ${{ inputs.model }} on five cards
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Model to test on the five reserved cards
+        required: true
+        type: choice
+        options:
+          - q35_9b
+          - q38_27b
+          - gptoss20b
+          - gemma4_26b
+
+permissions:
+  contents: read
+
+jobs:
+  inference:
+    name: Five-card inference (${{ inputs.model }})
+    runs-on: apex-five-card
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run inference on five FPGA cards
+        env:
+          MODEL: ${{ inputs.model }}
+        run: '"${APEX_TP_PYTHON:-python3}" -u tests/five_card_hw.py "$MODEL"'

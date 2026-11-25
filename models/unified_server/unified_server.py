@@ -38,6 +38,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -61,6 +62,7 @@ IMAGE_EXT = {e: e for e in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")}
 AUDIO_EXT = {e: e for e in AUDIO_NATIVE + (".mp3", ".m4a", ".webm", ".aac", ".opus", ".mp4")}
 
 sys.path.insert(0, os.path.join(MODELS_DIR, "flux2_klein_4b"))
+import tp_models
 import flux2_klein_4b_server as flux  # noqa: E402  (FLUX.2 configs, runner and job)
 
 
@@ -97,8 +99,15 @@ CHAT_MODELS = {
 }
 
 
+for _id, _spec in tp_models.MODELS.items():
+    CHAT_MODELS[_id] = {"title": _spec[0], "modalities": ["text", "image"] if _id != "gptoss20b" else ["text"],
+                        "blurb": "Tensor-parallel chat on five Apex FPGA cards (ten engines)."}
+
+
 def chat_static(model: str) -> dict:
     """Geometry, weight and program-image figures from the files on disk (no board access)."""
+    if model in tp_models.MODELS:
+        return tp_models.static(model)
     spec = CHAT_MODELS[model]
     d = os.path.join(MODELS_DIR, spec["dir"])
     cfg = _json(os.path.join(d, f"{model}_config.json"))
@@ -183,7 +192,7 @@ class LLMWorker:
         self.info: dict | None = None
         self.sink = sink                           # callable(line) -> the running job's log
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True, bufsize=1, encoding="utf-8",
+                                     stderr=subprocess.PIPE, start_new_session=True, text=True, bufsize=1, encoding="utf-8",
                                      errors="replace")
         threading.Thread(target=self._pump_stderr, daemon=True).start()
 
@@ -219,7 +228,10 @@ class LLMWorker:
                 self.proc.stdin.close()            # EOF ends the request loop
             self.proc.wait(timeout=30)
         except (OSError, subprocess.TimeoutExpired):
-            self.proc.kill()
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             self.proc.wait()
 
 
@@ -360,11 +372,27 @@ class ChatJob:
                 "log": "".join(list(self.log)[-200:])}
 
 
+class DetectionJob:
+    kind = "detection"
+    model = "yolo26_obb"
+
+    def __init__(self, tag, source, name):
+        self.id, self.source, self.name = tag, source, name
+        self.image = os.path.join(OUT_DIR, tag + ".png")
+        self.state, self.error, self.result = "queued", None, None
+        self.created, self.started, self.finished = time.time(), None, None
+
+    def public(self):
+        return {"kind": self.kind, "model": self.model, "id": self.id, "state": self.state, "name": self.name,
+                "error": self.error, "result": self.result, "image": f"/api/jobs/{self.id}/image.png" if self.state == "done" else None}
+
+
 class Board(threading.Thread):
     """The single scheduler: FLUX jobs and chat jobs, one at a time, one resident process at most."""
 
-    def __init__(self, python: str, dev: str, engines: int):
+    def __init__(self, python: str, dev: str, engines: int, tp_devices: str = ""):
         super().__init__(daemon=True)
+        self.tp_devices = tp_devices
         self.python, self.dev, self.engines = python, dev, engines
         self.q: "queue.Queue" = queue.Queue()
         self.jobs: dict[str, object] = {}
@@ -420,8 +448,10 @@ class Board(threading.Thread):
             self.loading = {"model": job.model, "since": time.time()}
             cmd = [self.python, WORKER, "--model", job.model, "--engines", str(job.engines),
                                     "--dev", self.dev]
-            w = LLMWorker(cmd, job.model, job.engines, job.log.append)
+            if job.model in tp_models.MODELS and self.tp_devices:
+                cmd += ["--tp-devices", self.tp_devices]
             try:
+                w = LLMWorker(cmd, job.model, job.engines, job.log.append)
                 for ev in w.events():
                     if ev.get("event") == "ready":
                         w.info = ev.get("info") or {}
@@ -431,7 +461,8 @@ class Board(threading.Thread):
                 if w.info is None:
                     raise RuntimeError(f"the {title} runner exited during start-up")
             except Exception:
-                w.stop()
+                if w is not None:
+                    w.stop()
                 raise
             finally:
                 self.loading = None
@@ -465,6 +496,8 @@ class Board(threading.Thread):
                     job.text = job.metrics["text"]
                 return
             elif e == "error":
+                if ev.get("fatal"):
+                    self.stop_llm()
                 raise RuntimeError(ev.get("error") or "the request failed")
         self.stop_llm()
         raise RuntimeError("the chat runner exited during the request")
@@ -482,6 +515,25 @@ class Board(threading.Thread):
             except OSError:
                 pass
         return True
+
+    def _run_detection(self, job):
+        self.stop_all()
+        detector = tp_models.ROOT / "yolo26"
+        weights = os.environ.get("YOLO26_WEIGHTS", str(detector / "yolo26s-obb.pt"))
+        if not os.path.isfile(weights):
+            raise FileNotFoundError(f"Install YOLO26s-OBB weights at {weights} or set YOLO26_WEIGHTS.")
+        local_python = detector / "env/bin/python"
+        python = str(local_python) if local_python.is_file() else self.python
+        output = job.image + ".json"
+        cmd = [python, str(detector / "test_yolo26.py"), "--weights", weights, "--dev", self.dev,
+               "--engine", "0", "--repeat", "1", "--image", job.source, "--out", job.image, "--result-json", output]
+        run = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
+        if run.returncode:
+            raise RuntimeError("YOLO26 failed: " + run.stdout[-1500:])
+        with open(output, encoding="utf-8") as f:
+            job.result = json.load(f)
+        if not os.path.isfile(job.image):
+            raise RuntimeError("YOLO26 finished without writing the annotated image")
 
     # -- FLUX (flux2_klein_4b_server.Runner's job body) ----------------------
     def _run_flux(self, job) -> None:
@@ -512,6 +564,8 @@ class Board(threading.Thread):
                 os.makedirs(OUT_DIR, exist_ok=True)
                 if getattr(job, "kind", "image") == "chat":
                     self._run_chat(job)
+                elif getattr(job, "kind", "") == "detection":
+                    self._run_detection(job)
                 else:
                     self._run_flux(job)
                 job.state = "done"
@@ -538,10 +592,14 @@ def flux_public(job, board: Board) -> dict:
 
 def save_upload(obj, kind: str, job_tag: str) -> tuple[str, str]:
     """{"name", "data": base64 or data: URL} -> (path on disk, display name)."""
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected an uploaded {kind} with a name and base64 data")
     name = os.path.basename(str(obj.get("name") or kind))
     data = str(obj.get("data") or "")
     if data.startswith("data:"):
-        data = data.split(",", 1)[1]
+        _, separator, data = data.partition(",")
+        if not separator:
+            raise ValueError(f"Malformed {kind} data URL")
     raw = base64.b64decode(data, validate=False)
     if not raw:
         raise ValueError(f"empty {kind}")
@@ -632,7 +690,10 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", "0"))
         if n > 4 * MAX_UPLOAD_BYTES:
             raise ValueError("request too large")
-        return json.loads(self.rfile.read(n) or b"{}")
+        body = json.loads(self.rfile.read(n) or b"{}")
+        if not isinstance(body, dict):
+            raise ValueError("expected a JSON object")
+        return body
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -659,6 +720,8 @@ class Handler(BaseHTTPRequestHandler):
             fboard["worker"] = b.flux.worker_state()
             models = [{"id": k, "kind": "chat", "title": v["title"], "modalities": v["modalities"],
                        "blurb": v["blurb"], "static": chat_static(k)} for k, v in CHAT_MODELS.items()]
+            models.append({"id": "yolo26_obb", "kind": "detection", "title": "YOLO26s-OBB",
+                           "modalities": ["image"], "blurb": "Detect oriented objects in an image on one Apex engine."})
             models.append({"id": "flux2_klein_4b", "kind": "image", "title": "FLUX.2 [klein] 4B",
                            "modalities": ["text→image"],
                            "blurb": "Text-to-image. Text encoder, diffusion transformer and VAE decoder all on the FPGA."})
@@ -670,7 +733,7 @@ class Handler(BaseHTTPRequestHandler):
                 jobs = [b.jobs[i] for i in b.order]
             out = []
             for j in jobs:
-                d = flux_public(j, b) if getattr(j, "kind", "image") != "chat" else j.public()
+                d = flux_public(j, b) if getattr(j, "kind", "image") == "image" else j.public()
                 d.pop("log", None)
                 out.append(d)
             return self._json(out)
@@ -685,7 +748,7 @@ class Handler(BaseHTTPRequestHandler):
             if job is None:
                 return self._json({"error": "no such job"}, HTTPStatus.NOT_FOUND)
             if len(parts) == 1:
-                if getattr(job, "kind", "image") == "chat":
+                if getattr(job, "kind", "image") != "image":
                     d = job.public()
                     d["position"] = b.position(job)
                     return self._json(d)
@@ -744,6 +807,15 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
         except (ValueError, json.JSONDecodeError) as e:
             return self._json({"error": f"bad request: {e}"}, HTTPStatus.BAD_REQUEST)
+        if path == "/api/detect":
+            tag = uuid.uuid4().hex[:12]
+            try:
+                source, name = save_upload(body.get("image"), "image", tag)
+            except (ValueError, TypeError) as e:
+                return self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
+            job = DetectionJob(tag, source, name)
+            b.submit(job)
+            return self._json({"id": job.id, "position": b.position(job)}, HTTPStatus.ACCEPTED)
         if path == "/api/chat":
             return self._chat(body)
         if path == "/api/flux/prepare":
@@ -754,10 +826,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chat(self, body: dict) -> None:
         model = body.get("model")
-        if model not in CHAT_MODELS:
+        if not isinstance(model, str) or model not in CHAT_MODELS:
             return self._json({"error": "unknown chat model"}, HTTPStatus.BAD_REQUEST)
         msgs = []
-        for m in body.get("messages") or []:
+        messages = body.get("messages")
+        if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+            return self._json({"error": "messages must be a list of chat messages"}, HTTPStatus.BAD_REQUEST)
+        for m in messages:
             role = m.get("role")
             if role not in ("user", "assistant"):
                 continue
@@ -768,11 +843,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": f"conversation longer than {MAX_PROMPT_CHARS} characters"},
                               HTTPStatus.BAD_REQUEST)
         try:
-            max_new = int(body.get("max_new_tokens") or 8192)       # each model caps it at its context
+            max_new = int(body.get("max_new_tokens", 8192))       # each model caps it at its context
         except (TypeError, ValueError):
             return self._json({"error": "max_new_tokens must be an integer"}, HTTPStatus.BAD_REQUEST)
-        if not 1 <= max_new <= 8192:
-            return self._json({"error": "max_new_tokens must be in [1, 8192]"}, HTTPStatus.BAD_REQUEST)
+        limit = tp_models.MODELS[model][3] if model in tp_models.MODELS else 8192
+        if not 1 <= max_new <= limit:
+            return self._json({"error": f"max_new_tokens must be in [1, {limit}]"}, HTTPStatus.BAD_REQUEST)
         mods = CHAT_MODELS[model]["modalities"]
         tag = uuid.uuid4().hex[:12]
         image = audio = None
@@ -788,13 +864,14 @@ class Handler(BaseHTTPRequestHandler):
                 audio, att["audio"] = save_upload(body["audio"], "audio", tag)
         except (ValueError, TypeError, base64.binascii.Error) as e:
             return self._json({"error": str(e)}, HTTPStatus.BAD_REQUEST)
-        if (image or audio) and not msgs[-1]["content"].strip():
+        if model not in tp_models.MODELS and (image or audio) and not msgs[-1]["content"].strip():
             msgs[-1]["content"] = "Describe this image." if image and not audio else (
                 "Transcribe the speech exactly." if audio and not image else "Describe what you see and hear.")
-        if not msgs[-1]["content"].strip():
+        if not (image or audio or msgs[-1]["content"].strip()):
             return self._json({"error": "empty message"}, HTTPStatus.BAD_REQUEST)
         conversation = str(body.get("conversation") or "")[:64]
-        job = ChatJob(model, self.board.engines, msgs, image, audio, max_new, att, conversation)
+        engines = 10 if model in tp_models.MODELS else self.board.engines
+        job = ChatJob(model, engines, msgs, image, audio, max_new, att, conversation)
         self.board.submit(job)
         self._json({"id": job.id, "position": self.board.position(job)}, HTTPStatus.ACCEPTED)
 
@@ -833,22 +910,27 @@ def main(argv=None) -> int:
     ap.add_argument("--engines", type=int, default=8, help="engines for the chat models (FLUX uses its configs')")
     ap.add_argument("--reload-per-image", action="store_true",
                     help="FLUX: untick 'keep the board loaded' by default (reload the weights for every image)")
+    ap.add_argument("--tp-devices", default=os.environ.get("APEX_TP_DEVICES", ""),
+                    help="five comma-separated XDMA names for the ten-shard models; default: first five in PCI order")
     args = ap.parse_args(argv)
 
-    board = Board(args.python, args.dev, args.engines)
+    board = Board(args.python, args.dev, args.engines, args.tp_devices)
     board.start()
     Handler.board = board
     Handler.no_reload_default = "" if args.reload_per_image else "checked"
     Handler.flux_builds = FluxBuilds(args.python, args.engines)
     for k in CHAT_MODELS:
         s = chat_static(k)
-        print(f"  {k}: weights {s['weights_file']['bytes'] / 1e9:.2f} GB"
+        if k in tp_models.MODELS:
+            print(f"  {k}: {s['notes'][-1]} context {s['max_context']}", file=sys.stderr)
+            continue
+        print(f"  {k}: weights {(s['weights_file']['bytes'] or 0) / 1e9:.2f} GB"
               f"{'' if s['ready'] else ' (not generated yet)'}, context {s['max_context']}", file=sys.stderr)
     print(f"  flux2_klein_4b: {len(flux.scan_configs())} compiled program sets", file=sys.stderr)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"Unified Engine model server on http://{args.host}:{args.port}/  (runners: {args.python}, "
-          f"{args.engines} engines for chat)", file=sys.stderr)
+          f"{args.engines} engines for single-card chat)", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
