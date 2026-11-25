@@ -56,7 +56,6 @@ else
 fi
 
 export DMA_DEV=xdma0          # p2: U50 on xdma0, kintex7 on xdma1
-export UE_CI_CONV_IMAGE=1     # the U50 image carries the conv blocks
 
 echo "[alveo_u50] ./run_ci.sh ${RUN_CI_ARGS[*]}"
 ./run_ci.sh "${RUN_CI_ARGS[@]}"

@@ -171,8 +171,8 @@ before using the upstream loader. The normal compiler/runner does not import
 that package.
 
 `yolo26n_test.py` compiles if needed and runs the `model_auto_test.py` smoke test.
-It accepts `--cpu`, `--force`, `--native`, `--winograd` and `--optimize`; hardware tests use
-the existing `UE_CI_CONV_IMAGE=1` harness gate. The registry exercises the optimized default.
+It accepts `--cpu`, `--force`, `--native`, `--winograd` and `--optimize`. The registry
+exercises the optimized default.
 
 Sources: [architecture](https://github.com/ultralytics/ultralytics/blob/6bc84f1eda65fc8b0aa2a2c71b2eb60908b00711/ultralytics/cfg/models/26/yolo26.yaml),
 [official checkpoint release](https://github.com/ultralytics/assets/releases/tag/v8.4.0).
