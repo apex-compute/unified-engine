@@ -123,6 +123,12 @@ jobs:
 
             let completedRun;
             while (true) {
+              // Wait BEFORE each check, the first one included. A brand-new run shows
+              // up in the runs list a few seconds before GET /actions/runs/{id} can
+              // serve it: on 2026-11-25 the list returned run 45663784090 at 17:20:57
+              // and fetching it by id at 17:20:59 answered 404, failing the night.
+              // A Model HW CI run takes 40+ min, so nothing is lost by waiting first.
+              await sleep(60000);
               const response = await github.rest.actions.getWorkflowRun({
                 ...common,
                 run_id: dispatchedRun.id,
@@ -134,7 +140,6 @@ jobs:
               if (completedRun.status === 'completed') {
                 break;
               }
-              await sleep(60000);
             }
 
             const icon = completedRun.conclusion === 'success'
