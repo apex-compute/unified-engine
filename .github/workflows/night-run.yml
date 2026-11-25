@@ -122,11 +122,22 @@ jobs:
             }
 
             let completedRun;
+            let notFound = 0;
             while (true) {
-              const response = await github.rest.actions.getWorkflowRun({
-                ...common,
-                run_id: dispatchedRun.id,
-              });
+              let response;
+              try {
+                response = await github.rest.actions.getWorkflowRun({
+                  ...common,
+                  run_id: dispatchedRun.id,
+                });
+              } catch (error) {
+                // A run that was just listed can 404 on GET for a few seconds
+                // (11-25 night 45663755470). Retry instead of failing the night.
+                if (error.status !== 404 || ++notFound > 10) throw error;
+                core.info(`Model HW CI run ${dispatchedRun.id}: not found yet (${notFound}/10)`);
+                await sleep(5000);
+                continue;
+              }
               completedRun = response.data;
               core.info(
                 `Model HW CI run ${completedRun.id}: ${completedRun.status}`
