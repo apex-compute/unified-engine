@@ -14,6 +14,10 @@ on:
         type: boolean
         default: false
 
+# Only checks out the repo and runs a script.
+permissions:
+  contents: read
+
 concurrency:
   group: model-hw-ci
   cancel-in-progress: false  # never race with a live CI/HW run
