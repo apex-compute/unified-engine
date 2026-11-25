@@ -1,0 +1,11 @@
+[Unit]
+Description=Xilinx XDMA Driver
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/sbin/insmod /lib/modules/$(uname -r)/xdma/xdma.ko interrupt_mode=0 poll_mode=1 || true'
+ExecStartPost=/bin/sh -c 'chmod 666 /dev/xdma*'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
