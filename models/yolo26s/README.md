@@ -48,7 +48,7 @@ and output images under `yolo26s_bin/` are ignored by Git.
 Use firmware matching the active driver. Measurements below used `f1e5582c`
 and its matching Andromeda driver, with the firmware check intact. These
 scripts do not flash the board. The model-auto-test registry selects the
-optimized wrapper behind `UE_CI_CONV_IMAGE=1`.
+optimized wrapper.
 
 ## Measured performance
 

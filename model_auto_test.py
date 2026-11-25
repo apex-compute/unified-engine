@@ -855,35 +855,29 @@ TESTS = [
     # the prompt only to the next multiple of 64 (256x256 then takes ~40 s in total). Bins (params_te/params_dit/vae_weights/programs) are cached in
     # flux2_klein_4b_bin/ and reused on pass 2 (the program signature covers geometry,
     # engine count and the compiler source). The first entry decodes the VAE on the host
-    # (standard image); the second runs all three phases on the FPGA and needs the CONV2D
-    # queue-config image like the conv models below.
+    # (standard image); the second runs all three phases on the FPGA, VAE convs included.
     {"name": "flux2_klein_4b", "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
      "extra_args": ["--height", "256", "--width", "256", "--max-seq-len", "128", "--vae", "host"],
      "mode": "T2I (TE+DiT on FPGA, VAE host)", "prompt_desc": "A photo of a red sports car on a mountain road at sunset (default)"},
     {"name": "flux2_klein_4b_vae", "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
      "extra_args": ["--height", "256", "--width", "256", "--max-seq-len", "128", "--vae", "fpga"],
-     "mode": "T2I (all phases on FPGA)", "prompt_desc": "A photo of a red sports car on a mountain road at sunset (default)",
-     "requires_conv_image": True},
+     "mode": "T2I (all phases on FPGA)", "prompt_desc": "A photo of a red sports car on a mountain road at sunset (default)"},
 
     # --- Andromeda conv/audio ports (synced from pcie_utils) ---------------------
-    # These run a precompiled single-bin image through native CONV2D/MAXPOOL opcodes
-    # and need the queue-CONFIG convolution bitstream, which HW_INFO does not
-    # advertise. requires_conv_image gates them on UE_CI_CONV_IMAGE=1 in the runner's
-    # environment; on a board with the standard image they SKIP instead of timing out
-    # waiting for a HALT that never comes. Each <model>_test.py wrapper compiles the
-    # bin on pass 1 and reuses it on pass 2.
+    # These run a precompiled single-bin image through native CONV2D/MAXPOOL opcodes.
+    # Each <model>_test.py wrapper compiles the bin on pass 1 and reuses it on pass 2.
     # Not run by default: these ports are tested board-side by user_hw_test.py
     # (conv_model_tests(): FPGA vs CPU reference, FPGA cycles). The entries stay as
     # an interface; name one with --only, or set UE_RUN_CONV_MODELS=1, to run it here.
     # flux2_klein_4b_vae above stays in the default run.
-    {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
-    {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
-    {"name": "yolo26n", "script": "models/yolo26n/yolo26n_test.py", "pass_check": _check_yolo26n, "image": "test_samples/people.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_NOT},
-    {"name": "yolo26s", "script": "models/yolo26s/yolo26s_test.py", "pass_check": _check_yolo26s, "image": "test_samples/people.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_NOT},
-    {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
-    {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
-    {"name": "dpdfnet8khz", "script": "models/dpdfnet8khz/dpdfnet8khz_test.py", "pass_check": _check_dpdfnet8khz, "audio": "test_samples/apex.wav", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
-    {"name": "bigcodec", "script": "models/bigcodec/bigcodec_test.py", "pass_check": _check_bigcodec, "audio": "test_samples/apex.wav", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
+    {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "default_off": _CONV_PORT_UHW},
+    {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "default_off": _CONV_PORT_UHW},
+    {"name": "yolo26n", "script": "models/yolo26n/yolo26n_test.py", "pass_check": _check_yolo26n, "image": "test_samples/people.jpg", "default_off": _CONV_PORT_NOT},
+    {"name": "yolo26s", "script": "models/yolo26s/yolo26s_test.py", "pass_check": _check_yolo26s, "image": "test_samples/people.jpg", "default_off": _CONV_PORT_NOT},
+    {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "default_off": _CONV_PORT_UHW},
+    {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "default_off": _CONV_PORT_UHW},
+    {"name": "dpdfnet8khz", "script": "models/dpdfnet8khz/dpdfnet8khz_test.py", "pass_check": _check_dpdfnet8khz, "audio": "test_samples/apex.wav", "default_off": _CONV_PORT_UHW},
+    {"name": "bigcodec", "script": "models/bigcodec/bigcodec_test.py", "pass_check": _check_bigcodec, "audio": "test_samples/apex.wav", "default_off": _CONV_PORT_UHW},
 
 ]
 
@@ -1199,14 +1193,6 @@ def run_test(test: dict, verbose: bool = False,
             and os.environ.get("UE_RUN_CONV_MODELS") != "1"):
         reason = (f"not run by default: {test['default_off']}. "
                   "To run it here: --only " + test["name"] + " or UE_RUN_CONV_MODELS=1")
-        print(f"SKIP         : {reason}\n", flush=True)
-        result = _parse_output(test, "", 0, 0.0)
-        result.update(passed=True, skipped=True, pass_reason=reason)
-        return result
-
-    if test.get("requires_conv_image") and os.environ.get("UE_CI_CONV_IMAGE") != "1":
-        reason = ("needs the CONV2D/MAXPOOL queue-CONFIG bitstream; set UE_CI_CONV_IMAGE=1 "
-                  "on a runner whose board carries it")
         print(f"SKIP         : {reason}\n", flush=True)
         result = _parse_output(test, "", 0, 0.0)
         result.update(passed=True, skipped=True, pass_reason=reason)
@@ -1681,7 +1667,6 @@ def collect_run_info(args, dev: str) -> dict:
     info["engines_pinned"] = int(pinned) if pinned and pinned.isdigit() else None
     info["dram_fill"] = ("random bf16 before each model (RANDOMIZE_DRAM=1)" if RANDOMIZE_DRAM
                          else "none; entries with clear_dram_zero are zeroed first")
-    info["conv_image"] = os.environ.get("UE_CI_CONV_IMAGE") == "1"
     info["conv_ports"] = os.environ.get("UE_RUN_CONV_MODELS") == "1"
     info["order"] = (f"shuffled, seed {args.shuffle_seed}" if args.shuffle_seed is not None
                      else "registry" + (f", --first {' '.join(args.first)}" if args.first else ""))
@@ -1734,7 +1719,6 @@ def _header_lines(info: dict) -> list:
         + (f" -> {used} engine(s)" if used else "")
         + (" (pinned)" if info.get("engines_pinned") else " (board's HW_INFO count)"),
         f"  DRAM fill   : {info['dram_fill']}",
-        f"  conv image  : {'yes (UE_CI_CONV_IMAGE=1)' if info['conv_image'] else 'no: conv-image entries SKIP'}",
         f"  conv ports  : {'run (UE_RUN_CONV_MODELS=1)' if info['conv_ports'] else 'default-off (see user_hw_test.py)'}",
         f"  order       : {info['order']}",
         f"  programs    : {info['programs']}",
