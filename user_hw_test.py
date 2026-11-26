@@ -12046,20 +12046,15 @@ def gemma3_multi_core_inference_test(num_engines: int) -> None:
     private-arena address is wrong, and the coherent-looking text a bad shard
     produces is exactly what an exact-match check catches and an eyeball does not.
 
-    Speed is asserted in cycles/token, like the single-core test, so the floor is
-    clock-independent. The threshold is deliberately loose: its job is to catch
-    sharding silently degenerating to single-core work (~20M cycles/tok), not to
-    police the last few percent of a speedup.
+    The Kintex-7 and HBM performance checks use cycles/token. On the opt-in
+    DDR4 targets both engines share one controller, and speed is reported.
     """
     gemma3_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gemma3")
     if gemma3_dir not in sys.path:
         sys.path.insert(0, gemma3_dir)
     from gemma3_test import Gemma3_UnifiedEngine
+    from multi_engine_shard import KU5P_TWO_ENGINE_HW_INFO
     import user_dma_core
-
-    # Measured per core count with slack for memory timing; see the table above.
-    max_cycles_per_token = int(_GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN[num_engines]
-                               * GEMMA3_HARDWARE_PENALTY_FACTOR)
 
     # Workers have to be reset for the core count they will run at, and
     # setup_multi_core() is what brings up the scheduler and copies each
@@ -12092,11 +12087,19 @@ def gemma3_multi_core_inference_test(num_engines: int) -> None:
     cycles_per_token = (
         (1e9 / peak_tokens_per_s) / _clock_ns if peak_tokens_per_s > 0 else math.inf
     )
-    assert cycles_per_token < max_cycles_per_token, (
-        f"Gemma3 {label}: peak decode cost {cycles_per_token:,.0f} cycles/tok "
-        f"({peak_tokens_per_s:.2f} tok/s @ {_clock_ns:.4f} ns/cycle) "
-        f"exceeds required {max_cycles_per_token:,} cycles/tok."
+    # HW_INFO identifies the five on-demand DDR4 images. A two-engine run
+    # on a larger board retains its existing performance check.
+    shared_ddr4_pair = num_engines == 2 and user_dma_core.HW_INFO_RAW in (
+        *KU5P_TWO_ENGINE_HW_INFO, 0x84412C00, 0xA4412C00,  # BittWare 256/512
     )
+    if not shared_ddr4_pair:
+        max_cycles_per_token = int(_GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN[num_engines]
+                                   * GEMMA3_HARDWARE_PENALTY_FACTOR)
+        assert cycles_per_token < max_cycles_per_token, (
+            f"Gemma3 {label}: peak decode cost {cycles_per_token:,.0f} cycles/tok "
+            f"({peak_tokens_per_s:.2f} tok/s @ {_clock_ns:.4f} ns/cycle) "
+            f"exceeds required {max_cycles_per_token:,} cycles/tok."
+        )
 
     inst_bin = os.path.join(ue.script_dir, "gemma3_bin/gemma3_program.bin")
     inst_bytes = os.path.getsize(inst_bin) if os.path.exists(inst_bin) else None

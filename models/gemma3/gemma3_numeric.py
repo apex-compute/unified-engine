@@ -664,8 +664,10 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
 def _clock_ns_default_for_device(device: str) -> float:
     """Return default clock period (ns) for FPGA type — mirrors user_hw_test.py."""
     if device == "kintex7":                       return 1000 / (1066 / 5.375)
-    if device in ("rk", "puzhi"):                 return 3.0
-    if device in ("bittware", "bittware_256"):     return 3.3333
+    if device in ("rk", "rk_256", "puzhi"):
+        return 3.0
+    if device in ("bittware", "bittware_256"):
+        return 3.3333
     if device == "alveo":                          return 4.0
     return 10.0
 
@@ -678,17 +680,18 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Require existing gemma3_bin/params.bin (skip HF regeneration)")
     parser.add_argument('--dev', type=str, default='xdma0',help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
-    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
+    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, rk_256, puzhi, bittware, bittware_256, alveo, or a supported _2eng variant).')
     args = parser.parse_args()
 
     set_dma_device(args.dev)
     gemma3_test.DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     gemma3_test.DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     gemma3_test.DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
+    board_profile = args.device.removesuffix("_2eng")
+    axi_width_bits = 512 if board_profile in ("bittware", "rk") else 256
     os.environ["UE_AXI_DATA_WIDTH_BITS"] = str(axi_width_bits)
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = axi_width_bits
-    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(args.device)
+    clock = args.cycle if args.cycle is not None else _clock_ns_default_for_device(board_profile)
     user_dma_core.CLOCK_CYCLE_TIME_NS = clock
     user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
     print(f"FPGA profile: device={args.device}, clock={clock:.4f} ns, UE_AXI_DATA_WIDTH_BITS={axi_width_bits}")

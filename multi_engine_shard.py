@@ -445,6 +445,10 @@ def require_multicore_dram(num_engines: int, what: str,
 # controller: the windows are sequential and any placement gets the same
 # bandwidth.
 
+# The opt-in KU5P images decode only the upper 2 GiB of the 32-bit address space.
+KU5P_TWO_ENGINE_HW_INFO = (0x80414D40, 0xA0414D40)
+KU5P_MODEL_WINDOW_BYTES = 320 << 20  # 288 MiB for weights, 16 MiB each for ISA and tensors
+
 KINTEX7_BOARD_CORES = 2                     # HW_INFO signature of the kintex7 images
 ALVEO_BOARD_CORES = 8                       # HW_INFO signature of the U50 image
 ALVEO_U55C_BOARD_CORES = 12                 # HW_INFO signature of the U55C image
@@ -471,9 +475,10 @@ def dram_interleaved() -> bool:
 
 
 def sequential_windows(num_engines: int,
-                       window_bytes: int = MULTICORE_WINDOW_BYTES) -> list[tuple[int, int]]:
-    """``(base, bytes)`` per engine, packed one after another from address 0."""
-    return [(i * window_bytes, window_bytes) for i in range(num_engines)]
+                       window_bytes: int = MULTICORE_WINDOW_BYTES, *,
+                       base: int = 0) -> list[tuple[int, int]]:
+    """Return consecutive (address, size) windows starting at base."""
+    return [(base + i * window_bytes, window_bytes) for i in range(num_engines)]
 
 
 # ==========================================================================
@@ -663,9 +668,9 @@ def model_multicore_layout(num_engines: int, model_bytes: int = 2 << 30,
     rebase all model allocations to ``model_base``. A window's size includes
     the arena's ISA and tensor tails, not only weight storage.
 
-    The layout is sequential (all supported boards interleave their DRAM; see
-    dram_interleaved): 512 MiB windows one after another from 0, and the model
-    directly after the last window. ``preferred_model_base`` is kept for
+    The shared model follows the private windows. The two-engine KU5P images
+    use 320 MiB windows from DRAM_START_ADDR. The larger boards use 512 MiB
+    windows from address zero. ``preferred_model_base`` is kept for
     callers and not used.
 
     Unsupported boards and layouts that cannot fit raise ValueError. This
@@ -680,8 +685,13 @@ def model_multicore_layout(num_engines: int, model_bytes: int = 2 << 30,
         user_dma_core.configure_clock_from_hardware()
     cores = user_dma_core.ANDROMEDA_CORE_COUNT
     gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
-    if (cores, gib) not in {(KINTEX7_BOARD_CORES, 4), (ALVEO_BOARD_CORES, 8),
-                            (ALVEO_U55C_BOARD_CORES, 16)}:
+    dram_base = 0
+    window_bytes = MULTICORE_WINDOW_BYTES
+    if user_dma_core.HW_INFO_RAW in KU5P_TWO_ENGINE_HW_INFO:
+        dram_base = user_dma_core.DRAM_START_ADDR
+        window_bytes = KU5P_MODEL_WINDOW_BYTES
+    elif (cores, gib) not in {(KINTEX7_BOARD_CORES, 4), (ALVEO_BOARD_CORES, 8),
+                              (ALVEO_U55C_BOARD_CORES, 16)}:
         raise ValueError(f"no multi-core model map for {cores} cores / {gib} GiB")
     if not 1 <= num_engines <= cores:
         raise ValueError(f"num_engines must be 1..{cores}, got {num_engines}")
@@ -689,11 +699,11 @@ def model_multicore_layout(num_engines: int, model_bytes: int = 2 << 30,
     if model_bytes > dram_bytes:
         raise ValueError("shared model map exceeds the device's DRAM capacity")
 
-    windows = sequential_windows(num_engines)
-    model_base = num_engines * MULTICORE_WINDOW_BYTES
-    if model_base + model_bytes > dram_bytes:
+    windows = sequential_windows(num_engines, window_bytes, base=dram_base)
+    model_base = dram_base + num_engines * window_bytes
+    if model_base + model_bytes > dram_base + dram_bytes:
         raise ValueError(
-            f"{num_engines} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
+            f"{num_engines} x {window_bytes // 2**20} MiB private "
             f"windows and a {model_bytes // 2**20} MiB model map do not fit "
             f"the {gib} GiB board")
     return windows, model_base
