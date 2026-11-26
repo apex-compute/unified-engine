@@ -52,7 +52,8 @@ from models.profile_report import (aggregate_checkpoints, annotate_execution,
 # Bank B follows 4096 BF16 rows; its byte base grows with the lane count.
 URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
 from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
-                                KINTEX7_BOARD_CORES, MULTICORE_WINDOW_BYTES,
+                                KINTEX7_BOARD_CORES, KU5P_MODEL_WINDOW_BYTES,
+                                KU5P_TWO_ENGINE_HW_INFO, MULTICORE_WINDOW_BYTES,
                                 model_multicore_layout, multicore_arena_bytes,
                                 require_multicore_dram)
 
@@ -76,11 +77,16 @@ def _board_multicore_map(num_engines: int):
     """Use the shared model-safe controller map, or None on an unknown board."""
     profile = (user_dma_core.ANDROMEDA_CORE_COUNT,
                user_dma_core.AVAILABLE_DRAM_SIZE_GB)
-    if profile not in BOARD_MAP_PROFILES:
+    span = MULTI_CORE_MODEL_SPAN
+    if user_dma_core.HW_INFO_RAW in KU5P_TWO_ENGINE_HW_INFO:
+        # Keep the normal weights, tensors and ISA offsets. The remaining
+        # 1408 MiB includes 128 MiB above the primary program base.
+        span = (user_dma_core.AVAILABLE_DRAM_SIZE_GB << 30) - num_engines * KU5P_MODEL_WINDOW_BYTES
+    elif profile not in BOARD_MAP_PROFILES:
         return None
-    return model_multicore_layout(
-        num_engines, model_bytes=MULTI_CORE_MODEL_SPAN,
-        preferred_model_base=MULTI_CORE_MODEL_BASE)
+    windows, base = model_multicore_layout(num_engines, model_bytes=span,
+                                           preferred_model_base=MULTI_CORE_MODEL_BASE)
+    return windows, base, span
 
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -358,6 +364,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 f"multi_core must be in [1, {MULTI_CORE_MAX_ENGINES}], "
                 f"got {self.multi_core}")
         self._board_windows = None
+        self._model_span = MULTI_CORE_MODEL_SPAN
         self._model_base = user_dma_core.DRAM_START_ADDR
         # Select by the hardware signature even when only two engines of an
         # Alveo board are active.
@@ -370,7 +377,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     f"{user_dma_core.ANDROMEDA_CORE_COUNT} engines HW_INFO reports")
             board = _board_multicore_map(self.multi_core)
             if board is not None:
-                self._board_windows, self._model_base = board
+                self._board_windows, self._model_base, self._model_span = board
         self._use_multicore_dram_layout = (
             self._board_windows is not None
             or self.multi_core >= MULTI_CORE_FIXED_MAP_MIN_ENGINES)
@@ -486,7 +493,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._check_model_region(
             "program", self._align_up(self.get_program_dram_addr(), align_bytes),
             self._align_up(size_bytes, align_bytes), self._program_dram_base,
-            self._model_base + MULTI_CORE_MODEL_SPAN)
+            self._model_base + self._model_span)
         return super().allocate_program_dram(size_bytes, label, align_bytes)
 
     def write_captured_instructions_to_dram(self, start_addr=DRAM_INSTRUCTION_ADDR) -> int:
@@ -495,7 +502,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._check_model_region(
             "program", start_addr,
             self._align_up(self.capture_count * INSTRUCTION_SIZE_BYTES, 64),
-            self._program_dram_base, self._model_base + MULTI_CORE_MODEL_SPAN)
+            self._program_dram_base, self._model_base + self._model_span)
         return super().write_captured_instructions_to_dram(start_addr)
 
     @staticmethod
@@ -1835,7 +1842,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if self._board_windows is not None:
             # Core count alone cannot distinguish DDR/HBM placements, nor a
             # corrected engine-to-controller assignment on the same board.
-            layout = (self._model_base, MULTI_CORE_MODEL_SPAN,
+            layout = (self._model_base, self._model_span,
                       self._board_windows)
             digest = hashlib.sha256(json.dumps(layout).encode()).hexdigest()[:12]
             return f"_mc{self.multi_core}_board_{digest}"
@@ -3087,9 +3094,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "combined instruction image must be 64-byte aligned (HALT emits trailing NOP via generate_instruction_halt)"
         )
         # The model map's own top, not a fixed 8 GB: a board map can seat the
-        # model anywhere it leaves MULTI_CORE_MODEL_SPAN free, and the program
+        # model anywhere it leaves its reserved span free, and the program
         # must stay inside THAT span or it lands on a private window.
-        _model_limit = self._model_base + MULTI_CORE_MODEL_SPAN
+        _model_limit = self._model_base + self._model_span
         if (self._use_multicore_dram_layout
                 and instruction_base_addr + len(instruction_bytes) > _model_limit):
             raise MemoryError(

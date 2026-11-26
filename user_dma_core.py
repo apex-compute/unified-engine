@@ -1715,7 +1715,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xa605a799, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xa605a799. Please update FPGA with update_a605a799.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0xb9d61f12, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xb9d61f12. Please update FPGA with update_b9d61f12.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
