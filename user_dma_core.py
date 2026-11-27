@@ -1359,6 +1359,7 @@ class UnifiedEngine:
         self._next_params_dram_addr = self._params_dram_base
         self._next_program_dram_addr = self._program_dram_base
         self._tensor_dram_addr = self._tensor_dram_base
+        self._tensor_dram_peak = self._tensor_dram_base
         # ISA register and instruction pointer allocation tracking
         self._isa_reg_counter = 1      # Register 0 is hard-wired zero
         self._inst_ptr_counter = 1     # Allocation starts from 1; 15 pointers (1-15) available
@@ -1574,6 +1575,7 @@ class UnifiedEngine:
         self._tensor_dram_addr = self._align_up(self._tensor_dram_addr, align_bytes)
         tensor_dram_addr = self._tensor_dram_addr
         self._tensor_dram_addr += size_bytes
+        self._tensor_dram_peak = max(self._tensor_dram_peak, self._tensor_dram_addr)
         if label is not None:
             self._dram_addresses[label] = tensor_dram_addr
         return tensor_dram_addr

@@ -130,6 +130,15 @@
   <p class="boardline" id="boardline"></p>
 
   <!-- ===================== chat models ===================== -->
+  <section id="detectview" hidden>
+    <form class="card" id="detectform">
+      <label for="detectfile">Image to detect objects in</label>
+      <input id="detectfile" type="file" accept="image/*" required>
+      <button id="detectgo">Detect objects</button>
+      <p id="detectstatus" class="status" role="status"></p>
+      <img id="detectimg" hidden alt="Detected objects with oriented bounding boxes" style="max-width:100%">
+    </form>
+  </section>
   <section id="chatview" hidden>
     <div class="card chat">
       <div id="conv"><div class="empty" id="empty">Ask something — answers stream from the board token by token.</div></div>
@@ -233,8 +242,8 @@ async function loadModels() {
   models = d.models; state = d;
   const sel = $('model');
   if (!sel.options.length) {
-    const groups = { chat: 'Chat (LLM / VLM)', image: 'Image generation' };
-    for (const k of ['chat', 'image']) {
+    const groups = { chat: 'Chat (LLM / VLM)', image: 'Image generation', detection: 'Object detection' };
+    for (const k of ['chat', 'image', 'detection']) {
       const g = document.createElement('optgroup'); g.label = groups[k];
       for (const m of models.filter(m => m.kind === k)) {
         const o = document.createElement('option'); o.value = m.id;
@@ -255,7 +264,7 @@ function showBoard() {
   let s;
   if (l) s = `Board: loading ${title(l.model)}…`;
   else if (r) s = `Board: ${title(r.model)} resident on ${r.engines} engines` +
-    (r.info ? ` (${r.info.clock_mhz.toFixed(0)} MHz, peak ${r.info.peak_gflops.toFixed(0)} GFLOPS; loaded in ${(r.info.load_s + r.info.compile_s).toFixed(0)} s)` : '') +
+    (r.info ? ` (${r.info.peak_gflops ? r.info.clock_mhz.toFixed(0) + " MHz, peak " + r.info.peak_gflops.toFixed(0) + " GFLOPS; " : ""}loaded in ${(r.info.load_s + (r.info.compile_s || 0)).toFixed(0)} s)` : '') +
     ` <a href="#" id="release">release the board</a>`;
   else s = 'Board: free. The first message to a model loads it (weights + program image), later ones reuse it.';
   $('boardline').innerHTML = s;
@@ -271,6 +280,7 @@ function showModel(reset) {
   $('blurb').textContent = m.blurb;
   $('chatview').hidden = m.kind !== 'chat';
   $('fluxview').hidden = m.kind !== 'image';
+  $('detectview').hidden = m.kind !== 'detection';
   if (m.kind === 'chat') {
     if (reset) newChat();
     if (maxFor !== m.id) {            // default: the model's whole context (Gemma 3 512, the others 8192)
@@ -279,7 +289,7 @@ function showModel(reset) {
     }
     showChatStatic(); refreshTools();
   }
-  else { loadFluxConfigs(); loadFluxHistory(); if (reset || !fbuildTimer) prepareFlux(); }
+  else if (m.kind === "image") { loadFluxConfigs(); loadFluxHistory(); if (reset || !fbuildTimer) prepareFlux(); }
 }
 let maxFor = null;
 $('model').onchange = () => showModel(true);
@@ -296,11 +306,11 @@ function showChatStatic() {
     { cells: ['Layers × hidden', s.layers && s.hidden ? `${s.layers} × ${s.hidden}` : '—'] },
     { cells: ['Context (tokens)', s.max_context ?? '—'] },
     { cells: ['Prefill program rows', s.prefill_max ? s.prefill_max + ' per chunk (longer prompts chunked)' : '—'] },
-    { cells: [`Weight file (${esc(s.weights_file.name)})`, s.weights_file.bytes ? gb(s.weights_file.bytes) : 'not generated'] },
+    { cells: [`Weight file (${esc(s.weights_file.name)})`, s.weights_file.bytes ? gb(s.weights_file.bytes) : (s.engines === 10 ? (s.ready ? 'ten-shard plan found' : 'ten-shard plan missing') : 'not generated')] },
     { cells: ['Weights in board DRAM (quantized)', live ? gb(live.weights_dram_bytes) : 'known once loaded'] },
-    { cells: ['Engines', live ? live.engines : state.engines] },
+    { cells: ['Engines', live ? live.engines : (s.engines || state.engines)] },
   ];
-  if (live) body.push({ cells: ['Load (weights → DRAM) + program image', `${live.load_s.toFixed(1)} s + ${live.compile_s.toFixed(1)} s`] });
+  if (live) body.push({ cells: ['Load (weights → DRAM) + program image', live.compile_s == null ? sec(live.load_s) : `${live.load_s.toFixed(1)} s + ${live.compile_s.toFixed(1)} s`] });
   $('cstatictable').innerHTML = rows(['', ''], body);
   const progs = s.programs || [];
   $('cprogblock').hidden = !progs.length;
@@ -308,9 +318,12 @@ function showChatStatic() {
   $('cstaticnote').textContent = (s.notes || []).join(' ') + (live ? ` ${live.hw_info}` : '');
 }
 function refreshTools() {
-  const m = model(), media = m.modalities.includes('image');
-  $('mediatools').hidden = !media;
-  if (!media) att = { image: null, audio: null };
+  const m = model(), image = m.modalities.includes('image'), audio = m.modalities.includes('audio');
+  $('mediatools').hidden = !image && !audio;
+  $('addimg').hidden = !image;
+  $('addaud').hidden = $('recbtn').hidden = !audio;
+  if (!image) att.image = null;
+  if (!audio) att.audio = null;
   const c = [];
   if (att.image) c.push(`<span class="chip"><img src="${att.image.url}" alt="">${esc(att.image.name)} <a data-k="image" title="remove">✕</a></span>`);
   if (att.audio) c.push(`<span class="chip">♪ ${esc(att.audio.name)} <a data-k="audio" title="remove">✕</a></span>`);
@@ -464,8 +477,7 @@ async function send() {
   if (!text && !att.image && !att.audio) return;
   const user = { role: 'user', content: text, attachments: { image: att.image, audio: att.audio } };
   conv.push(user); addTurn(user);
-  // The whole conversation goes along, but the board keeps it in its K/V cache:
-  // a message that continues the same chat (same id) prefills only itself.
+  // The worker uses the conversation id to match the submitted history to its resident state.
   const history = conv.filter(x => !x.failed).map(x => ({ role: x.role, content: x.content }));
   const body = { model: m.id, messages: history, conversation: convId,
                  max_new_tokens: parseInt($('maxnew').value || '8192', 10) };
@@ -554,9 +566,10 @@ function finishBot(bot, j, err) {
   } else {
     const mm = j.metrics || {};
     const dec = mm.phases ? mm.phases.find(p => p.name === 'Decode') : null;
+    const wall = mm.ttft_hw_s == null;
     foot.innerHTML = `<span><b>${mm.generated_tokens}</b> tokens</span>` +
-      `<span>TTFT <b>${sec(mm.ttft_hw_s)}</b> on the engines</span>` +
-      `<span><b>${num(mm.decode_hw_tok_s)}</b> tok/s decode</span>` +
+      `<span>TTFT <b>${sec(wall ? mm.ttft_wall_s : mm.ttft_hw_s)}</b> ${wall ? 'wall' : 'on the engines'}</span>` +
+      `<span><b>${num(wall ? mm.decode_wall_tok_s : mm.decode_hw_tok_s)}</b> tok/s decode${wall ? ' (wall)' : ''}</span>` +
       (dec && dec.gflops ? `<span><b>${dec.gflops.toFixed(0)}</b> GFLOPS</span>` : '') +
       (mm.stopped ? '<span>stopped</span>' : '') + '<a>details ↓</a>';
     setStatus(mm.history_dropped ? `${mm.history_dropped} earlier turn(s) dropped to fit the prompt window.` : '');
@@ -591,6 +604,7 @@ function showMetrics(bot) {
   const peak = info.peak_gflops || 0;
   body.push({ total: true, cells: ['Total', '', sec(hw), '', '', fl ? gf(fl) : '', fl && hw ? (fl / hw / 1e9).toFixed(1) : '', info.engines || '',
     { util: fl && hw && peak ? fl / hw / 1e9 / peak : null }] });
+  $('ctable').hidden = !mm.phases?.length;
   $('ctable').innerHTML = rows(['Phase', 'Tokens', 'Engine time', 'Wall', 'tok/s', 'Work', 'GFLOPS', 'Engines', 'Of raw peak'], body);
   $('cnote').textContent =
     (peak ? `Raw peak ${peak.toFixed(0)} GFLOPS = ${info.engines} engines × 128 FLOP/cycle at ${info.clock_mhz.toFixed(0)} MHz; each phase is scored against the peak of the engines it runs on. ` : '') +
@@ -598,6 +612,8 @@ function showMetrics(bot) {
     'Decode tok/s on the engines sums every token\'s counter; the first-token rate is the single fastest point. ' +
     (mm.compile_s > 0.05 ? `This prompt length needed a program-image ${mm.compile_reused ? 'reload' : 'recompile'} on the host (${mm.compile_s.toFixed(1)} s, outside the figures above). ` : '') +
     (mm.history_dropped ? `${mm.history_dropped} earlier turn(s) were dropped to fit the prompt window. ` : '');
+  if (info.devices) $('cnote').textContent = 'Decode throughput uses elapsed wall time across all five cards.' +
+    (mm.history_dropped ? ' Earlier turns dropped: ' + mm.history_dropped + '.' : '');
   $('cmetrics').hidden = false;
 }
 $('send').onclick = send;
@@ -733,6 +749,38 @@ $('go').onclick = async () => {
   fcurrent = j.id; pollFlux(); ftimer = setInterval(pollFlux, 1000);
 };
 
+$('detectform').onsubmit = async e => {
+  e.preventDefault();
+  const file = $('detectfile').files[0];
+  if (!file) return;
+  $('detectgo').disabled = true;
+  $('detectimg').hidden = true;
+  const status = $('detectstatus');
+  try {
+    status.textContent = 'Uploading image…';
+    const response = await fetch('/api/detect', {method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({image: {name: file.name, data: await readFile(file)}})});
+    const submitted = await response.json();
+    if (!response.ok) throw Error(submitted.error);
+    for (;;) {
+      const result = await fetch('/api/jobs/' + submitted.id);
+      const job = await result.json();
+      if (!result.ok || job.state === 'error') throw Error(job.error || 'Detection failed.');
+      if (job.state === 'done') {
+        $('detectimg').src = job.image;
+        $('detectimg').hidden = false;
+        status.textContent = job.result.detections.length + ' detections · ' + sec(job.result.card_s) + ' on the FPGA';
+        break;
+      }
+      status.textContent = job.state === 'queued' ? 'Queued for the board…' : 'Running YOLO26…';
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    $('detectgo').disabled = false;
+  }
+};
 loadModels();
 setInterval(() => { if (!chatJob && !ftimer) loadModels(); }, 10000);
 </script>
